@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm, trange
+from ipdb import launch_ipdb_on_exception, set_trace
 
 import matplotlib.pyplot as plt
 
@@ -18,6 +19,7 @@ from load_llff import load_llff_data
 from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data
 from load_LINEMOD import load_LINEMOD_data
+from load_bonn import load_bonn_data
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -605,6 +607,9 @@ def train():
             far = 1.
         print('NEAR FAR', near, far)
 
+        import ipdb
+        ipdb.set_trace()
+
     elif args.dataset_type == 'blender':
         images, poses, render_poses, hwf, i_split = load_blender_data(
             args.datadir, args.half_res, args.testskip)
@@ -643,6 +648,16 @@ def train():
         hemi_R = np.mean(np.linalg.norm(poses[:, :3, -1], axis=-1))
         near = hemi_R-1.
         far = hemi_R+1.
+
+    elif args.dataset_type == 'bonn':
+        images, hwf, poses, render_poses, i_train, i_test = \
+            load_bonn_data(args.datadir, downsample_factor=args.factor)
+
+        i_val = i_test
+        near = 0.
+        far = 1.
+
+        # set_trace()
 
     else:
         print('Unknown dataset type', args.dataset_type, 'exiting')
