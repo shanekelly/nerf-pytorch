@@ -74,19 +74,19 @@ def load_bonn_data(base_dir, downsample_factor):
     # Move forward by 1 meter in even steps over the first half of the number of render poses, then
     # move backward by 1 meter in even steps over the last half of the render poses. End up back
     # at start.
-    NUM_RENDER_POSES = 60
+    NUM_RENDER_POSES = 30
     assert NUM_RENDER_POSES % 2 == 0
     render_poses = []
     rotmat_identity = np.eye(3)
     pz = 0
-    pz_delta = 2 / NUM_RENDER_POSES
+    pz_delta = 1 / NUM_RENDER_POSES
     half_num_render_poses = NUM_RENDER_POSES // 2
 
     for idx in range(NUM_RENDER_POSES):
         if idx < half_num_render_poses:
-            pz = pz_delta * idx
+            pz = -pz_delta * idx
         else:
-            pz = 1 - pz_delta * (idx - half_num_render_poses)
+            pz = -0.5 + pz_delta * (idx - half_num_render_poses)
 
         translation = np.array([0, 0, pz])
         rotmat = rotmat_identity
