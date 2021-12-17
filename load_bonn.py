@@ -6,7 +6,9 @@ import numpy as np
 from cv2 import COLOR_BGR2RGB, cvtColor, imread, resize
 from ipdb import set_trace
 
-from utils.transforms import tfmat_from_rotmat_and_translation, tfmat_from_quat_and_translation
+from utils.transforms import (rotmat_from_euler_zyx,
+                              tfmat_from_rotmat_and_translation,
+                              tfmat_from_quat_and_translation)
 
 
 def load_bonn_data(base_dir, downsample_factor):
@@ -42,7 +44,7 @@ def load_bonn_data(base_dir, downsample_factor):
     camera_info_file.close()
 
     # Read images and poses.
-    trajectory_fpath = base_dirpath / 'trajectory.txt'
+    trajectory_fpath = base_dirpath / 'traj.txt'
     assert trajectory_fpath.exists()
     trajectory_file = open(trajectory_fpath.as_posix(), 'r')
 
@@ -54,7 +56,7 @@ def load_bonn_data(base_dir, downsample_factor):
         # Convert timestamp from seconds to microseconds.
         timestamp = int(timestamp_s * MICROSECONDS_PER_SECOND)
 
-        img_fpath = base_dirpath / f'{timestamp}.png'
+        img_fpath = base_dirpath / 'images' / f'{timestamp}.png'
         assert img_fpath.exists()
         image = resize(cvtColor(imread(img_fpath.as_posix()), COLOR_BGR2RGB),
                        (width, height))
@@ -74,30 +76,35 @@ def load_bonn_data(base_dir, downsample_factor):
     # Move forward by 1 meter in even steps over the first half of the number of render poses, then
     # move backward by 1 meter in even steps over the last half of the render poses. End up back
     # at start.
-    NUM_RENDER_POSES = 30
-    assert NUM_RENDER_POSES % 2 == 0
+    NUM_RENDER_POSES = 1
     render_poses = []
-    rotmat_identity = np.eye(3)
-    pz = 0
-    pz_delta = 1 / NUM_RENDER_POSES
-    half_num_render_poses = NUM_RENDER_POSES // 2
+
+    # start_translation = np.array([0.11, -0.012, 0.563]) + np.array([0, 0, -0.25])
+    start_translation = np.array([-0.11, 0.012, 0.563]) + np.array([0, 0, -0.25])
+    # translation_motion = np.array([0, 0, 0.75])
+    translation_motion = np.array([0, 0, 0.75])
+
+    start_rotation = np.deg2rad(np.array([0, 90, 180]))
+    rotation_motion = np.deg2rad(np.array([0, 0, 0]))
 
     for idx in range(NUM_RENDER_POSES):
-        if idx < half_num_render_poses:
-            pz = -pz_delta * idx
-        else:
-            pz = -0.5 + pz_delta * (idx - half_num_render_poses)
+        pct = idx / NUM_RENDER_POSES
+        translation = start_translation + pct * translation_motion
+        rotmat = rotmat_from_euler_zyx(start_rotation + pct * rotation_motion)
 
-        translation = np.array([0, 0, pz])
-        rotmat = rotmat_identity
         render_pose = tfmat_from_rotmat_and_translation(rotmat, translation)
+        # render_pose = np.array([
+        #     [ 0.0005171 ,  0.01598652,  0.99987207,  0.11357104],
+        #     [-0.02391396,  0.99958646, -0.01596959, -0.01041086],
+        #     [-0.99971389, -0.02390265,  0.00089919,  0.69796815],
+        #     [ 0.        ,  0.        ,  0.        ,  1.        ]])
         render_poses.append(render_pose)
 
     render_poses = np.array(render_poses)
 
     # Compute train indices and test indices.
     all_idxs = list(range(images.shape[0]))
-    test_idxs = all_idxs[::4]
+    test_idxs = all_idxs[::8]
     train_idxs = [idx for idx in all_idxs if idx not in test_idxs]
 
     return images, hwf, poses, render_poses, train_idxs, test_idxs

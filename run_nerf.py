@@ -1,6 +1,7 @@
 import os
 import sys
 import numpy as np
+import open3d as o3d
 import imageio
 import json
 import random
@@ -171,6 +172,16 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
         rgb, disp, acc, _ = render(H, W, K, chunk=chunk, c2w=c2w[:3, :4], **render_kwargs)
         rgbs.append(rgb.cpu().numpy())
         disps.append(disp.cpu().numpy())
+
+        set_trace()
+
+        o3d_rgb = o3d.geometry.Image(rgb.cpu().numpy())
+        o3d_depth = o3d.geometry.Image(1. / disp.cpu().numpy())
+        rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(o3d_rgb, o3d_depth,
+                convert_rgb_to_intensity=False)
+        intrinsics = o3d.camera.PinholeCameraIntrinsic(W, H, focal, focal, W/2, H/2)
+        ptcld = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd, intrinsics)
+        o3d.io.write_point_cloud(f'pointcloud/{i:02.0f}.ply', ptcld)
 
         if i == 0:
             print(rgb.shape, disp.shape)

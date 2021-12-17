@@ -1,0 +1,17 @@
+expname = bonn_strawberry-0_right
+basedir = ./logs
+datadir = ~/eth/implicit-mapping/datasets/strawberry/0/5-to-10-sec/orbslam/front-camera/right-camera/all-frames
+dataset_type = bonn
+
+factor = 2
+
+chunk = 8192  # Default value (1024*32) divided by 4.
+
+N_rand = 1024
+N_samples = 64
+N_importance = 64
+
+use_viewdirs = False
+raw_noise_std = 1e0
+
+i_video = 25000
