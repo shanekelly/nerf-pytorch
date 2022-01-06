@@ -21,23 +21,23 @@ class Embedder:
 
     def create_embedding_fn(self):
         embed_fns = []
-        d = self.kwargs['input_dims']
+        d = self.kwargs['input_dims']  # sk: hard-coded to 3
         out_dim = 0
 
         if self.kwargs['include_input']:
             embed_fns.append(lambda x: x)
             out_dim += d
 
-        max_freq = self.kwargs['max_freq_log2']
-        N_freqs = self.kwargs['num_freqs']
+        max_freq = self.kwargs['max_freq_log2']  # sk: 9 for pos, 3 for view dir
+        N_freqs = self.kwargs['num_freqs']  # sk: 10 for pos, 4 for view dir
 
-        if self.kwargs['log_sampling']:
+        if self.kwargs['log_sampling']:  # sk: hard-coded to True
             freq_bands = 2.**torch.linspace(0., max_freq, steps=N_freqs)
         else:
             freq_bands = torch.linspace(2.**0., 2.**max_freq, steps=N_freqs)
 
         for freq in freq_bands:
-            for p_fn in self.kwargs['periodic_fns']:
+            for p_fn in self.kwargs['periodic_fns']:  # sk: hard-coded to [torch.sin, torch.cos]
                 embed_fns.append(lambda x, p_fn=p_fn, freq=freq: p_fn(x * freq))
                 out_dim += d
 
@@ -77,11 +77,12 @@ class NeRF(nn.Module):
         self.W = W
         self.input_ch = input_ch
         self.input_ch_views = input_ch_views
-        self.skips = skips
+        self.skips = skips  # sk: layers to skip
         self.use_viewdirs = use_viewdirs
 
         self.pts_linears = nn.ModuleList(
-            [nn.Linear(input_ch, W)] + [nn.Linear(W, W) if i not in self.skips else nn.Linear(W + input_ch, W) for i in range(D-1)])
+            [nn.Linear(input_ch, W)] +
+            [nn.Linear(W, W) if i not in self.skips else nn.Linear(W + input_ch, W) for i in range(D-1)])
 
         # Implementation according to the official code release (https://github.com/bmild/nerf/blob/master/run_nerf_helpers.py#L104-L105)
         self.views_linears = nn.ModuleList([nn.Linear(input_ch_views + W, W//2)])
