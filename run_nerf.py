@@ -618,9 +618,6 @@ def train():
             far = 1.
         print('NEAR FAR', near, far)
 
-        import ipdb
-        ipdb.set_trace()
-
     elif args.dataset_type == 'blender':
         images, poses, render_poses, hwf, i_split = load_blender_data(
             args.datadir, args.half_res, args.testskip)
@@ -747,9 +744,10 @@ def train():
     N_rand = args.N_rand
     use_batching = not args.no_batching
 
-    if use_batching:
+    if use_batching:  # sk: True by default
         # For random ray batching
         print('get rays')
+        # sk: A ray for every pixel of every camera image.
         rays = np.stack([get_rays_np(H, W, K, p)
                         for p in poses[:, :3, :4]], 0)  # [N, ro+rd, H, W, 3]
         print('done, concats')
@@ -759,13 +757,14 @@ def train():
         rays_rgb = np.reshape(rays_rgb, [-1, 3, 3])  # [(N-1)*H*W, ro+rd+rgb, 3]
         rays_rgb = rays_rgb.astype(np.float32)
         print('shuffle rays')
+
+        # sk: Shuffle can take a while, because this array can have millions of elements.
         np.random.shuffle(rays_rgb)
 
         print('done')
         i_batch = 0
 
     # Move training data to GPU
-
     if use_batching:
         images = torch.Tensor(images).to(device)
     poses = torch.Tensor(poses).to(device)
