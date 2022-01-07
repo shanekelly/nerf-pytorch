@@ -6,9 +6,9 @@ import numpy as np
 from cv2 import COLOR_BGR2RGB, cvtColor, imread, resize
 from ipdb import set_trace
 
-from utils.transforms import (rotmat_from_euler_zyx,
-                              tfmat_from_rotmat_and_translation,
-                              tfmat_from_quat_and_translation)
+from util.transforms import (rotmat_from_euler_zyx,
+                             tfmat_from_rotmat_and_translation,
+                             tfmat_from_quat_and_translation)
 
 
 def load_bonn_data(base_dir, downsample_factor):
@@ -76,7 +76,7 @@ def load_bonn_data(base_dir, downsample_factor):
     # Move forward by 1 meter in even steps over the first half of the number of render poses, then
     # move backward by 1 meter in even steps over the last half of the render poses. End up back
     # at start.
-    NUM_RENDER_POSES = 1
+    NUM_RENDER_POSES = 10
     render_poses = []
 
     # start_translation = np.array([0.11, -0.012, 0.563]) + np.array([0, 0, -0.25])
