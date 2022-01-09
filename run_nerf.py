@@ -10,7 +10,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm, trange
-from ipdb import launch_ipdb_on_exception, set_trace
 
 import matplotlib.pyplot as plt
 
@@ -21,6 +20,12 @@ from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data
 from load_LINEMOD import load_LINEMOD_data
 from load_bonn import load_bonn_data
+
+# sk: My imports.
+from ipdb import launch_ipdb_on_exception, set_trace
+from pathlib import Path
+from pickle import dump
+from torch.utils.tensorboard import SummaryWriter
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -85,7 +90,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
     Args:
       H: int. Height of image in pixels.
       W: int. Width of image in pixels.
-      focal: float. Focal length of pinhole camera.
+      K: array of shape [3, 3]. Camera intrinsics matrix.
       chunk: int. Maximum number of rays to process simultaneously. Used to
         control maximum memory usage. Does not affect final results.
       rays: array of shape [2, batch_size, 3]. Ray origin and direction for
@@ -183,6 +188,22 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
 
     rgbs = np.stack(rgbs, 0)
     disps = np.stack(disps, 0)
+
+    # sk: If savedir is specified, then save additional debug information inside savedir.
+    if savedir is not None:
+        output_dir = Path(savedir)
+
+        rgbs_file = open(output_dir / 'rgbs.pickle', 'wb')
+        dump(rgbs, rgbs_file)
+        rgbs_file.close()
+
+        disps_file = open(output_dir / 'disps.pickle', 'wb')
+        dump(disps, disps_file)
+        disps_file.close()
+
+        render_poses_file = open(output_dir / 'render_poses.pickle', 'wb')
+        dump(render_poses.cpu().numpy(), render_poses_file)
+        render_poses_file.close()
 
     return rgbs, disps
 
@@ -569,6 +590,8 @@ def train():
     parser = config_parser()
     args = parser.parse_args()
 
+    tensorboard = SummaryWriter(log_dir=Path(args.basedir) / args.expname, flush_secs=10)
+
     # Load data
     K = None
 
@@ -648,8 +671,6 @@ def train():
         i_val = i_test
         near = 0.
         far = 1.
-
-        # set_trace()
 
     else:
         print('Unknown dataset type', args.dataset_type, 'exiting')
@@ -893,6 +914,28 @@ def train():
 
         if i % args.i_print == 0:
             tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
+
+            tensorboard.add_scalar('train/loss', loss, i)
+            tensorboard.add_scalar('train/psnr', psnr, i)
+
+        if i % args.i_img == 0:
+            # Log a rendered validation view to Tensorboard
+            # img_i = np.random.choice(i_val)
+            img_i = i_val[-2] if len(i_val) > 1 else i_val[0]
+            target = images[img_i]
+            c2w = poses[img_i, :3, :4]
+            with torch.no_grad():
+                rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, c2w=c2w,
+                                                **render_kwargs_test)
+
+            psnr = mse2psnr(img2mse(rgb, target))
+
+            tensorboard.add_image('validation/rgb/estimate', rgb, i, dataformats='HWC')
+            if i == 1:
+                tensorboard.add_image('validation/rgb/groundtruth', target, i, dataformats='HWC')
+            tensorboard.add_image('validation/disp/estimate', disp, i, dataformats='HW')
+            tensorboard.add_scalar('validation/psnr', psnr, i)
+
         """
             print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
             print('iter time {:.05f}'.format(dt))
@@ -943,4 +986,5 @@ if __name__ == '__main__':
     torch.set_default_tensor_type('torch.cuda.FloatTensor')
     # torch.set_default_tensor_type('torch.FloatTensor')
 
+    # with launch_ipdb_on_exception():
     train()
