@@ -833,7 +833,8 @@ def train():
     # writer = SummaryWriter(os.path.join(basedir, 'summaries', expname))
 
     num_grid_sections = grid_size ** 2
-    num_rays_to_sample_per_section = 200 // num_grid_sections
+    num_rays_to_sample_per_img = 2000
+    num_rays_to_sample_per_section = num_rays_to_sample_per_img // num_grid_sections
     start = start + 1
 
     tqdm_bar = trange(start, N_iters)
@@ -854,7 +855,7 @@ def train():
             # sub_fig = sub_figs[img_idx]
             # axs = sub_fig.subplots(grid_size, grid_size)
             for grid_row_idx, grid_col_idx in product(range(grid_size), range(grid_size)):
-                pixels_to_add = torch.empty((0, 2))
+                pixels_to_add = np.empty((0, 2))
                 while pixels_to_add.shape[0] < num_rays_to_sample_per_section:
                     num_pixels_to_add = num_rays_to_sample_per_section - pixels_to_add.shape[0]
                     start_idx = batch_idxs[img_idx, grid_row_idx, grid_col_idx]
