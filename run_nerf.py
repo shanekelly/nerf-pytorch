@@ -5,7 +5,6 @@ import open3d as o3d
 import imageio
 import json
 import random
-import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -27,6 +26,7 @@ from itertools import product
 from matplotlib.patches import Circle
 from pathlib import Path
 from pickle import dump
+from time import time, perf_counter
 from torch.utils.tensorboard import SummaryWriter
 
 
@@ -171,11 +171,11 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
     rgbs = []
     disps = []
 
-    t = time.time()
+    t = time()
 
     for i, c2w in enumerate(tqdm(render_poses)):
-        print(i, time.time() - t)
-        t = time.time()
+        print(i, time() - t)
+        t = time()
         rgb, disp, acc, _ = render(H, W, K, chunk=chunk, c2w=c2w[:3, :4], **render_kwargs)
         rgbs.append(rgb.cpu().numpy())
         disps.append(disp.cpu().numpy())
@@ -585,7 +585,7 @@ def config_parser():
                         help='frequency of render_poses video saving')
 
     # sk: My options.
-    parser.add_argument("--img_grid_side_len",   type=int, default=2,
+    parser.add_argument("--img_grid_side_len",   type=int, default=8,
                         help='The side length of the grid used to split up training images for '
                         'image active sampling.')
 
@@ -760,11 +760,15 @@ def train():
     grid_size = args.img_grid_side_len
 
     # For random ray batching
-    print('get rays')
+    print('Getting rays...', end='')
+    t = perf_counter()
     # sk: A ray for every pixel of every camera image.
     rays = np.stack([get_rays_np(H, W, K, p)
                     for p in poses[:, :3, :4]], 0)  # [N, ro+rd, H, W, 3]
-    print('done, concats')
+    print(f' done in {perf_counter() - t:.4f} seconds.')
+
+    print('Merging rays with rgb and sorting into grids...', end='')
+    t = perf_counter()
     rays_rgb = np.concatenate([rays, images[:, None]], 1)  # [N, ro+rd+rgb, H, W, 3]
     rays_rgb = np.transpose(rays_rgb, [0, 2, 3, 1, 4])  # [N, H, W, ro+rd+rgb, 3]
     rays_rgb = np.stack([rays_rgb[i] for i in i_train], 0)  # train images only
@@ -786,20 +790,14 @@ def train():
             rays_rgb[:, img_start_row_idx:img_stop_row_idx,
                      img_start_col_idx:img_stop_col_idx, :, :]
         rays[:, grid_row_idx, grid_col_idx, :, :, :] = grid_section
-    #     ax = plt.subplot(grid_size, grid_size, idx + 1)
-    #     img_section = grid_section[0, :, :, -1, :]
-    #     ax.imshow(img_section)
-    #     ax.add_patch(Circle((100, 100), 2, color='black'))
-    #     ax.add_patch(Circle((100, 100), 1.5, color='white'))
-    #     ax.add_patch(Circle((100, 100), 0.5, color='red'))
-    #     ax.axis('off')
-    # plt.show()
-    # set_trace()
+
     # sk: shape (num training images, grid rows, grid cols, H*W//16, ro+rd+rgb, 3)
     # rays_rgb = np.reshape(rays_rgb, [rays_rgb.shape[0], 4, 4, H*W // 16, 3, 3])
     rays = rays.astype(np.float32)
-    print('shuffle rays')
+    print(f' done in {perf_counter() - t:.4f} seconds.')
 
+    print('Randomly shuffling rays...', end='')
+    t = perf_counter()
     # sk: Shuffle can take a while, because there are as many rays as there are pixels in all
     # the training images combined.
     grid_section_idxs = \
@@ -815,10 +813,9 @@ def train():
         np.random.shuffle(rand_idxs)
         rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, :, :] = \
             rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, rand_idxs, :]
+    print(f' done in {perf_counter() - t:.4f} seconds.')
 
     batch_idxs = np.zeros((num_train_imgs, grid_size, grid_size), dtype=int)
-
-    print('done')
 
     # Move training data to GPU
     images = torch.Tensor(images).to(device)
@@ -835,22 +832,29 @@ def train():
     # Summary writers
     # writer = SummaryWriter(os.path.join(basedir, 'summaries', expname))
 
+    num_grid_sections = grid_size ** 2
+    num_rays_per_grid_section = 200 // num_grid_sections
     start = start + 1
 
-    for i in trange(start, N_iters):
-        time0 = time.time()
+    tqdm_bar = trange(start, N_iters)
+
+    for i in tqdm_bar:
+        time0 = time()
 
         # Sample random ray batch
 
         # Random over all images
+        # print('Drawing uniform random batch across grid sections...', end='')
+        t = perf_counter()
         batch = torch.empty((0, 3, 3))
-        num_rays_per_grid_section = 200
-        fig = plt.figure()
-        sub_figs = fig.subfigures(num_train_imgs, 1)
+        # fig = plt.figure()
+        # sub_figs = fig.subfigures(num_train_imgs, 1)
         for img_idx in range(num_train_imgs):
-            sub_fig = sub_figs[img_idx]
-            axs = sub_fig.subplots(grid_size, grid_size, constrained_layout=True)
+            # sub_fig = sub_figs[img_idx]
+            # axs = sub_fig.subplots(grid_size, grid_size)
             for grid_row_idx, grid_col_idx in product(range(grid_size), range(grid_size)):
+                add_to_batch = torch.empty((0, 3, 3))
+                # while add_to_batch.shape[0] < num_rays_per_grid_section
                 start_idx = batch_idxs[img_idx, grid_row_idx, grid_col_idx]
                 stop_idx = \
                     batch_idxs[img_idx, grid_row_idx, grid_col_idx] + num_rays_per_grid_section
@@ -862,50 +866,61 @@ def train():
 
                 batch_idxs[img_idx, grid_row_idx, grid_col_idx] += num_rays_per_grid_section
 
-                ax = axs[grid_row_idx, grid_col_idx]
-                ax.imshow(rays[img_idx, grid_row_idx, grid_col_idx, :, :, 2, :])
-                for pixel_row_idx, pixel_col_idx in rand_pixels:
-                    ax.add_patch(Circle((pixel_col_idx, pixel_row_idx), 2, color='black'))
-                    ax.add_patch(Circle((pixel_col_idx, pixel_row_idx), 1.5, color='white'))
-                    ax.add_patch(Circle((pixel_col_idx, pixel_row_idx), 0.5, color='red'))
-                ax.axis('off')
-                ax.set_xmargin(0.1)
+                # ax = axs[grid_row_idx, grid_col_idx]
+                # ax.imshow(rays[img_idx, grid_row_idx, grid_col_idx, :, :, 2, :])
+                # for pixel_row_idx, pixel_col_idx in rand_pixels:
+                #     ax.add_patch(Circle((pixel_col_idx, pixel_row_idx), 2, color='black'))
+                #     ax.add_patch(Circle((pixel_col_idx, pixel_row_idx), 1.5, color='white'))
+                #     ax.add_patch(Circle((pixel_col_idx, pixel_row_idx), 0.5, color='red'))
+                # ax.axis('off')
 
-            # sk: TODO: If you draw the remainder of the pixels and still have more to draw,
-            # don't just stop. Shuffle, then continue drawing.
-            if batch_idxs[img_idx, grid_row_idx, grid_col_idx] >= num_pixels_per_grid_section:
-                print(
-                    f'Shuffle data ({img_idx}, {grid_row_idx}, {grid_col_idx}) after an epoch!')
-                rand_idxs = np.random.permutation(num_pixels_per_grid_section)
-                rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, :, :] = \
-                    rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, rand_idxs, :]
-                batch_idxs[img_idx, grid_row_idx, grid_col_idx] = 0
+                # sk: TODO: If you draw the remainder of the pixels and still have more to draw,
+                # don't just stop. Shuffle, then continue drawing.
+                if batch_idxs[img_idx, grid_row_idx, grid_col_idx] >= num_pixels_per_grid_section:
+                    # print(
+                    #     f'Shuffle data ({img_idx}, {grid_row_idx}, {grid_col_idx}) after an epoch!')
+                    rand_idxs = np.random.permutation(num_pixels_per_grid_section)
+                    rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, :, :] = \
+                        rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, rand_idxs, :]
+                    batch_idxs[img_idx, grid_row_idx, grid_col_idx] = 0
 
-            plt.tight_layout(w_pad=2, h_pad=2)
+        # plt.show()
 
-            plt.show()
+        batch = torch.transpose(batch, 0, 1)
+        batch_rays, target_s = batch[:2], batch[2]
 
-            batch = torch.transpose(batch, 0, 1)
-            batch_rays, target_s = batch[:2], batch[2]
+        t_batching = perf_counter() - t
+        # print(f' done in {perf_counter() - t:.4f} seconds.')
 
         #####  Core optimization loop  #####
+        # print('Rendering batch...', end='')
+        t = perf_counter()
         rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
                                         verbose=i < 10, retraw=True,
                                         **render_kwargs_train)
+        t_rendering = perf_counter() - t
+        # print(f' done in {perf_counter() - t: .4f} seconds.')
 
+        # print('Computing loss...', end='')
+        # t = perf_counter()
         optimizer.zero_grad()
         img_loss = img2mse(rgb, target_s)
         trans = extras['raw'][..., -1]
         loss = img_loss
         psnr = mse2psnr(img_loss)
+        # print(f' done in {perf_counter() - t: .4f} seconds.')
 
         if 'rgb0' in extras:
             img_loss0 = img2mse(extras['rgb0'], target_s)
             loss = loss + img_loss0
             psnr0 = mse2psnr(img_loss0)
 
+        # print('Back propagating...', end='')
+        t = perf_counter()
         loss.backward()
         optimizer.step()
+        t_backprop = perf_counter() - t
+        # print(' done in {perf_counter() - t: .4f} seconds.')
 
         # NOTE: IMPORTANT!
         ###   update learning rate   ###
@@ -917,7 +932,7 @@ def train():
             param_group['lr'] = new_lrate
         ################################
 
-        dt = time.time()-time0
+        dt = time()-time0
         # print(f"Step: {global_step}, Loss: {loss}, Time: {dt}")
         #####           end            #####
 
