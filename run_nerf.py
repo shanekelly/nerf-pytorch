@@ -777,7 +777,7 @@ def train():
     if use_batching:
         rays_rgb = torch.Tensor(rays_rgb).to(device)
 
-    N_iters = 200000 + 1
+    N_iters = 50000 + 1
     print('Begin')
     print('TRAIN views are', i_train)
     print('TEST views are', i_test)
@@ -931,7 +931,7 @@ def train():
             psnr = mse2psnr(img2mse(rgb, target))
 
             tensorboard.add_image('validation/rgb/estimate', rgb, i, dataformats='HWC')
-            if i == 1:
+            if i == args.i_img:
                 tensorboard.add_image('validation/rgb/groundtruth', target, i, dataformats='HWC')
             tensorboard.add_image('validation/disp/estimate', disp, i, dataformats='HW')
             tensorboard.add_scalar('validation/psnr', psnr, i)
