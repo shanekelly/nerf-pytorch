@@ -28,6 +28,7 @@ from matplotlib.patches import Circle
 from pathlib import Path
 from pickle import dump
 from torch.utils.tensorboard import SummaryWriter
+from matplotlib.patches import Circle
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
