@@ -22,6 +22,14 @@ from load_blender import load_blender_data
 from load_LINEMOD import load_LINEMOD_data
 from load_bonn import load_bonn_data
 
+# sk: My imports.
+from ipdb import launch_ipdb_on_exception, set_trace
+from itertools import product
+from pathlib import Path
+from pickle import dump
+from torch.utils.tensorboard import SummaryWriter
+from matplotlib.patches import Circle
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 np.random.seed(0)
@@ -561,6 +569,11 @@ def config_parser():
     parser.add_argument("--i_video",   type=int, default=50000,
                         help='frequency of render_poses video saving')
 
+    # sk: My options.
+    parser.add_argument("--img_grid_side_len",   type=int, default=2,
+                        help='The side length of the grid used to split up training images for '
+                        'image active sampling.')
+
     return parser
 
 
@@ -728,6 +741,8 @@ def train():
     N_rand = args.N_rand
     use_batching = not args.no_batching
 
+    grid_size = args.img_grid_side_len
+
     if use_batching:  # sk: True by default
         # For random ray batching
         print('get rays')
@@ -738,15 +753,57 @@ def train():
         rays_rgb = np.concatenate([rays, images[:, None]], 1)  # [N, ro+rd+rgb, H, W, 3]
         rays_rgb = np.transpose(rays_rgb, [0, 2, 3, 1, 4])  # [N, H, W, ro+rd+rgb, 3]
         rays_rgb = np.stack([rays_rgb[i] for i in i_train], 0)  # train images only
-        rays_rgb = np.reshape(rays_rgb, [-1, 3, 3])  # [(N-1)*H*W, ro+rd+rgb, 3]
-        rays_rgb = rays_rgb.astype(np.float32)
+        assert H % grid_size == 0
+        assert W % grid_size == 0
+        grid_section_height = H // grid_size
+        grid_section_width = W // grid_size
+        num_pixels_per_grid_section = grid_section_height * grid_section_width
+        num_train_imgs = len(i_train)
+        rays = np.zeros((num_train_imgs, grid_size, grid_size,
+                         grid_section_height, grid_section_width, 3, 3))
+        for idx, (grid_row_idx, grid_col_idx) in enumerate(product(range(grid_size),
+                                                                   range(grid_size))):
+            img_start_row_idx = grid_row_idx * grid_section_height
+            img_stop_row_idx = (grid_row_idx + 1) * grid_section_height
+            img_start_col_idx = grid_col_idx * grid_section_width
+            img_stop_col_idx = (grid_col_idx + 1) * grid_section_width
+            grid_section = \
+                rays_rgb[:, img_start_row_idx:img_stop_row_idx,
+                         img_start_col_idx:img_stop_col_idx, :, :]
+            rays[:, grid_row_idx, grid_col_idx, :, :, :] = grid_section
+        #     ax = plt.subplot(grid_size, grid_size, idx + 1)
+        #     img_section = grid_section[0, :, :, -1, :]
+        #     ax.imshow(img_section)
+        #     ax.add_patch(Circle((100, 100), 2, color='black'))
+        #     ax.add_patch(Circle((100, 100), 1.5, color='white'))
+        #     ax.add_patch(Circle((100, 100), 0.5, color='red'))
+        #     ax.axis('off')
+        # plt.show()
+        # set_trace()
+        # sk: shape (num training images, grid rows, grid cols, H*W//16, ro+rd+rgb, 3)
+        # rays_rgb = np.reshape(rays_rgb, [rays_rgb.shape[0], 4, 4, H*W // 16, 3, 3])
+        rays = rays.astype(np.float32)
         print('shuffle rays')
 
-        # sk: Shuffle can take a while, because this array can have millions of elements.
-        np.random.shuffle(rays_rgb)
+        # sk: Shuffle can take a while, because there are as many rays as there are pixels in all
+        # the training images combined.
+        grid_section_idxs = \
+            [idxs for idxs in product(range(grid_section_height), range(grid_section_width))]
+        rand_pixel_idxs = \
+            np.broadcast_to(grid_section_idxs,
+                            (num_train_imgs, grid_size, grid_size,
+                             num_pixels_per_grid_section, 2)).copy()
+        for img_idx, grid_row_idx, grid_col_idx in product(range(num_train_imgs),
+                                                           range(grid_size),
+                                                           range(grid_size)):
+            rand_idxs = np.arange(num_pixels_per_grid_section)
+            np.random.shuffle(rand_idxs)
+            rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, :, :] = \
+                rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, rand_idxs, :]
+
+        batch_idxs = np.zeros((num_train_imgs, grid_size, grid_size), dtype=int)
 
         print('done')
-        i_batch = 0
 
     # Move training data to GPU
     if use_batching:
@@ -754,7 +811,7 @@ def train():
     poses = torch.Tensor(poses).to(device)
 
     if use_batching:
-        rays_rgb = torch.Tensor(rays_rgb).to(device)
+        rays = torch.Tensor(rays).to(device)
 
     N_iters = 200000 + 1
     print('Begin')
@@ -774,17 +831,35 @@ def train():
 
         if use_batching:
             # Random over all images
-            batch = rays_rgb[i_batch:i_batch+N_rand]  # [B, 2+1, 3*?]
+            batch = np.empty((0, 3, 3))
+            num_rays_per_grid_section = 200
+            for img_idx, grid_row_idx, grid_col_idx in product(range(num_train_imgs),
+                                                               range(grid_size),
+                                                               range(grid_size)):
+                start_idx = batch_idxs[img_idx, grid_row_idx, grid_col_idx]
+                stop_idx = \
+                    batch_idxs[img_idx, grid_row_idx, grid_col_idx] + num_rays_per_grid_section
+                rand_pixels = \
+                    rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, start_idx:stop_idx, :]
+                batch = np.concatenate(
+                    (batch, rays[img_idx, grid_row_idx, grid_col_idx, rand_pixels[:, 0],
+                                 rand_pixels[:, 1]]))
+
+                batch_idxs[img_idx, grid_row_idx, grid_col_idx] += num_rays_per_grid_section
+
+                # sk: TODO: If you draw the remainder of the pixels and still have more to draw,
+                # don't just stop. Shuffle, then continue drawing.
+                if batch_idxs[img_idx, grid_row_idx, grid_col_idx] >= num_pixels_per_grid_section:
+                    print(
+                        f'Shuffle data ({img_idx}, {grid_row_idx}, {grid_col_idx}) after an epoch!')
+                    rand_idxs = torch.randperm(num_pixels_per_grid_section)
+                    rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, :, :] = \
+                        rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, rand_idxs, :]
+                    batch_idxs[img_idx, grid_row_idx, grid_col_idx] = 0
+
+            batch = torch.from_numpy(batch)
             batch = torch.transpose(batch, 0, 1)
             batch_rays, target_s = batch[:2], batch[2]
-
-            i_batch += N_rand
-
-            if i_batch >= rays_rgb.shape[0]:
-                print("Shuffle data after an epoch!")
-                rand_idx = torch.randperm(rays_rgb.shape[0])
-                rays_rgb = rays_rgb[rand_idx]
-                i_batch = 0
 
         else:
             # Random from one image
@@ -931,8 +1006,10 @@ def train():
 
                     with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
                         tf.contrib.summary.image('rgb0', to8b(extras['rgb0'])[tf.newaxis])
-                        tf.contrib.summary.image('disp0', extras['disp0'][tf.newaxis,...,tf.newaxis])
-                        tf.contrib.summary.image('z_std', extras['z_std'][tf.newaxis,...,tf.newaxis])
+                        tf.contrib.summary.image(
+                            'disp0', extras['disp0'][tf.newaxis,...,tf.newaxis])
+                        tf.contrib.summary.image(
+                            'z_std', extras['z_std'][tf.newaxis,...,tf.newaxis])
         """
 
         global_step += 1
