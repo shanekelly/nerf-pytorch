@@ -44,7 +44,7 @@ def load_bonn_data(base_dir, downsample_factor):
     camera_info_file.close()
 
     # Read images and poses.
-    trajectory_fpath = base_dirpath / 'traj.txt'
+    trajectory_fpath = base_dirpath / 'traj_z-backwards.txt'
     assert trajectory_fpath.exists()
     trajectory_file = open(trajectory_fpath.as_posix(), 'r')
 
@@ -104,7 +104,10 @@ def load_bonn_data(base_dir, downsample_factor):
 
     # Compute train indices and test indices.
     all_idxs = list(range(images.shape[0]))
-    test_idxs = all_idxs[::8]
+    if len(all_idxs) <= 5:
+        test_idxs = [len(all_idxs) // 2]
+    else:
+        test_idxs = all_idxs[::8]
     train_idxs = [idx for idx in all_idxs if idx not in test_idxs]
 
     return images, hwf, poses, render_poses, train_idxs, test_idxs
