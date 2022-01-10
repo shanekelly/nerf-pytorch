@@ -847,7 +847,7 @@ def train():
 
         if use_batching:
             # Random over all images
-            batch = np.empty((0, 3, 3))
+            batch = torch.empty((0, 3, 3))
             num_rays_per_grid_section = 200
             for img_idx, grid_row_idx, grid_col_idx in product(range(num_train_imgs),
                                                                range(grid_size),
@@ -857,7 +857,7 @@ def train():
                     batch_idxs[img_idx, grid_row_idx, grid_col_idx] + num_rays_per_grid_section
                 rand_pixels = \
                     rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, start_idx:stop_idx, :]
-                batch = np.concatenate(
+                batch = torch.cat(
                     (batch, rays[img_idx, grid_row_idx, grid_col_idx, rand_pixels[:, 0],
                                  rand_pixels[:, 1]]))
 
@@ -868,12 +868,11 @@ def train():
                 if batch_idxs[img_idx, grid_row_idx, grid_col_idx] >= num_pixels_per_grid_section:
                     print(
                         f'Shuffle data ({img_idx}, {grid_row_idx}, {grid_col_idx}) after an epoch!')
-                    rand_idxs = torch.randperm(num_pixels_per_grid_section)
+                    rand_idxs = np.random.permutation(num_pixels_per_grid_section)
                     rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, :, :] = \
                         rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, rand_idxs, :]
                     batch_idxs[img_idx, grid_row_idx, grid_col_idx] = 0
 
-            batch = torch.from_numpy(batch)
             batch = torch.transpose(batch, 0, 1)
             batch_rays, target_s = batch[:2], batch[2]
 
