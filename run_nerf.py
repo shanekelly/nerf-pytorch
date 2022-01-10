@@ -1045,6 +1045,8 @@ def train():
                             'z_std', extras['z_std'][tf.newaxis,...,tf.newaxis])
         """
 
+        tqdm_bar.set_postfix({'t_batch': f'{t_batching:.3f}', 't_render': f'{t_rendering:.3f}',
+                              't_back': f'{t_backprop:.3f}'})
         global_step += 1
 
 
