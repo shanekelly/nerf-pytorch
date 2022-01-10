@@ -821,41 +821,33 @@ def train():
     images = torch.Tensor(images).to(device)
     poses = torch.Tensor(poses).to(device)
 
-    rays = torch.Tensor(rays).to(device)
-
     N_iters = 50000 + 1
     print('Begin')
     print('TRAIN views are', i_train)
     print('TEST views are', i_test)
     print('VAL views are', i_val)
 
-    # Summary writers
-    # writer = SummaryWriter(os.path.join(basedir, 'summaries', expname))
-
     num_grid_sections = grid_size ** 2
-    num_rays_to_sample_per_img = 2000
+    num_rays_to_sample_per_img = 200
     num_rays_to_sample_per_section = num_rays_to_sample_per_img // num_grid_sections
     start = start + 1
 
     tqdm_bar = trange(start, N_iters)
-
     for i in tqdm_bar:
-        time0 = time()
-
         # Sample random ray batch
 
         # Random over all images
         # print('Drawing uniform random batch across grid sections...', end='')
         t = perf_counter()
-        batches = torch.empty((num_train_imgs, grid_size, grid_size, num_rays_to_sample_per_section,
-                               3, 3))
+        batches = np.empty((num_train_imgs, grid_size, grid_size, num_rays_to_sample_per_section,
+                            3, 3))
         # fig = plt.figure()
         # sub_figs = fig.subfigures(num_train_imgs, 1)
         for img_idx in range(num_train_imgs):
             # sub_fig = sub_figs[img_idx]
             # axs = sub_fig.subplots(grid_size, grid_size)
             for grid_row_idx, grid_col_idx in product(range(grid_size), range(grid_size)):
-                pixels_to_add = np.empty((0, 2))
+                pixels_to_add = np.empty((0, 2), dtype=int)
                 while pixels_to_add.shape[0] < num_rays_to_sample_per_section:
                     num_pixels_to_add = num_rays_to_sample_per_section - pixels_to_add.shape[0]
                     start_idx = batch_idxs[img_idx, grid_row_idx, grid_col_idx]
@@ -889,7 +881,7 @@ def train():
 
         # plt.show()
 
-        batch = torch.reshape(batches, (-1, 3, 3))
+        batch = torch.reshape(torch.from_numpy(batches).to(device), (-1, 3, 3))
         batch = torch.transpose(batch, 0, 1)
         batch_rays, target_s = batch[:2], batch[2]
 
@@ -936,9 +928,6 @@ def train():
         for param_group in optimizer.param_groups:
             param_group['lr'] = new_lrate
         ################################
-
-        dt = time()-time0
-        # print(f"Step: {global_step}, Loss: {loss}, Time: {dt}")
         #####           end            #####
 
         # Rest is logging
