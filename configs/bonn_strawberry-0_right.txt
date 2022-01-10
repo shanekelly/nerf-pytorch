@@ -1,11 +1,12 @@
-expname = bonn_strawberry-0_right
+expname = bonn_strawberry-0_right_active-sampling
 basedir = ./logs
-datadir = ~/eth/implicit-mapping/datasets/strawberry/0/5-to-10-sec/orbslam/front-camera/right-camera/all-frames
+datadir = ~/eth/implicit-mapping/datasets/strawberry/0/3-frames/orbslam/front-camera/right-camera/all-frames
 dataset_type = bonn
 
-factor = 2
+factor = 2  # Downsampling factor.
 
-chunk = 8192  # Default value (1024*32) divided by 4.
+chunk = 8192  # Default value (1024*32=32768) divided by 4.
+netchunk = 32768  # Default value (1024*64=65536) divided by 2.
 
 N_rand = 1024
 N_samples = 64
@@ -14,4 +15,4 @@ N_importance = 64
 use_viewdirs = False
 raw_noise_std = 1e0
 
-i_video = 25000
+render_test = True  # Render the test images instead of a custom render path.
