@@ -1120,8 +1120,11 @@ def train():
 
 if __name__ == '__main__':
     torch.cuda.empty_cache()
-    torch.set_default_tensor_type('torch.cuda.FloatTensor')
-    # torch.set_default_tensor_type('torch.FloatTensor')
 
-    # with launch_ipdb_on_exception():
-    train()
+    if torch.cuda.is_available():
+        torch.set_default_tensor_type('torch.cuda.FloatTensor')
+    else:
+        torch.set_default_tensor_type('torch.FloatTensor')
+
+    with launch_ipdb_on_exception():
+        train()
