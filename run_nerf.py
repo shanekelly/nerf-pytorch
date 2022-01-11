@@ -12,8 +12,8 @@ from tqdm import tqdm, trange
 
 import matplotlib.pyplot as plt
 
-from run_nerf_helpers import (get_embedder, get_rays, get_rays_np, img2mse, mse2psnr, NeRF,
-                              ndc_rays, sample_pdf, to8b)
+from run_nerf_helpers import (get_embedder, get_initial_section_rand_pixel_idxs, get_rays,
+                              get_rays_np, img2mse, mse2psnr, NeRF, ndc_rays, sample_pdf, to8b)
 
 from load_llff import load_llff_data
 from load_deepvoxels import load_dv_data
@@ -601,6 +601,7 @@ def config_parser():
     parser.add_argument('--i_active_sampling_fig', type=int, default=500, help='The frequency of '
                         'creating a figure to visualize the active sampling and logging it to '
                         'tensorboard.')
+    parser.add_argument('--verbose', action='store_true', help='True to print additional info.')
 
     return parser
 
@@ -771,61 +772,50 @@ def train():
     use_batching = not args.no_batching
     assert use_batching is True
 
+    verbose = args.verbose
     grid_size = args.img_grid_side_len
 
     # For random ray batching
-    print('Getting rays...', end='')
+    if verbose:
+        print('Getting rays...', end='')
     t = perf_counter()
     # sk: A ray for every pixel of every camera image.
     rays = np.stack([get_rays_np(H, W, K, p)
                      for p in poses[:, :3, :4]], 0)  # [N, ro+rd, H, W, 3]
-    print(f' done in {perf_counter() - t:.4f} seconds.')
+    if verbose:
+        print(f' done in {perf_counter() - t:.4f} seconds.')
 
-    print('Merging rays with rgb and sorting into grids...', end='')
+    if verbose:
+        print('Merging rays with rgb and sorting into grids...', end='')
     t = perf_counter()
     rays_rgb = np.concatenate([rays, images[:, None]], 1)  # [N, ro+rd+rgb, H, W, 3]
     rays_rgb = np.transpose(rays_rgb, [0, 2, 3, 1, 4])  # [N, H, W, ro+rd+rgb, 3]
     rays_rgb = np.stack([rays_rgb[i] for i in i_train], 0)  # train images only
     assert H % grid_size == 0
     assert W % grid_size == 0
-    grid_section_height = H // grid_size
-    grid_section_width = W // grid_size
-    num_pixels_per_grid_section = grid_section_height * grid_section_width
+    section_height = H // grid_size
+    section_width = W // grid_size
+    num_pixels_per_section = section_height * section_width
     num_train_imgs = len(i_train)
     rays = np.zeros((num_train_imgs, grid_size, grid_size,
-                     grid_section_height, grid_section_width, 3, 3))
+                     section_height, section_width, 3, 3))
     for idx, (grid_row_idx, grid_col_idx) in enumerate(product(range(grid_size),
                                                                range(grid_size))):
-        img_start_row_idx = grid_row_idx * grid_section_height
-        img_stop_row_idx = (grid_row_idx + 1) * grid_section_height
-        img_start_col_idx = grid_col_idx * grid_section_width
-        img_stop_col_idx = (grid_col_idx + 1) * grid_section_width
-        grid_section = rays_rgb[:, img_start_row_idx:img_stop_row_idx,
-                                img_start_col_idx:img_stop_col_idx, :, :]
-        rays[:, grid_row_idx, grid_col_idx, :, :, :] = grid_section
+        img_start_row_idx = grid_row_idx * section_height
+        img_stop_row_idx = (grid_row_idx + 1) * section_height
+        img_start_col_idx = grid_col_idx * section_width
+        img_stop_col_idx = (grid_col_idx + 1) * section_width
+        section = rays_rgb[:, img_start_row_idx:img_stop_row_idx,
+                           img_start_col_idx:img_stop_col_idx, :, :]
+        rays[:, grid_row_idx, grid_col_idx, :, :, :] = section
 
-    # sk: shape (num training images, grid rows, grid cols, H*W//16, ro+rd+rgb, 3)
-    # rays_rgb = np.reshape(rays_rgb, [rays_rgb.shape[0], 4, 4, H*W // 16, 3, 3])
+    # sk: shape (num training images, num grid rows, num grid cols, num pixels per section, ro+rd+rgb, 3)
     rays = rays.astype(np.float32)
-    print(f' done in {perf_counter() - t:.4f} seconds.')
+    if verbose:
+        print(f' done in {perf_counter() - t:.4f} seconds.')
 
-    print('Randomly shuffling rays...', end='')
-    t = perf_counter()
-    # sk: Shuffle can take a while, because there are as many rays as there are pixels in all
-    # the training images combined.
-    grid_section_idxs = [idxs for idxs in product(
-        range(grid_section_height), range(grid_section_width))]
-    rand_pixel_idxs = np.broadcast_to(grid_section_idxs,
-                                      (num_train_imgs, grid_size, grid_size,
-                                       num_pixels_per_grid_section, 2)).copy()
-    for img_idx, grid_row_idx, grid_col_idx in product(range(num_train_imgs),
-                                                       range(grid_size),
-                                                       range(grid_size)):
-        rand_idxs = np.arange(num_pixels_per_grid_section)
-        np.random.shuffle(rand_idxs)
-        rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, :,
-                        :] = rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, rand_idxs, :]
-    print(f' done in {perf_counter() - t:.4f} seconds.')
+    section_rand_pixel_idxs, t_initial_shuffle_ = get_initial_section_rand_pixel_idxs(
+        num_train_imgs, grid_size, section_height, section_width, verbose=verbose)
 
     batch_idxs = np.zeros((num_train_imgs, grid_size, grid_size), dtype=int)
 
@@ -839,10 +829,11 @@ def train():
     print('TEST views are', i_test)
     print('VAL views are', i_val)
 
-    num_grid_sections = grid_size ** 2
+    num_sections = grid_size ** 2
     num_random_rays_to_sample_per_img = 200
-    num_random_rays_to_sample_per_img = num_random_rays_to_sample_per_img // num_grid_sections
+    num_random_rays_to_sample_per_img = num_random_rays_to_sample_per_img // num_sections
     num_active_rays_to_sample_per_img = 200
+
     start = start + 1
 
     tqdm_bar = trange(start, N_iters)
@@ -850,7 +841,8 @@ def train():
         do_rand_sampling_fig = i % args.i_rand_sampling_fig == 0
         do_active_sampling_fig = i % args.i_active_sampling_fig == 0
 
-        # print('Drawing uniform random batch across grid sections...', end='')
+        if verbose:
+            print('Drawing uniform random batch across grid sections...', end='')
         t = perf_counter()
         losses = np.empty((num_train_imgs, grid_size, grid_size))
         if do_rand_sampling_fig:
@@ -866,20 +858,19 @@ def train():
                     num_pixels_to_add = num_random_rays_to_sample_per_img - pixels_to_add.shape[0]
                     start_idx = batch_idxs[img_idx, grid_row_idx, grid_col_idx]
                     stop_idx = start_idx + num_pixels_to_add
-                    pixels_to_add = \
-                        np.concatenate(
-                            (pixels_to_add, rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx,
-                                                            start_idx:stop_idx, :]))
+                    pixels_to_add = np.concatenate(
+                        (pixels_to_add, section_rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx,
+                                                                start_idx:stop_idx, :]))
 
                     batch_idxs[img_idx, grid_row_idx, grid_col_idx] += num_pixels_to_add
 
                     if (batch_idxs[img_idx, grid_row_idx, grid_col_idx] >=
-                            num_pixels_per_grid_section):
+                            num_pixels_per_section):
                         # print(f'Shuffle data ({img_idx}, {grid_row_idx}, {grid_col_idx}) after '
                         #       'an epoch!')
-                        rand_idxs = np.random.permutation(num_pixels_per_grid_section)
-                        rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, :, :] = \
-                            rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, rand_idxs, :]
+                        rand_idxs = np.random.permutation(num_pixels_per_section)
+                        section_rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, :,
+                                                :] = section_rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, rand_idxs, :]
                         batch_idxs[img_idx, grid_row_idx, grid_col_idx] = 0
 
                 if do_rand_sampling_fig:
@@ -913,8 +904,8 @@ def train():
         for img_idx in range(num_train_imgs):
             img_losses = losses[img_idx]
             active_sample_probs[img_idx] = img_losses / np.sum(img_losses)
-            num_active_samples[img_idx] = \
-                active_sample_probs[img_idx] * num_active_rays_to_sample_per_img
+            num_active_samples[img_idx] = active_sample_probs[img_idx] * \
+                num_active_rays_to_sample_per_img
 
         if do_active_sampling_fig:
             fig = plt.figure(figsize=(6.5, num_train_imgs * 2.5))
@@ -936,20 +927,19 @@ def train():
                         num_pixels_to_add = num_active_samples_to_draw - pixels_to_add.shape[0]
                         start_idx = batch_idxs[img_idx, grid_row_idx, grid_col_idx]
                         stop_idx = start_idx + num_pixels_to_add
-                        pixels_to_add = \
-                            np.concatenate((pixels_to_add,
-                                            rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx,
-                                                            start_idx:stop_idx, :]))
+                        pixels_to_add = np.concatenate((pixels_to_add,
+                                                        section_rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx,
+                                                                                start_idx:stop_idx, :]))
 
                         batch_idxs[img_idx, grid_row_idx, grid_col_idx] += num_pixels_to_add
 
                         if (batch_idxs[img_idx, grid_row_idx, grid_col_idx] >=
-                                num_pixels_per_grid_section):
+                                num_pixels_per_section):
                             # print(f'Shuffle data ({img_idx}, {grid_row_idx}, {grid_col_idx}) '
                             # after an epoch!')
-                            rand_idxs = np.random.permutation(num_pixels_per_grid_section)
-                            rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, :, :] = \
-                                rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, rand_idxs, :]
+                            rand_idxs = np.random.permutation(num_pixels_per_section)
+                            section_rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, :,
+                                                    :] = section_rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, rand_idxs, :]
                             batch_idxs[img_idx, grid_row_idx, grid_col_idx] = 0
 
                 if do_active_sampling_fig:

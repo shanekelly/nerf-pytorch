@@ -4,6 +4,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
+from itertools import product
+from time import perf_counter
+from typing import Tuple
+
 
 # Misc
 def img2mse(x, y): return torch.mean((x - y) ** 2)
@@ -259,3 +263,44 @@ def sample_pdf(bins, weights, N_samples, det=False, pytest=False):
     samples = bins_g[..., 0] + t * (bins_g[..., 1]-bins_g[..., 0])
 
     return samples
+
+
+def get_initial_section_rand_pixel_idxs(num_train_imgs: int, grid_size: int, section_height: int,
+                                        section_width: int, verbose: bool = False
+                                        ) -> Tuple[np.ndarray, float]:
+    """
+    @param num_train_imgs - The number of training images.
+    @param grid_size - The number of sections along one side of the grid that images are split into
+        (the grid is assumed square).
+    @param section_height - The height of a single grid section, in pixels.
+    @param section_width - The width of a single grid section, in pixels.
+    @param verbose - True to print extra info.
+    @returns - A tuple of (section_rand_pixel_idxs, t_delta).
+        section_rand_pixels - Numpy array of shape (num_train_imgs, grid_size, grid_size,
+            section_height * section_width) that stores a random list of all pixel indices for each
+            grid section.
+        t_delta - The execution time of this function.
+    """
+    t_start = perf_counter()
+
+    if verbose:
+        print('Getting initial grid section random pixel indices...', end='')
+
+    num_pixels_per_section = section_height * section_width
+    single_section_pixel_idxs = list(product(range(section_height), range(section_width)))
+    section_rand_pixel_idxs = np.broadcast_to(single_section_pixel_idxs,
+                                              (num_train_imgs, grid_size, grid_size,
+                                               num_pixels_per_section, 2)).copy()
+    for img_idx, grid_row_idx, grid_col_idx in product(range(num_train_imgs),
+                                                       range(grid_size),
+                                                       range(grid_size)):
+        rand_pixel_idxs = np.random.permutation(num_pixels_per_section)
+        section_rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, :, :] = \
+            section_rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, rand_pixel_idxs, :]
+
+    t_delta = perf_counter() - t_start
+
+    if verbose:
+        print(f' done in {t_delta:.4f} seconds.')
+
+    return section_rand_pixel_idxs, t_delta
