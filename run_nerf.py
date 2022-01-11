@@ -12,7 +12,8 @@ from tqdm import tqdm, trange
 
 import matplotlib.pyplot as plt
 
-from run_nerf_helpers import *
+from run_nerf_helpers import (get_embedder, get_rays, get_rays_np, img2mse, mse2psnr, NeRF,
+                              ndc_rays, sample_pdf, to8b)
 
 from load_llff import load_llff_data
 from load_deepvoxels import load_dv_data
@@ -158,7 +159,8 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
     return ret_list + [ret_dict]
 
 
-def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedir=None, render_factor=0):
+def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedir=None,
+                render_factor=0):
 
     H, W, focal = hwf
 
@@ -235,10 +237,9 @@ def create_nerf(args):
                           input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
         grad_vars += list(model_fine.parameters())
 
-    def network_query_fn(inputs, viewdirs, network_fn): return run_network(inputs, viewdirs, network_fn,
-                                                                           embed_fn=embed_fn,
-                                                                           embeddirs_fn=embeddirs_fn,
-                                                                           netchunk=args.netchunk)
+    def network_query_fn(inputs, viewdirs, network_fn):
+        return run_network(inputs, viewdirs, network_fn, embed_fn=embed_fn,
+                           embeddirs_fn=embeddirs_fn, netchunk=args.netchunk)
 
     # Create optimizer
     optimizer = torch.optim.Adam(params=grad_vars, lr=args.lrate, betas=(0.9, 0.999))
@@ -503,9 +504,11 @@ def config_parser():
     parser.add_argument("--lrate_decay", type=int, default=250,
                         help='exponential learning rate decay (in 1000 steps)')
     parser.add_argument("--chunk", type=int, default=1024*32,
-                        help='number of rays processed in parallel, decrease if running out of memory')
+                        help='number of rays processed in parallel, decrease if running out of '
+                        'memory')
     parser.add_argument("--netchunk", type=int, default=1024*64,
-                        help='number of pts sent through network in parallel, decrease if running out of memory')
+                        help='number of pts sent through network in parallel, decrease if running '
+                        'out of memory')
     parser.add_argument("--no_batching", action='store_true',
                         help='only take random rays from 1 image at a time')
     parser.add_argument("--no_reload", action='store_true',
@@ -536,7 +539,8 @@ def config_parser():
     parser.add_argument("--render_test", action='store_true',
                         help='render the test set instead of render_poses path')
     parser.add_argument("--render_factor", type=int, default=0,
-                        help='downsampling factor to speed up rendering, set 4 or 8 for fast preview')
+                        help='downsampling factor to speed up rendering, set 4 or 8 for fast '
+                        'preview')
 
     # training options
     parser.add_argument("--precrop_iters", type=int, default=0,
@@ -548,7 +552,8 @@ def config_parser():
     parser.add_argument("--dataset_type", type=str, default='llff',
                         help='options: llff / blender / deepvoxels')
     parser.add_argument("--testskip", type=int, default=8,
-                        help='will load 1/N images from test/val sets, useful for large datasets like deepvoxels')
+                        help='will load 1/N images from test/val sets, useful for large datasets '
+                        'like deepvoxels')
 
     # deepvoxels flags
     parser.add_argument("--shape", type=str, default='greek',
@@ -556,7 +561,8 @@ def config_parser():
 
     # blender flags
     parser.add_argument("--white_bkgd", action='store_true',
-                        help='set to render synthetic data on a white bkgd (always use for dvoxels)')
+                        help='set to render synthetic data on a white bkgd (always use for '
+                        'dvoxels)')
     parser.add_argument("--half_res", action='store_true',
                         help='load blender synthetic data at 400x400 instead of 800x800')
 
@@ -564,7 +570,8 @@ def config_parser():
     parser.add_argument("--factor", type=int, default=8,
                         help='downsample factor for LLFF images')
     parser.add_argument("--no_ndc", action='store_true',
-                        help='do not use normalized device coordinates (set for non-forward facing scenes)')
+                        help='do not use normalized device coordinates (set for non-forward facing '
+                        'scenes)')
     parser.add_argument("--lindisp", action='store_true',
                         help='sampling linearly in disparity rather than depth')
     parser.add_argument("--spherify", action='store_true',
@@ -751,8 +758,9 @@ def train():
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', render_poses.shape)
 
-            rgbs, _ = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test,
-                                  gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
+            rgbs, _ = \
+                render_path(render_poses, hwf, K, args.chunk, render_kwargs_test, gt_imgs=images,
+                            savedir=testsavedir, render_factor=args.render_factor)
             print('Done rendering', testsavedir)
             imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
 
@@ -761,7 +769,7 @@ def train():
     # Prepare raybatch tensor if batching random rays
     N_rand = args.N_rand
     use_batching = not args.no_batching
-    assert use_batching == True
+    assert use_batching is True
 
     grid_size = args.img_grid_side_len
 
@@ -858,18 +866,20 @@ def train():
                     num_pixels_to_add = num_random_rays_to_sample_per_img - pixels_to_add.shape[0]
                     start_idx = batch_idxs[img_idx, grid_row_idx, grid_col_idx]
                     stop_idx = start_idx + num_pixels_to_add
-                    pixels_to_add = np.concatenate((pixels_to_add,
-                                                    rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx,
-                                                                    start_idx:stop_idx, :]))
+                    pixels_to_add = \
+                        np.concatenate(
+                            (pixels_to_add, rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx,
+                                                            start_idx:stop_idx, :]))
 
                     batch_idxs[img_idx, grid_row_idx, grid_col_idx] += num_pixels_to_add
 
-                    if batch_idxs[img_idx, grid_row_idx, grid_col_idx] >= num_pixels_per_grid_section:
+                    if (batch_idxs[img_idx, grid_row_idx, grid_col_idx] >=
+                            num_pixels_per_grid_section):
                         # print(f'Shuffle data ({img_idx}, {grid_row_idx}, {grid_col_idx}) after '
                         #       'an epoch!')
                         rand_idxs = np.random.permutation(num_pixels_per_grid_section)
-                        rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, :,
-                                        :] = rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, rand_idxs, :]
+                        rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, :, :] = \
+                            rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, rand_idxs, :]
                         batch_idxs[img_idx, grid_row_idx, grid_col_idx] = 0
 
                 if do_rand_sampling_fig:
@@ -926,18 +936,20 @@ def train():
                         num_pixels_to_add = num_active_samples_to_draw - pixels_to_add.shape[0]
                         start_idx = batch_idxs[img_idx, grid_row_idx, grid_col_idx]
                         stop_idx = start_idx + num_pixels_to_add
-                        pixels_to_add = np.concatenate((pixels_to_add,
-                                                        rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx,
-                                                                        start_idx:stop_idx, :]))
+                        pixels_to_add = \
+                            np.concatenate((pixels_to_add,
+                                            rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx,
+                                                            start_idx:stop_idx, :]))
 
                         batch_idxs[img_idx, grid_row_idx, grid_col_idx] += num_pixels_to_add
 
-                        if batch_idxs[img_idx, grid_row_idx, grid_col_idx] >= num_pixels_per_grid_section:
-                            # print(f'Shuffle data ({img_idx}, {grid_row_idx}, {grid_col_idx}) after '
-                            #       'an epoch!')
+                        if (batch_idxs[img_idx, grid_row_idx, grid_col_idx] >=
+                                num_pixels_per_grid_section):
+                            # print(f'Shuffle data ({img_idx}, {grid_row_idx}, {grid_col_idx}) '
+                            # after an epoch!')
                             rand_idxs = np.random.permutation(num_pixels_per_grid_section)
-                            rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, :,
-                                            :] = rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, rand_idxs, :]
+                            rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, :, :] = \
+                                rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, rand_idxs, :]
                             batch_idxs[img_idx, grid_row_idx, grid_col_idx] = 0
 
                 if do_active_sampling_fig:
@@ -949,8 +961,8 @@ def train():
                         ax.add_patch(Circle((pixel_col_idx, pixel_row_idx), 0.5, color='red'))
                     ax.axis('off')
 
-                batch = np.concatenate((batch, rays[img_idx, grid_row_idx, grid_col_idx, pixels_to_add[:, 0],
-                                                    pixels_to_add[:, 1]]))
+                batch = np.concatenate((batch, rays[img_idx, grid_row_idx, grid_col_idx,
+                                                    pixels_to_add[:, 0], pixels_to_add[:, 1]]))
 
         if do_active_sampling_fig:
             plt.show()
@@ -1038,8 +1050,9 @@ def train():
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', poses[i_test].shape)
             with torch.no_grad():
-                render_path(torch.Tensor(poses[i_test]).to(
-                    device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
+                render_path(
+                    torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test,
+                    gt_imgs=images[i_test], savedir=testsavedir)
             print('Saved test set')
 
         if i % args.i_print == 0:
