@@ -1,12 +1,14 @@
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
-# torch.autograd.set_detect_anomaly(True)
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 
 from ipdb import set_trace
 from itertools import product
+from matplotlib.patches import Circle
 from time import perf_counter
+from torch.utils.tensorboard import SummaryWriter
 from typing import List, Tuple
 
 from load_llff import load_llff_data
@@ -449,3 +451,72 @@ def get_initial_section_rand_pixel_idxs(num_train_imgs: int, grid_size: int, sec
         print(f' done in {t_delta:.4f} seconds.')
 
     return section_rand_pixel_idxs, t_delta
+
+
+def sample_section_rays(section_rays: np.ndarray, section_rand_pixel_idxs: np.ndarray,
+                        section_sampling_start_idxs: np.ndarray, section_n_rays_to_sample: np.ndarray,
+                        n_train_imgs: int, grid_size: int, n_pixels_per_section: int,
+                        tensorboard: SummaryWriter, tensorboard_tag: str, train_iter_idx: int,
+                        log_sampling_fig: bool = False, verbose: bool = False
+                        ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+    if verbose:
+        print('Sampling rays across grid sections...', end='')
+
+    t_start = perf_counter()
+
+    if log_sampling_fig:
+        fig = plt.figure(figsize=(3.5, n_train_imgs * 2.5))
+        sub_figs = fig.subfigures(n_train_imgs, 1)
+
+    sampled_rays = np.empty((0, 3, 3))
+    section_sampled_bounding_idxs = np.empty((n_train_imgs, grid_size, grid_size, 2), dtype=int)
+    for img_idx in range(n_train_imgs):
+        if log_sampling_fig:
+            img_sub_figs = sub_figs[img_idx]
+            axs = img_sub_figs.subplots(grid_size, grid_size)
+        for grid_row_idx, grid_col_idx in product(range(grid_size), range(grid_size)):
+            n_rays_to_sample = section_n_rays_to_sample[img_idx, grid_row_idx, grid_col_idx]
+            pixel_idxs_to_sample = np.empty((0, 2), dtype=int)
+            while pixel_idxs_to_sample.shape[0] < n_rays_to_sample:
+                n_pixels_to_add = n_rays_to_sample - pixel_idxs_to_sample.shape[0]
+                start_idx = section_sampling_start_idxs[img_idx, grid_row_idx, grid_col_idx]
+                stop_idx = start_idx + n_pixels_to_add
+                pixel_idxs_to_sample = np.concatenate(
+                    (pixel_idxs_to_sample, section_rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx,
+                                                                   start_idx:stop_idx, :]))
+
+                section_sampling_start_idxs[img_idx, grid_row_idx, grid_col_idx] += n_pixels_to_add
+
+                if (section_sampling_start_idxs[img_idx, grid_row_idx, grid_col_idx] >=
+                        n_pixels_per_section):
+                    rand_idxs = np.random.permutation(n_pixels_per_section)
+                    section_rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, :, :] = \
+                        section_rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, rand_idxs, :]
+                    section_sampling_start_idxs[img_idx, grid_row_idx, grid_col_idx] = 0
+
+            section_sampled_bounding_idxs[img_idx, grid_row_idx, grid_col_idx, 0] = \
+                sampled_rays.shape[0]
+            sampled_rays = np.concatenate((
+                sampled_rays, section_rays[img_idx, grid_row_idx, grid_col_idx,
+                                           pixel_idxs_to_sample[:, 0], pixel_idxs_to_sample[:, 1], :]))
+            section_sampled_bounding_idxs[img_idx, grid_row_idx, grid_col_idx, 1] = \
+                sampled_rays.shape[0]
+
+            if log_sampling_fig:
+                ax = axs[grid_row_idx, grid_col_idx]
+                ax.imshow(section_rays[img_idx, grid_row_idx, grid_col_idx, :, :, 2, :])
+                for pixel_row_idx, pixel_col_idx in pixel_idxs_to_sample:
+                    ax.add_patch(Circle((pixel_col_idx, pixel_row_idx), 2, color='black'))
+                    ax.add_patch(Circle((pixel_col_idx, pixel_row_idx), 1.5, color='white'))
+                    ax.add_patch(Circle((pixel_col_idx, pixel_row_idx), 0.5, color='red'))
+                ax.axis('off')
+
+    if log_sampling_fig:
+        tensorboard.add_figure(tensorboard_tag, fig, train_iter_idx)
+
+    t_delta = perf_counter() - t_start
+    if verbose:
+        print(f' done in {t_delta:.4f} seconds.')
+
+    return (sampled_rays, section_sampled_bounding_idxs, section_rand_pixel_idxs,
+            section_sampling_start_idxs, t_delta)
