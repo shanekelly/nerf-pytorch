@@ -244,7 +244,7 @@ def create_nerf(args):
     # Create optimizer
     optimizer = torch.optim.Adam(params=grad_vars, lr=args.lrate, betas=(0.9, 0.999))
 
-    start = 0
+    start_iter_idx = 0
     basedir = args.basedir
     expname = args.expname
 
@@ -265,7 +265,7 @@ def create_nerf(args):
         print('Reloading from', ckpt_path)
         ckpt = torch.load(ckpt_path)
 
-        start = ckpt['global_step']
+        start_iter_idx = ckpt['global_step']
         optimizer.load_state_dict(ckpt['optimizer_state_dict'])
 
         # Load model
@@ -299,7 +299,7 @@ def create_nerf(args):
     render_kwargs_test['perturb'] = False
     render_kwargs_test['raw_noise_std'] = 0.
 
-    return render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer
+    return render_kwargs_train, render_kwargs_test, start_iter_idx, grad_vars, optimizer
 
 
 def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False):
@@ -729,8 +729,9 @@ def train():
             file.write(open(args.config, 'r').read())
 
     # Create nerf model
-    render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
-    global_step = start
+    render_kwargs_train, render_kwargs_test, start_iter_idx, grad_vars, optimizer = create_nerf(
+        args)
+    global_step = start_iter_idx
 
     bds_dict = {
         'near': near,
@@ -755,7 +756,7 @@ def train():
                 images = None
 
             testsavedir = os.path.join(basedir, expname, 'renderonly_{}_{:06d}'.format(
-                'test' if args.render_test else 'path', start))
+                'test' if args.render_test else 'path', start_iter_idx))
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', render_poses.shape)
 
@@ -817,7 +818,7 @@ def train():
     section_rand_pixel_idxs, t_initial_shuffle_ = get_initial_section_rand_pixel_idxs(
         num_train_imgs, grid_size, section_height, section_width, verbose=verbose)
 
-    batch_idxs = np.zeros((num_train_imgs, grid_size, grid_size), dtype=int)
+    batch_start_idxs = np.zeros((num_train_imgs, grid_size, grid_size), dtype=int)
 
     # Move training data to GPU
     images = torch.Tensor(images).to(device)
@@ -834,9 +835,9 @@ def train():
     num_random_rays_to_sample_per_img = num_random_rays_to_sample_per_img // num_sections
     num_active_rays_to_sample_per_img = 200
 
-    start = start + 1
+    start_iter_idx += 1
 
-    tqdm_bar = trange(start, N_iters)
+    tqdm_bar = trange(start_iter_idx, N_iters)
     for i in tqdm_bar:
         do_rand_sampling_fig = i % args.i_rand_sampling_fig == 0
         do_active_sampling_fig = i % args.i_active_sampling_fig == 0
@@ -856,22 +857,22 @@ def train():
                 pixels_to_add = np.empty((0, 2), dtype=int)
                 while pixels_to_add.shape[0] < num_random_rays_to_sample_per_img:
                     num_pixels_to_add = num_random_rays_to_sample_per_img - pixels_to_add.shape[0]
-                    start_idx = batch_idxs[img_idx, grid_row_idx, grid_col_idx]
+                    start_idx = batch_start_idxs[img_idx, grid_row_idx, grid_col_idx]
                     stop_idx = start_idx + num_pixels_to_add
                     pixels_to_add = np.concatenate(
                         (pixels_to_add, section_rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx,
                                                                 start_idx:stop_idx, :]))
 
-                    batch_idxs[img_idx, grid_row_idx, grid_col_idx] += num_pixels_to_add
+                    batch_start_idxs[img_idx, grid_row_idx, grid_col_idx] += num_pixels_to_add
 
-                    if (batch_idxs[img_idx, grid_row_idx, grid_col_idx] >=
+                    if (batch_start_idxs[img_idx, grid_row_idx, grid_col_idx] >=
                             num_pixels_per_section):
                         # print(f'Shuffle data ({img_idx}, {grid_row_idx}, {grid_col_idx}) after '
                         #       'an epoch!')
                         rand_idxs = np.random.permutation(num_pixels_per_section)
                         section_rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, :,
                                                 :] = section_rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, rand_idxs, :]
-                        batch_idxs[img_idx, grid_row_idx, grid_col_idx] = 0
+                        batch_start_idxs[img_idx, grid_row_idx, grid_col_idx] = 0
 
                 if do_rand_sampling_fig:
                     ax = axs[grid_row_idx, grid_col_idx]
@@ -894,7 +895,6 @@ def train():
                 losses[img_idx, grid_row_idx, grid_col_idx] = loss
 
         if do_rand_sampling_fig:
-            plt.show()
             tensorboard.add_figure('train/random_sampling', fig, i)
 
         batch = np.empty((0, 3, 3))
@@ -925,22 +925,22 @@ def train():
                 if num_active_samples_to_draw != 0:
                     while pixels_to_add.shape[0] < num_active_samples_to_draw:
                         num_pixels_to_add = num_active_samples_to_draw - pixels_to_add.shape[0]
-                        start_idx = batch_idxs[img_idx, grid_row_idx, grid_col_idx]
+                        start_idx = batch_start_idxs[img_idx, grid_row_idx, grid_col_idx]
                         stop_idx = start_idx + num_pixels_to_add
                         pixels_to_add = np.concatenate((pixels_to_add,
                                                         section_rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx,
                                                                                 start_idx:stop_idx, :]))
 
-                        batch_idxs[img_idx, grid_row_idx, grid_col_idx] += num_pixels_to_add
+                        batch_start_idxs[img_idx, grid_row_idx, grid_col_idx] += num_pixels_to_add
 
-                        if (batch_idxs[img_idx, grid_row_idx, grid_col_idx] >=
+                        if (batch_start_idxs[img_idx, grid_row_idx, grid_col_idx] >=
                                 num_pixels_per_section):
                             # print(f'Shuffle data ({img_idx}, {grid_row_idx}, {grid_col_idx}) '
                             # after an epoch!')
                             rand_idxs = np.random.permutation(num_pixels_per_section)
                             section_rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, :,
                                                     :] = section_rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, rand_idxs, :]
-                            batch_idxs[img_idx, grid_row_idx, grid_col_idx] = 0
+                            batch_start_idxs[img_idx, grid_row_idx, grid_col_idx] = 0
 
                 if do_active_sampling_fig:
                     ax = axs2[grid_row_idx, grid_col_idx]
@@ -955,7 +955,6 @@ def train():
                                                     pixels_to_add[:, 0], pixels_to_add[:, 1]]))
 
         if do_active_sampling_fig:
-            plt.show()
             tensorboard.add_figure('train/active_sampling', fig, i)
 
         batch = torch.reshape(torch.from_numpy(batch).to(device), (-1, 3, 3))
