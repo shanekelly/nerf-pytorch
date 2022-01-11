@@ -12,9 +12,9 @@ from tqdm import tqdm, trange
 
 import matplotlib.pyplot as plt
 
-from run_nerf_helpers import (get_embedder, get_initial_section_rand_pixel_idxs, get_rays,
-                              get_rays_np, img2mse, load_data, mse2psnr, NeRF, ndc_rays, sample_pdf,
-                              to8b)
+from run_nerf_helpers import (get_all_rays_np, get_embedder, get_initial_section_rand_pixel_idxs,
+                              get_rays, get_rays_np, img2mse, load_data, mse2psnr, NeRF, ndc_rays,
+                              sample_pdf, to8b)
 
 # sk: My imports.
 from ipdb import launch_ipdb_on_exception, set_trace
@@ -674,14 +674,7 @@ def train():
     grid_size = args.img_grid_side_len
 
     # For random ray batching
-    if verbose:
-        print('Getting rays...', end='')
-    t = perf_counter()
-    # sk: A ray for every pixel of every camera image.
-    rays = np.stack([get_rays_np(H, W, K, p)
-                     for p in poses[:, :3, :4]], 0)  # [N, ro+rd, H, W, 3]
-    if verbose:
-        print(f' done in {perf_counter() - t:.4f} seconds.')
+    rays, t_get_rays = get_all_rays_np(H, W, K, poses, verbose=verbose)
 
     if verbose:
         print('Merging rays with rgb and sorting into grids...', end='')

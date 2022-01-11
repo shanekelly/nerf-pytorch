@@ -373,6 +373,23 @@ def load_data(args):
     return images, hwf, H, W, focal, K, poses, render_poses, i_train, i_test, i_val, near, far
 
 
+def get_all_rays_np(H, W, K, poses, verbose=False) -> Tuple[np.ndarray, float]:
+    if verbose:
+        print('Getting rays...', end='')
+
+    t_start = perf_counter()
+
+    # sk: A ray for every pixel of every camera image. Shape (N, ro+rd, H, W, 3).
+    rays = np.stack([get_rays_np(H, W, K, p) for p in poses[:, :3, :4]], 0)
+
+    t_delta = perf_counter() - t_start
+
+    if verbose:
+        print(f' done in {t_delta:.4f} seconds.')
+
+    return rays, t_delta
+
+
 def get_initial_section_rand_pixel_idxs(num_train_imgs: int, grid_size: int, section_height: int,
                                         section_width: int, verbose: bool = False
                                         ) -> Tuple[np.ndarray, float]:
