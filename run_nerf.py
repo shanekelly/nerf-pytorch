@@ -607,7 +607,7 @@ def train():
 
     tensorboard = SummaryWriter(log_dir=Path(args.basedir) / args.expname, flush_secs=10)
 
-    images, hwf, H, W, focal, K, poses, render_poses, i_train, i_test, i_val, near, far = \
+    images, hwf, H, W, focal, K, poses, render_poses, train_idxs, test_idxs, val_idxs, near, far = \
         load_data(args)
 
     # Create log dir and copy the config file
@@ -647,7 +647,7 @@ def train():
         with torch.no_grad():
             if args.render_test:
                 # render_test switches to test poses
-                images = images[i_test]
+                images = images[test_idxs]
             else:
                 # Default is smoother render_poses path
                 images = None
@@ -665,45 +665,29 @@ def train():
 
             return
 
-    # Prepare raybatch tensor if batching random rays
     N_rand = args.N_rand
     use_batching = not args.no_batching
     assert use_batching is True
 
     verbose = args.verbose
+    n_train_imgs = len(train_idxs)
     grid_size = args.img_grid_side_len
 
-    # For random ray batching
-    rays, t_get_rays = get_all_rays_np(H, W, K, poses, verbose=verbose)
-
-    if verbose:
-        print('Merging rays with rgb and sorting into grids...', end='')
-    t = perf_counter()
-    rays_rgb = np.concatenate([rays, images[:, None]], 1)  # [N, ro+rd+rgb, H, W, 3]
-    rays_rgb = np.transpose(rays_rgb, [0, 2, 3, 1, 4])  # [N, H, W, ro+rd+rgb, 3]
-    rays_rgb = np.stack([rays_rgb[i] for i in i_train], 0)  # train images only
     assert H % grid_size == 0
     assert W % grid_size == 0
     section_height = H // grid_size
     section_width = W // grid_size
     n_pixels_per_section = section_height * section_width
-    n_train_imgs = len(i_train)
-    rays = np.zeros((n_train_imgs, grid_size, grid_size,
-                     section_height, section_width, 3, 3))
-    for idx, (grid_row_idx, grid_col_idx) in enumerate(product(range(grid_size),
-                                                               range(grid_size))):
-        img_start_row_idx = grid_row_idx * section_height
-        img_stop_row_idx = (grid_row_idx + 1) * section_height
-        img_start_col_idx = grid_col_idx * section_width
-        img_stop_col_idx = (grid_col_idx + 1) * section_width
-        section = rays_rgb[:, img_start_row_idx:img_stop_row_idx,
-                           img_start_col_idx:img_stop_col_idx, :, :]
-        rays[:, grid_row_idx, grid_col_idx, :, :, :] = section
 
-    # sk: shape (num training images, num grid rows, num grid cols, num pixels per section, ro+rd+rgb, 3)
-    rays = rays.astype(np.float32)
-    if verbose:
-        print(f' done in {perf_counter() - t:.4f} seconds.')
+    n_sections = grid_size ** 2
+    n_random_rays_to_sample_per_img = 200
+    n_random_rays_to_sample_per_img = n_random_rays_to_sample_per_img // n_sections
+    n_active_rays_to_sample_per_img = 200
+
+    # For random ray batching
+    section_rays, t_get_rays = get_all_rays_np(images, H, W, K, poses, n_train_imgs, train_idxs,
+                                               grid_size, section_height, section_width,
+                                               verbose=verbose)
 
     section_rand_pixel_idxs, t_initial_shuffle_ = get_initial_section_rand_pixel_idxs(
         n_train_imgs, grid_size, section_height, section_width, verbose=verbose)
@@ -716,14 +700,9 @@ def train():
 
     N_iters = 50000 + 1
     print('Begin')
-    print('TRAIN views are', i_train)
-    print('TEST views are', i_test)
-    print('VAL views are', i_val)
-
-    n_sections = grid_size ** 2
-    n_random_rays_to_sample_per_img = 200
-    n_random_rays_to_sample_per_img = n_random_rays_to_sample_per_img // n_sections
-    n_active_rays_to_sample_per_img = 200
+    print('TRAIN views are', train_idxs)
+    print('TEST views are', test_idxs)
+    print('VAL views are', val_idxs)
 
     start_iter_idx += 1
 
@@ -766,15 +745,15 @@ def train():
 
                 if do_rand_sampling_fig:
                     ax = axs[grid_row_idx, grid_col_idx]
-                    ax.imshow(rays[img_idx, grid_row_idx, grid_col_idx, :, :, 2, :])
+                    ax.imshow(section_rays[img_idx, grid_row_idx, grid_col_idx, :, :, 2, :])
                     for pixel_row_idx, pixel_col_idx in pixels_to_add:
                         ax.add_patch(Circle((pixel_col_idx, pixel_row_idx), 2, color='black'))
                         ax.add_patch(Circle((pixel_col_idx, pixel_row_idx), 1.5, color='white'))
                         ax.add_patch(Circle((pixel_col_idx, pixel_row_idx), 0.5, color='red'))
                     ax.axis('off')
 
-                batch = rays[img_idx, grid_row_idx, grid_col_idx, pixels_to_add[:, 0],
-                             pixels_to_add[:, 1]]
+                batch = section_rays[img_idx, grid_row_idx, grid_col_idx, pixels_to_add[:, 0],
+                                     pixels_to_add[:, 1]]
                 batch = torch.reshape(torch.from_numpy(batch).to(device), (-1, 3, 3))
                 batch = torch.transpose(batch, 0, 1)
                 batch_rays, target_s = batch[:2], batch[2]
@@ -834,15 +813,15 @@ def train():
 
                 if do_active_sampling_fig:
                     ax = axs2[grid_row_idx, grid_col_idx]
-                    ax.imshow(rays[img_idx, grid_row_idx, grid_col_idx, :, :, 2, :])
+                    ax.imshow(section_rays[img_idx, grid_row_idx, grid_col_idx, :, :, 2, :])
                     for pixel_row_idx, pixel_col_idx in pixels_to_add:
                         ax.add_patch(Circle((pixel_col_idx, pixel_row_idx), 2, color='black'))
                         ax.add_patch(Circle((pixel_col_idx, pixel_row_idx), 1.5, color='white'))
                         ax.add_patch(Circle((pixel_col_idx, pixel_row_idx), 0.5, color='red'))
                     ax.axis('off')
 
-                batch = np.concatenate((batch, rays[img_idx, grid_row_idx, grid_col_idx,
-                                                    pixels_to_add[:, 0], pixels_to_add[:, 1]]))
+                batch = np.concatenate((batch, section_rays[img_idx, grid_row_idx, grid_col_idx,
+                                                            pixels_to_add[:, 0], pixels_to_add[:, 1]]))
 
         if do_active_sampling_fig:
             tensorboard.add_figure('train/active_sampling', fig, i)
@@ -920,11 +899,12 @@ def train():
         if i % args.i_testset == 0 and i > 0:
             testsavedir = os.path.join(basedir, expname, 'testset_{:06d}'.format(i))
             os.makedirs(testsavedir, exist_ok=True)
-            print('test poses shape', poses[i_test].shape)
+            print('test poses shape', poses[test_idxs].shape)
             with torch.no_grad():
                 render_path(
-                    torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test,
-                    gt_imgs=images[i_test], savedir=testsavedir)
+                    torch.Tensor(poses[test_idxs]).to(
+                        device), hwf, K, args.chunk, render_kwargs_test,
+                    gt_imgs=images[test_idxs], savedir=testsavedir)
             print('Saved test set')
 
         if i % args.i_print == 0:
@@ -935,8 +915,8 @@ def train():
 
         if i % args.i_img == 0:
             # Log a rendered validation view to Tensorboard
-            # img_i = np.random.choice(i_val)
-            img_i = i_val[-2] if len(i_val) > 1 else i_val[0]
+            # img_i = np.random.choice(val_idxs)
+            img_i = val_idxs[-2] if len(val_idxs) > 1 else val_idxs[0]
             target = images[img_i]
             c2w = poses[img_i, :3, :4]
             with torch.no_grad():

@@ -4,9 +4,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
+from ipdb import set_trace
 from itertools import product
 from time import perf_counter
-from typing import Tuple
+from typing import List, Tuple
 
 from load_llff import load_llff_data
 from load_deepvoxels import load_dv_data
@@ -276,23 +277,23 @@ def load_data(args):
     K = None
 
     if args.dataset_type == 'llff':
-        images, poses, bds, render_poses, i_test = load_llff_data(args.datadir, args.factor,
-                                                                  recenter=True, bd_factor=.75,
-                                                                  spherify=args.spherify)
+        images, poses, bds, render_poses, test_idxs = load_llff_data(args.datadir, args.factor,
+                                                                     recenter=True, bd_factor=.75,
+                                                                     spherify=args.spherify)
         hwf = poses[0, :3, -1]
         poses = poses[:, :3, :4]
         print('Loaded llff', images.shape, render_poses.shape, hwf, args.datadir)
 
-        if not isinstance(i_test, list):
-            i_test = [i_test]
+        if not isinstance(test_idxs, list):
+            test_idxs = [test_idxs]
 
         if args.llffhold > 0:
             print('Auto LLFF holdout,', args.llffhold)
-            i_test = np.arange(images.shape[0])[::args.llffhold]
+            test_idxs = np.arange(images.shape[0])[::args.llffhold]
 
-        i_val = i_test
-        i_train = np.array([i for i in np.arange(int(images.shape[0])) if
-                            (i not in i_test and i not in i_val)])
+        val_idxs = test_idxs
+        train_idxs = np.array([i for i in np.arange(int(images.shape[0])) if
+                               (i not in test_idxs and i not in val_idxs)])
 
         print('DEFINING BOUNDS')
 
@@ -309,7 +310,7 @@ def load_data(args):
         images, poses, render_poses, hwf, i_split = load_blender_data(
             args.datadir, args.half_res, args.testskip)
         print('Loaded blender', images.shape, render_poses.shape, hwf, args.datadir)
-        i_train, i_val, i_test = i_split
+        train_idxs, val_idxs, test_idxs = i_split
 
         near = 2.
         far = 6.
@@ -324,7 +325,7 @@ def load_data(args):
             args.datadir, args.half_res, args.testskip)
         print(f'Loaded LINEMOD, images shape: {images.shape}, hwf: {hwf}, K: {K}')
         print(f'[CHECK HERE] near: {near}, far: {far}.')
-        i_train, i_val, i_test = i_split
+        train_idxs, val_idxs, test_idxs = i_split
 
         if args.white_bkgd:
             images = images[..., :3]*images[..., -1:] + (1.-images[..., -1:])
@@ -338,17 +339,17 @@ def load_data(args):
                                                                  testskip=args.testskip)
 
         print('Loaded deepvoxels', images.shape, render_poses.shape, hwf, args.datadir)
-        i_train, i_val, i_test = i_split
+        train_idxs, val_idxs, test_idxs = i_split
 
         hemi_R = np.mean(np.linalg.norm(poses[:, :3, -1], axis=-1))
         near = hemi_R-1.
         far = hemi_R+1.
 
     elif args.dataset_type == 'bonn':
-        images, hwf, poses, render_poses, i_train, i_test = load_bonn_data(
+        images, hwf, poses, render_poses, train_idxs, test_idxs = load_bonn_data(
             args.datadir, downsample_factor=args.factor)
 
-        i_val = i_test
+        val_idxs = test_idxs
         near = 0.
         far = 1.
 
@@ -368,12 +369,14 @@ def load_data(args):
         ])
 
     if args.render_test:
-        render_poses = np.array(poses[i_test])
+        render_poses = np.array(poses[test_idxs])
 
-    return images, hwf, H, W, focal, K, poses, render_poses, i_train, i_test, i_val, near, far
+    return images, hwf, H, W, focal, K, poses, render_poses, train_idxs, test_idxs, val_idxs, near, far
 
 
-def get_all_rays_np(H, W, K, poses, verbose=False) -> Tuple[np.ndarray, float]:
+def get_all_rays_np(images: np.ndarray, H: int, W: int, K: np.ndarray, poses: np.ndarray,
+                    n_train_imgs: int, train_idxs: List[int], grid_size: int, section_height: int,
+                    section_width: int, verbose=False) -> Tuple[np.ndarray, float]:
     if verbose:
         print('Getting rays...', end='')
 
@@ -382,12 +385,29 @@ def get_all_rays_np(H, W, K, poses, verbose=False) -> Tuple[np.ndarray, float]:
     # sk: A ray for every pixel of every camera image. Shape (N, ro+rd, H, W, 3).
     rays = np.stack([get_rays_np(H, W, K, p) for p in poses[:, :3, :4]], 0)
 
+    rays = np.concatenate([rays, images[:, None]], 1)  # (N, ro+rd+rgb, H, W, 3)
+    rays = np.transpose(rays, [0, 2, 3, 1, 4])  # (N, H, W, ro+rd+rgb, 3)
+    rays = np.stack([rays[i] for i in train_idxs], 0)  # (N train, H, W, ro+rd+rgb, 3)
+
+    section_rays = np.empty((n_train_imgs, grid_size, grid_size,
+                             section_height, section_width, 3, 3))
+    for grid_row_idx, grid_col_idx in product(range(grid_size), range(grid_size)):
+        img_start_row_idx = grid_row_idx * section_height
+        img_stop_row_idx = (grid_row_idx + 1) * section_height
+        img_start_col_idx = grid_col_idx * section_width
+        img_stop_col_idx = (grid_col_idx + 1) * section_width
+        section_rays[:, grid_row_idx, grid_col_idx, :, :, :] = \
+            rays[:, img_start_row_idx:img_stop_row_idx, img_start_col_idx:img_stop_col_idx, :, :]
+
+    # sk: shape (num training images, num grid rows, num grid cols, num pixels per section, ro+rd+rgb, 3)
+    section_rays = section_rays.astype(np.float32)
+
     t_delta = perf_counter() - t_start
 
     if verbose:
         print(f' done in {t_delta:.4f} seconds.')
 
-    return rays, t_delta
+    return section_rays, t_delta
 
 
 def get_initial_section_rand_pixel_idxs(num_train_imgs: int, grid_size: int, section_height: int,
