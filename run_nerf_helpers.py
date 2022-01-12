@@ -1,13 +1,12 @@
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from cv2 import circle
 from ipdb import set_trace
 from itertools import product
 from time import perf_counter
+from torch.nn.functional import relu
 from torch.utils.tensorboard import SummaryWriter
 from typing import List, Tuple
 
@@ -120,7 +119,7 @@ class NeRF(nn.Module):
 
         for i, l in enumerate(self.pts_linears):
             h = self.pts_linears[i](h)
-            h = F.relu(h)
+            h = relu(h)
 
             if i in self.skips:
                 h = torch.cat([input_pts, h], -1)
@@ -132,7 +131,7 @@ class NeRF(nn.Module):
 
             for i, l in enumerate(self.views_linears):
                 h = self.views_linears[i](h)
-                h = F.relu(h)
+                h = relu(h)
 
             rgb = self.rgb_linear(h)
             outputs = torch.cat([rgb, alpha], -1)

@@ -1,28 +1,20 @@
 import os
-import sys
 import numpy as np
-import open3d as o3d
 import imageio
-import json
-import random
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from tqdm import tqdm, trange
 
-import matplotlib.pyplot as plt
-
-from run_nerf_helpers import (sample_section_rays, get_all_rays_np, get_embedder,
-                              get_initial_section_rand_pixel_idxs, get_rays, get_rays_np, img2mse,
-                              load_data, mse2psnr, NeRF, ndc_rays, sample_pdf, to8b)
-
-# sk: My imports.
 from ipdb import launch_ipdb_on_exception, set_trace
 from itertools import product
 from pathlib import Path
 from pickle import dump
 from time import time, perf_counter
+from torch.nn.functional import relu
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm, trange
+
+from run_nerf_helpers import (sample_section_rays, get_all_rays_np, get_embedder,
+                              get_initial_section_rand_pixel_idxs, get_rays, img2mse,
+                              load_data, mse2psnr, NeRF, ndc_rays, sample_pdf, to8b)
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -309,7 +301,7 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
         weights: [num_rays, num_samples]. Weights assigned to each sampled color.
         depth_map: [num_rays]. Estimated distance to object.
     """
-    def raw2alpha(raw, dists, act_fn=F.relu): return 1.-torch.exp(-act_fn(raw)*dists)
+    def raw2alpha(raw, dists, act_fn=relu): return 1.-torch.exp(-act_fn(raw)*dists)
 
     dists = z_vals[..., 1:] - z_vals[..., :-1]
     dists = torch.cat([dists, torch.Tensor([1e10]).expand(
