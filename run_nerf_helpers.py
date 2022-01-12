@@ -4,9 +4,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from cv2 import circle
 from ipdb import set_trace
 from itertools import product
-from matplotlib.patches import Circle
 from time import perf_counter
 from torch.utils.tensorboard import SummaryWriter
 from typing import List, Tuple
@@ -82,7 +82,8 @@ def get_embedder(multires, i=0):
 
 # Model
 class NeRF(nn.Module):
-    def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False):
+    def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4],
+                 use_viewdirs=False):
         """
         """
         super(NeRF, self).__init__()
@@ -95,9 +96,11 @@ class NeRF(nn.Module):
 
         self.pts_linears = nn.ModuleList(
             [nn.Linear(input_ch, W)] +
-            [nn.Linear(W, W) if i not in self.skips else nn.Linear(W + input_ch, W) for i in range(D-1)])
+            [nn.Linear(W, W) if i not in self.skips
+             else nn.Linear(W + input_ch, W) for i in range(D-1)])
 
-        # Implementation according to the official code release (https://github.com/bmild/nerf/blob/master/run_nerf_helpers.py#L104-L105)
+        # Implementation according to the official code release
+        # https://github.com/bmild/nerf/blob/master/run_nerf_helpers.py#L104-L105
         self.views_linears = nn.ModuleList([nn.Linear(input_ch_views + W, W//2)])
 
         # Implementation according to the paper
@@ -373,7 +376,8 @@ def load_data(args):
     if args.render_test:
         render_poses = np.array(poses[test_idxs])
 
-    return images, hwf, H, W, focal, K, poses, render_poses, train_idxs, test_idxs, val_idxs, near, far
+    return (images, hwf, H, W, focal, K, poses, render_poses, train_idxs, test_idxs, val_idxs,
+            near, far)
 
 
 def get_all_rays_np(images: np.ndarray, H: int, W: int, K: np.ndarray, poses: np.ndarray,
@@ -401,7 +405,8 @@ def get_all_rays_np(images: np.ndarray, H: int, W: int, K: np.ndarray, poses: np
         section_rays[:, grid_row_idx, grid_col_idx, :, :, :] = \
             rays[:, img_start_row_idx:img_stop_row_idx, img_start_col_idx:img_stop_col_idx, :, :]
 
-    # sk: shape (num training images, num grid rows, num grid cols, num pixels per section, ro+rd+rgb, 3)
+    # sk: shape (num training images, num grid rows, num grid cols, num pixels per section,
+    #            ro+rd+rgb, 3)
     section_rays = section_rays.astype(np.float32)
 
     t_delta = perf_counter() - t_start
@@ -454,65 +459,79 @@ def get_initial_section_rand_pixel_idxs(num_train_imgs: int, grid_size: int, sec
 
 
 def sample_section_rays(section_rays: np.ndarray, section_rand_pixel_idxs: np.ndarray,
-                        section_sampling_start_idxs: np.ndarray, section_n_rays_to_sample: np.ndarray,
-                        n_train_imgs: int, grid_size: int, n_pixels_per_section: int,
-                        tensorboard: SummaryWriter, tensorboard_tag: str, train_iter_idx: int,
-                        log_sampling_fig: bool = False, verbose: bool = False
+                        section_sampling_start_idxs: np.ndarray,
+                        section_n_rays_to_sample: np.ndarray, n_train_imgs: int, img_height: int,
+                        img_width: int, grid_size: int, section_height: int, section_width: int,
+                        n_pixels_per_section: int, tensorboard: SummaryWriter, tensorboard_tag: str,
+                        train_iter_idx: int, log_sampling_fig: bool = False, verbose: bool = False
                         ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+
     if verbose:
         print('Sampling rays across grid sections...', end='')
 
     t_start = perf_counter()
 
     if log_sampling_fig:
-        fig = plt.figure(figsize=(3.5, n_train_imgs * 2.5))
-        sub_figs = fig.subfigures(n_train_imgs, 1)
+        # The number of white pixels between each grid section.
+        section_padding_size = 5
+
+        n_pads = grid_size + 2
+        n_pad_pixels_per_axis = section_padding_size * n_pads
+        sampling_imgs = np.ones((n_train_imgs, img_height + n_pad_pixels_per_axis,
+                                 img_width + n_pad_pixels_per_axis, 3))
 
     sampled_rays = np.empty((0, 3, 3))
     section_sampled_bounding_idxs = np.empty((n_train_imgs, grid_size, grid_size, 2), dtype=int)
-    for img_idx in range(n_train_imgs):
+    for img_idx, grid_row_idx, grid_col_idx in product(range(n_train_imgs), range(grid_size),
+                                                       range(grid_size)):
+        n_rays_to_sample = section_n_rays_to_sample[img_idx, grid_row_idx, grid_col_idx]
+        pixel_idxs_to_sample = np.empty((0, 2), dtype=int)
+        while pixel_idxs_to_sample.shape[0] < n_rays_to_sample:
+            n_pixels_to_add = n_rays_to_sample - pixel_idxs_to_sample.shape[0]
+            start_idx = section_sampling_start_idxs[img_idx, grid_row_idx, grid_col_idx]
+            stop_idx = start_idx + n_pixels_to_add
+            pixel_idxs_to_sample = np.concatenate(
+                (pixel_idxs_to_sample, section_rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx,
+                                                               start_idx:stop_idx, :]))
+
+            section_sampling_start_idxs[img_idx, grid_row_idx, grid_col_idx] += n_pixels_to_add
+
+            if (section_sampling_start_idxs[img_idx, grid_row_idx, grid_col_idx] >=
+                    n_pixels_per_section):
+                rand_idxs = np.random.permutation(n_pixels_per_section)
+                section_rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, :, :] = \
+                    section_rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, rand_idxs, :]
+                section_sampling_start_idxs[img_idx, grid_row_idx, grid_col_idx] = 0
+
+        section_sampled_bounding_idxs[img_idx, grid_row_idx,
+                                      grid_col_idx, 0] = sampled_rays.shape[0]
+        sampled_rays = np.concatenate((
+            sampled_rays, section_rays[img_idx, grid_row_idx, grid_col_idx,
+                                       pixel_idxs_to_sample[:, 0], pixel_idxs_to_sample[:, 1], :]))
+        section_sampled_bounding_idxs[img_idx, grid_row_idx,
+                                      grid_col_idx, 1] = sampled_rays.shape[0]
+
         if log_sampling_fig:
-            img_sub_figs = sub_figs[img_idx]
-            axs = img_sub_figs.subplots(grid_size, grid_size)
-        for grid_row_idx, grid_col_idx in product(range(grid_size), range(grid_size)):
-            n_rays_to_sample = section_n_rays_to_sample[img_idx, grid_row_idx, grid_col_idx]
-            pixel_idxs_to_sample = np.empty((0, 2), dtype=int)
-            while pixel_idxs_to_sample.shape[0] < n_rays_to_sample:
-                n_pixels_to_add = n_rays_to_sample - pixel_idxs_to_sample.shape[0]
-                start_idx = section_sampling_start_idxs[img_idx, grid_row_idx, grid_col_idx]
-                stop_idx = start_idx + n_pixels_to_add
-                pixel_idxs_to_sample = np.concatenate(
-                    (pixel_idxs_to_sample, section_rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx,
-                                                                   start_idx:stop_idx, :]))
+            section_row_start_idx = \
+                (grid_row_idx + 1) * section_padding_size + grid_row_idx * section_height
+            section_row_stop_idx = section_row_start_idx + section_height
+            section_col_start_idx = \
+                (grid_col_idx + 1) * section_padding_size + grid_col_idx * section_width
+            section_col_stop_idx = section_col_start_idx + section_width
 
-                section_sampling_start_idxs[img_idx, grid_row_idx, grid_col_idx] += n_pixels_to_add
-
-                if (section_sampling_start_idxs[img_idx, grid_row_idx, grid_col_idx] >=
-                        n_pixels_per_section):
-                    rand_idxs = np.random.permutation(n_pixels_per_section)
-                    section_rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, :, :] = \
-                        section_rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, rand_idxs, :]
-                    section_sampling_start_idxs[img_idx, grid_row_idx, grid_col_idx] = 0
-
-            section_sampled_bounding_idxs[img_idx, grid_row_idx, grid_col_idx, 0] = \
-                sampled_rays.shape[0]
-            sampled_rays = np.concatenate((
-                sampled_rays, section_rays[img_idx, grid_row_idx, grid_col_idx,
-                                           pixel_idxs_to_sample[:, 0], pixel_idxs_to_sample[:, 1], :]))
-            section_sampled_bounding_idxs[img_idx, grid_row_idx, grid_col_idx, 1] = \
-                sampled_rays.shape[0]
-
-            if log_sampling_fig:
-                ax = axs[grid_row_idx, grid_col_idx]
-                ax.imshow(section_rays[img_idx, grid_row_idx, grid_col_idx, :, :, 2, :])
-                for pixel_row_idx, pixel_col_idx in pixel_idxs_to_sample:
-                    ax.add_patch(Circle((pixel_col_idx, pixel_row_idx), 2, color='black'))
-                    ax.add_patch(Circle((pixel_col_idx, pixel_row_idx), 1.5, color='white'))
-                    ax.add_patch(Circle((pixel_col_idx, pixel_row_idx), 0.5, color='red'))
-                ax.axis('off')
+            sampling_img = sampling_imgs[img_idx]
+            sampling_img[section_row_start_idx:section_row_stop_idx,
+                         section_col_start_idx:section_col_stop_idx] = \
+                section_rays[img_idx, grid_row_idx, grid_col_idx, :, :, 2]
+            for pixel_row_idx, pixel_col_idx in pixel_idxs_to_sample:
+                pixel_row_idx += section_row_start_idx
+                pixel_col_idx += section_col_start_idx
+                circle(sampling_img, (pixel_col_idx, pixel_row_idx), 3, color=(0, 0, 0))
+                circle(sampling_img, (pixel_col_idx, pixel_row_idx), 2, color=(1, 1, 1))
+                circle(sampling_img, (pixel_col_idx, pixel_row_idx), 1, color=(1, 0, 0))
 
     if log_sampling_fig:
-        tensorboard.add_figure(tensorboard_tag, fig, train_iter_idx)
+        tensorboard.add_images(tensorboard_tag, sampling_imgs, train_iter_idx, dataformats='NHWC')
 
     t_delta = perf_counter() - t_start
     if verbose:

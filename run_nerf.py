@@ -19,7 +19,6 @@ from run_nerf_helpers import (sample_section_rays, get_all_rays_np, get_embedder
 # sk: My imports.
 from ipdb import launch_ipdb_on_exception, set_trace
 from itertools import product
-from matplotlib.patches import Circle
 from pathlib import Path
 from pickle import dump
 from time import time, perf_counter
@@ -575,7 +574,7 @@ def config_parser():
                         help='will take every 1/N images as LLFF test set, paper uses 8')
 
     # logging/saving options
-    parser.add_argument("--i_print",   type=int, default=100,
+    parser.add_argument("--i_loss",   type=int, default=100,
                         help='frequency of console printout and metric loggin')
     parser.add_argument("--i_img",     type=int, default=500,
                         help='frequency of tensorboard image logging')
@@ -682,7 +681,7 @@ def train() -> None:
     n_rays_to_uniformly_sample_per_img = 200
     n_sections = grid_size ** 2
     n_rays_to_uniformly_sample_per_section = n_rays_to_uniformly_sample_per_img // n_sections
-    n_rays_to_actively_sample_per_img = 200
+    n_rays_to_actively_sample_per_img = N_rand // n_train_imgs
 
     # For random ray batching
     section_rays, t_get_rays = get_all_rays_np(images, H, W, K, poses, n_train_imgs, train_idxs,
@@ -717,7 +716,8 @@ def train() -> None:
         (uniformly_sampled_rays, section_uniformly_sampled_bounding_idxs,
          section_rand_pixel_idxs, section_sampling_start_idxs, t_uniform_sampling) = \
             sample_section_rays(section_rays, section_rand_pixel_idxs, section_sampling_start_idxs,
-                                section_n_rays_to_uniformly_sample, n_train_imgs, grid_size,
+                                section_n_rays_to_uniformly_sample,
+                                n_train_imgs, H, W, grid_size, section_height, section_width,
                                 n_pixels_per_section, tensorboard, 'train/uniform_sampling',
                                 train_iter_idx, log_sampling_fig=log_uniform_sampling_fig,
                                 verbose=verbose)
@@ -726,7 +726,6 @@ def train() -> None:
         t_start = perf_counter()
         batch = torch.transpose(torch.from_numpy(uniformly_sampled_rays).to(device), 0, 1)
         batch_rays, target_s = batch[:2], batch[2]
-        t_start_batch_rendering = perf_counter()
         rgb, _, _, _ = render(H, W, K, chunk=args.chunk, rays=batch_rays,
                               verbose=train_iter_idx < 10, retraw=True,
                               **render_kwargs_train)
@@ -741,7 +740,7 @@ def train() -> None:
                                                                           grid_col_idx]
             curr_section_rgb = rgb[start_idx:stop_idx]
             curr_section_target = target_s[start_idx:stop_idx]
-            curr_section_loss = img2mse(rgb, target_s)
+            curr_section_loss = img2mse(curr_section_rgb, curr_section_target)
             section_loss[img_idx, grid_row_idx, grid_col_idx] = curr_section_loss
         t_uniform_loss = perf_counter() - t_start
 
@@ -762,8 +761,8 @@ def train() -> None:
         (actively_sampled_rays, _, section_rand_pixel_idxs, section_sampling_start_idxs,
          t_active_sampling) = \
             sample_section_rays(section_rays, section_rand_pixel_idxs, section_sampling_start_idxs,
-                                section_n_rays_to_actively_sample, n_train_imgs, grid_size,
-                                n_pixels_per_section, tensorboard, 'train/active_sampling',
+                                section_n_rays_to_actively_sample, n_train_imgs, H, W, grid_size,
+                                section_height, section_width, n_pixels_per_section, tensorboard, 'train/active_sampling',
                                 train_iter_idx, log_sampling_fig=log_active_sampling_fig,
                                 verbose=verbose)
 
@@ -783,12 +782,11 @@ def train() -> None:
         img_loss = img2mse(rgb, target_s)
         loss = img_loss
         psnr = mse2psnr(img_loss)
-        t_active_loss = perf_counter() - t_start
-
         if 'rgb0' in extras:
             img_loss0 = img2mse(extras['rgb0'], target_s)
-            loss = loss + img_loss0
-            psnr0 = mse2psnr(img_loss0)
+            loss += img_loss0
+            # psnr0 = mse2psnr(img_loss0)
+        t_active_loss = perf_counter() - t_start
 
         t_start = perf_counter()
         loss.backward()
@@ -837,9 +835,7 @@ def train() -> None:
                     gt_imgs=images[test_idxs], savedir=testsavedir)
             print('Saved test set')
 
-        if train_iter_idx % args.i_print == 0:
-            tqdm.write(f"[TRAIN] Iter: {train_iter_idx} Loss: {loss.item()}  PSNR: {psnr.item()}")
-
+        if train_iter_idx % args.i_loss == 0:
             tensorboard.add_scalar('train/loss', loss, train_iter_idx)
             tensorboard.add_scalar('train/psnr', psnr, train_iter_idx)
 
