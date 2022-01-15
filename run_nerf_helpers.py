@@ -462,7 +462,7 @@ def sample_section_rays(section_rays: np.ndarray, section_rand_pixel_idxs: np.nd
                         section_n_rays_to_sample: np.ndarray, n_train_imgs: int, img_height: int,
                         img_width: int, grid_size: int, section_height: int, section_width: int,
                         n_pixels_per_section: int, tensorboard: SummaryWriter, tensorboard_tag: str,
-                        train_iter_idx: int, log_sampling_fig: bool = False, verbose: bool = False
+                        train_iter_idx: int, log_sampling_vis: bool = False, verbose: bool = False
                         ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
 
     if verbose:
@@ -470,7 +470,7 @@ def sample_section_rays(section_rays: np.ndarray, section_rand_pixel_idxs: np.nd
 
     t_start = perf_counter()
 
-    if log_sampling_fig:
+    if log_sampling_vis:
         # The number of white pixels between each grid section.
         section_padding_size = 5
 
@@ -510,7 +510,7 @@ def sample_section_rays(section_rays: np.ndarray, section_rand_pixel_idxs: np.nd
         section_sampled_bounding_idxs[img_idx, grid_row_idx,
                                       grid_col_idx, 1] = sampled_rays.shape[0]
 
-        if log_sampling_fig:
+        if log_sampling_vis:
             section_row_start_idx = \
                 (grid_row_idx + 1) * section_padding_size + grid_row_idx * section_height
             section_row_stop_idx = section_row_start_idx + section_height
@@ -529,7 +529,7 @@ def sample_section_rays(section_rays: np.ndarray, section_rand_pixel_idxs: np.nd
                 circle(sampling_img, (pixel_col_idx, pixel_row_idx), 2, color=(1, 1, 1))
                 circle(sampling_img, (pixel_col_idx, pixel_row_idx), 1, color=(1, 0, 0))
 
-    if log_sampling_fig:
+    if log_sampling_vis:
         tensorboard.add_images(tensorboard_tag, sampling_imgs, train_iter_idx, dataformats='NHWC')
 
     t_delta = perf_counter() - t_start
