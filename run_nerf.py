@@ -669,11 +669,15 @@ def train() -> None:
     section_width = W // grid_size
     n_pixels_per_section = section_height * section_width
 
-    n_sections = grid_size ** 2
+    n_sections_per_img = grid_size ** 2
     if do_active_sampling:
         n_rays_to_uniformly_sample_per_img = 200
-        n_rays_to_uniformly_sample_per_section = n_rays_to_uniformly_sample_per_img // n_sections
+        n_rays_to_uniformly_sample_per_section = \
+            n_rays_to_uniformly_sample_per_img // n_sections_per_img
         n_rays_to_actively_sample_per_img = N_rand // n_train_imgs
+    else:
+        n_rays_to_sample_per_img = N_rand // n_train_imgs
+        n_rays_to_sample_per_section = n_rays_to_sample_per_img // n_sections_per_img
 
     # For random ray batching
     section_rays, t_get_rays = get_all_rays_np(images, H, W, K, poses, n_train_imgs, train_idxs,
@@ -686,6 +690,9 @@ def train() -> None:
     if do_active_sampling:
         section_n_rays_to_uniformly_sample = np.broadcast_to(n_rays_to_uniformly_sample_per_section,
                                                              (n_train_imgs, grid_size, grid_size))
+    else:
+        section_n_rays_to_sample = np.broadcast_to(n_rays_to_sample_per_section,
+                                                   (n_train_imgs, grid_size, grid_size))
 
     # Move training data to GPU
     images = torch.Tensor(images).to(device)
@@ -702,9 +709,9 @@ def train() -> None:
 
     tqdm_bar = trange(start_iter_idx, N_iters)
     for train_iter_idx in tqdm_bar:
-        if do_active_sampling:
-            log_sampling_vis = train_iter_idx % args.i_sampling_vis == 0
+        log_sampling_vis = train_iter_idx % args.i_sampling_vis == 0
 
+        if do_active_sampling:
             # Uniform ray sampling.
             (uniformly_sampled_rays, section_uniformly_sampled_bounding_idxs,
              section_rand_pixel_idxs, section_sampling_start_idxs, t_uniform_sampling) = \
@@ -751,16 +758,17 @@ def train() -> None:
             # Active ray sampling.
             (actively_sampled_rays, _, section_rand_pixel_idxs, section_sampling_start_idxs,
              t_active_sampling) = \
-                sample_section_rays(section_rays, section_rand_pixel_idxs, section_sampling_start_idxs,
-                                    section_n_rays_to_actively_sample, n_train_imgs, H, W, grid_size,
-                                    section_height, section_width, n_pixels_per_section, tensorboard, 'train/active_sampling',
+                sample_section_rays(section_rays, section_rand_pixel_idxs,
+                                    section_sampling_start_idxs, section_n_rays_to_actively_sample,
+                                    n_train_imgs, H, W, grid_size, section_height, section_width,
+                                    n_pixels_per_section, tensorboard, 'train/active_sampling',
                                     train_iter_idx, log_sampling_vis=log_sampling_vis,
                                     verbose=verbose)
             sampled_rays = actively_sampled_rays
         else:
             (sampled_rays, _, section_rand_pixel_idxs, section_sampling_start_idxs, t_sampling) = \
                 sample_section_rays(section_rays, section_rand_pixel_idxs,
-                                    section_sampling_start_idxs, section_n_rays_to_uniformly_sample,
+                                    section_sampling_start_idxs, section_n_rays_to_sample,
                                     n_train_imgs, H, W, grid_size, section_height, section_width,
                                     n_pixels_per_section, tensorboard, 'train/sampling',
                                     train_iter_idx, log_sampling_vis=log_sampling_vis,
