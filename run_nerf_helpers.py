@@ -1,14 +1,16 @@
+from argparse import Namespace
+from itertools import product
+from time import perf_counter
+from typing import List, Tuple
+
 import numpy as np
 import torch
 import torch.nn as nn
 
-from cv2 import circle
+from cv2 import circle, FILLED
 from ipdb import set_trace
-from itertools import product
-from time import perf_counter
 from torch.nn.functional import relu
 from torch.utils.tensorboard import SummaryWriter
-from typing import List, Tuple
 
 from load_llff import load_llff_data
 from load_deepvoxels import load_dv_data
@@ -178,9 +180,8 @@ class NeRF(nn.Module):
 
 
 # Ray helpers
-def get_rays(H, W, K, c2w):
-    i, j = torch.meshgrid(torch.linspace(0, W-1, W), torch.linspace(0, H-1, H), indexing='ij'
-                          )  # pytorch's meshgrid has indexing='ij'
+def get_rays(H: int, W: int, K: torch.Tensor, c2w: torch.Tensor):
+    i, j = torch.meshgrid(torch.linspace(0, W-1, W), torch.linspace(0, H-1, H), indexing='ij')
     i = i.t()
     j = j.t()
     dirs = torch.stack([(i-K[0][2])/K[0][0], -(j-K[1][2])/K[1][1], -torch.ones_like(i)], -1)
@@ -276,7 +277,9 @@ def sample_pdf(bins, weights, N_samples, det=False, pytest=False):
     return samples
 
 
-def load_data(args):
+def load_data(args: Namespace, device: str
+              ) -> Tuple[torch.Tensor, List[int], int, int, float, torch.Tensor, torch.Tensor,
+                         torch.Tensor, List[int], List[int], List[int], float, float]:
     # Load data
     K = None
 
@@ -375,27 +378,40 @@ def load_data(args):
     if args.render_test:
         render_poses = np.array(poses[test_idxs])
 
+    # Move data to GPU.
+    images = torch.Tensor(images).to(device)
+    K = torch.tensor(K)
+    poses = torch.Tensor(poses).to(device)
+    render_poses = torch.Tensor(render_poses).to(device)
+
+    print('TRAIN views are', train_idxs)
+    print('TEST views are', test_idxs)
+    print('VAL views are', val_idxs)
+
     return (images, hwf, H, W, focal, K, poses, render_poses, train_idxs, test_idxs, val_idxs,
             near, far)
 
 
-def get_all_rays_np(images: np.ndarray, H: int, W: int, K: np.ndarray, poses: np.ndarray,
-                    n_train_imgs: int, train_idxs: List[int], grid_size: int, section_height: int,
-                    section_width: int, verbose=False) -> Tuple[np.ndarray, float]:
+def get_all_rays(images: torch.Tensor, H: int, W: int, K: torch.Tensor, poses: torch.Tensor,
+                 n_train_imgs: int,  grid_size: int, section_height: int,
+                 section_width: int, verbose=False) -> Tuple[torch.Tensor, float]:
+    """
+    @param images - Training images.
+    @param poses - Pose for each training image.
+    """
     if verbose:
-        print('Getting rays...', end='')
+        print('Getting all rays...', end='')
 
     t_start = perf_counter()
 
     # sk: A ray for every pixel of every camera image. Shape (N, ro+rd, H, W, 3).
-    rays = np.stack([get_rays_np(H, W, K, p) for p in poses[:, :3, :4]], 0)
+    rays = torch.stack([torch.stack(get_rays(H, W, K, p)) for p in poses[:, :3, :4]])
 
-    rays = np.concatenate([rays, images[:, None]], 1)  # (N, ro+rd+rgb, H, W, 3)
-    rays = np.transpose(rays, [0, 2, 3, 1, 4])  # (N, H, W, ro+rd+rgb, 3)
-    rays = np.stack([rays[i] for i in train_idxs], 0)  # (N train, H, W, ro+rd+rgb, 3)
+    rays = torch.cat([rays, images[:, None]], 1)  # (N, ro+rd+rgb, H, W, 3)
+    rays = torch.permute(rays, (0, 2, 3, 1, 4))  # (N, H, W, ro+rd+rgb, 3)
 
-    section_rays = np.empty((n_train_imgs, grid_size, grid_size,
-                             section_height, section_width, 3, 3))
+    section_rays = torch.empty((n_train_imgs, grid_size, grid_size,
+                                section_height, section_width, 3, 3))
     for grid_row_idx, grid_col_idx in product(range(grid_size), range(grid_size)):
         img_start_row_idx = grid_row_idx * section_height
         img_stop_row_idx = (grid_row_idx + 1) * section_height
@@ -404,21 +420,17 @@ def get_all_rays_np(images: np.ndarray, H: int, W: int, K: np.ndarray, poses: np
         section_rays[:, grid_row_idx, grid_col_idx, :, :, :] = \
             rays[:, img_start_row_idx:img_stop_row_idx, img_start_col_idx:img_stop_col_idx, :, :]
 
-    # sk: shape (num training images, num grid rows, num grid cols, num pixels per section,
-    #            ro+rd+rgb, 3)
-    section_rays = section_rays.astype(np.float32)
-
     t_delta = perf_counter() - t_start
 
     if verbose:
-        print(f' done in {t_delta:.4f} seconds.')
+        print(f' done in {t_delta:.3f} seconds.')
 
     return section_rays, t_delta
 
 
 def get_initial_section_rand_pixel_idxs(num_train_imgs: int, grid_size: int, section_height: int,
                                         section_width: int, verbose: bool = False
-                                        ) -> Tuple[np.ndarray, float]:
+                                        ) -> Tuple[torch.Tensor, float]:
     """
     @param num_train_imgs - The number of training images.
     @param grid_size - The number of sections along one side of the grid that images are split into
@@ -435,35 +447,34 @@ def get_initial_section_rand_pixel_idxs(num_train_imgs: int, grid_size: int, sec
     t_start = perf_counter()
 
     if verbose:
-        print('Getting initial grid section random pixel indices...', end='')
+        print('Getting initial section random pixel indices...', end='')
 
     num_pixels_per_section = section_height * section_width
-    single_section_pixel_idxs = list(product(range(section_height), range(section_width)))
-    section_rand_pixel_idxs = np.broadcast_to(single_section_pixel_idxs,
-                                              (num_train_imgs, grid_size, grid_size,
-                                               num_pixels_per_section, 2)).copy()
+    single_section_pixel_idxs = torch.tensor(list(product(range(section_height),
+                                                          range(section_width))))
+    section_rand_pixel_idxs = \
+        single_section_pixel_idxs.repeat((num_train_imgs, grid_size, grid_size, 1, 1))
     for img_idx, grid_row_idx, grid_col_idx in product(range(num_train_imgs),
                                                        range(grid_size),
                                                        range(grid_size)):
-        rand_pixel_idxs = np.random.permutation(num_pixels_per_section)
+        rand_pixel_idxs = torch.randperm(num_pixels_per_section)
         section_rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, :, :] = \
             section_rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, rand_pixel_idxs, :]
 
     t_delta = perf_counter() - t_start
 
     if verbose:
-        print(f' done in {t_delta:.4f} seconds.')
+        print(f' done in {t_delta:.3f} seconds.')
 
     return section_rand_pixel_idxs, t_delta
 
 
-def sample_section_rays(section_rays: np.ndarray, section_rand_pixel_idxs: np.ndarray,
-                        section_sampling_start_idxs: np.ndarray,
-                        section_n_rays_to_sample: np.ndarray, n_train_imgs: int, img_height: int,
-                        img_width: int, grid_size: int, section_height: int, section_width: int,
-                        n_pixels_per_section: int, tensorboard: SummaryWriter, tensorboard_tag: str,
-                        train_iter_idx: int, log_sampling_vis: bool = False, verbose: bool = False
-                        ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+def sample_section_rays(section_rays: torch.Tensor, section_n_rays_to_sample: torch.Tensor,
+                        n_train_imgs: int, img_height: int, img_width: int, grid_size: int,
+                        section_height: int, section_width: int, tensorboard: SummaryWriter,
+                        tensorboard_tag: str, train_iter_idx: int, log_sampling_vis: bool = False,
+                        verbose: bool = False
+                        ) -> Tuple[torch.Tensor, torch.Tensor, float]:
 
     if verbose:
         print('Sampling rays across grid sections...', end='')
@@ -476,65 +487,110 @@ def sample_section_rays(section_rays: np.ndarray, section_rand_pixel_idxs: np.nd
 
         n_pads = grid_size + 2
         n_pad_pixels_per_axis = section_padding_size * n_pads
-        sampling_imgs = np.ones((n_train_imgs, img_height + n_pad_pixels_per_axis,
-                                 img_width + n_pad_pixels_per_axis, 3))
+        sampling_vis_imgs = torch.ones((n_train_imgs, img_height + n_pad_pixels_per_axis,
+                                        img_width + n_pad_pixels_per_axis, 3))
 
-    sampled_rays = np.empty((0, 3, 3))
-    section_sampled_bounding_idxs = np.empty((n_train_imgs, grid_size, grid_size, 2), dtype=int)
-    for img_idx, grid_row_idx, grid_col_idx in product(range(n_train_imgs), range(grid_size),
-                                                       range(grid_size)):
-        n_rays_to_sample = section_n_rays_to_sample[img_idx, grid_row_idx, grid_col_idx]
-        pixel_idxs_to_sample = np.empty((0, 2), dtype=int)
-        while pixel_idxs_to_sample.shape[0] < n_rays_to_sample:
-            n_pixels_to_add = n_rays_to_sample - pixel_idxs_to_sample.shape[0]
-            start_idx = section_sampling_start_idxs[img_idx, grid_row_idx, grid_col_idx]
-            stop_idx = start_idx + n_pixels_to_add
-            pixel_idxs_to_sample = np.concatenate(
-                (pixel_idxs_to_sample, section_rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx,
-                                                               start_idx:stop_idx, :]))
-
-            section_sampling_start_idxs[img_idx, grid_row_idx, grid_col_idx] += n_pixels_to_add
-
-            if (section_sampling_start_idxs[img_idx, grid_row_idx, grid_col_idx] >=
-                    n_pixels_per_section):
-                rand_idxs = np.random.permutation(n_pixels_per_section)
-                section_rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, :, :] = \
-                    section_rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, rand_idxs, :]
-                section_sampling_start_idxs[img_idx, grid_row_idx, grid_col_idx] = 0
-
-        section_sampled_bounding_idxs[img_idx, grid_row_idx,
-                                      grid_col_idx, 0] = sampled_rays.shape[0]
-        sampled_rays = np.concatenate((
-            sampled_rays, section_rays[img_idx, grid_row_idx, grid_col_idx,
-                                       pixel_idxs_to_sample[:, 0], pixel_idxs_to_sample[:, 1], :]))
-        section_sampled_bounding_idxs[img_idx, grid_row_idx,
-                                      grid_col_idx, 1] = sampled_rays.shape[0]
-
+    sampled_rays = torch.empty((torch.sum(section_n_rays_to_sample), 3, 3))
+    section_sampled_bounding_idxs = torch.empty((n_train_imgs, grid_size, grid_size, 2), dtype=int)
+    start_idx = 0
+    n_pixels_per_section = section_height * section_width
+    t_np = 0.0
+    t_circles = 0.0
+    for img_idx in range(n_train_imgs):
         if log_sampling_vis:
-            section_row_start_idx = \
-                (grid_row_idx + 1) * section_padding_size + grid_row_idx * section_height
-            section_row_stop_idx = section_row_start_idx + section_height
-            section_col_start_idx = \
-                (grid_col_idx + 1) * section_padding_size + grid_col_idx * section_width
-            section_col_stop_idx = section_col_start_idx + section_width
+            sampling_vis_img = sampling_vis_imgs[img_idx]
+            t_np_start = perf_counter()
+            sampling_vis_img_np = sampling_vis_img.numpy()
+            t_np += perf_counter() - t_np_start
+        for grid_row_idx, grid_col_idx in product(range(grid_size), range(grid_size)):
+            n_rays_to_sample = int(section_n_rays_to_sample[img_idx, grid_row_idx, grid_col_idx])
 
-            sampling_img = sampling_imgs[img_idx]
-            sampling_img[section_row_start_idx:section_row_stop_idx,
-                         section_col_start_idx:section_col_stop_idx] = \
-                section_rays[img_idx, grid_row_idx, grid_col_idx, :, :, 2]
-            for pixel_row_idx, pixel_col_idx in pixel_idxs_to_sample:
-                pixel_row_idx += section_row_start_idx
-                pixel_col_idx += section_col_start_idx
-                circle(sampling_img, (pixel_col_idx, pixel_row_idx), 3, color=(0, 0, 0))
-                circle(sampling_img, (pixel_col_idx, pixel_row_idx), 2, color=(1, 1, 1))
-                circle(sampling_img, (pixel_col_idx, pixel_row_idx), 1, color=(1, 0, 0))
+            pixel_flat_idxs_to_sample = torch.randperm(n_pixels_per_section)[:n_rays_to_sample]
+            pixel_row_idxs_to_sample = torch.div(pixel_flat_idxs_to_sample, section_width,
+                                                 rounding_mode='floor')
+            pixel_col_idxs_to_sample = torch.fmod(pixel_flat_idxs_to_sample, section_width)
+
+            stop_idx = start_idx + n_rays_to_sample
+            sampled_rays[start_idx:stop_idx] = \
+                section_rays[img_idx, grid_row_idx, grid_col_idx, pixel_row_idxs_to_sample,
+                             pixel_col_idxs_to_sample, :]
+
+            section_sampled_bounding_idxs[img_idx, grid_row_idx, grid_col_idx, 0] = start_idx
+            section_sampled_bounding_idxs[img_idx, grid_row_idx, grid_col_idx, 1] = stop_idx
+            start_idx = stop_idx
+
+            if log_sampling_vis:
+                section_row_start_idx = \
+                    (grid_row_idx + 1) * section_padding_size + grid_row_idx * section_height
+                section_row_stop_idx = section_row_start_idx + section_height
+                section_col_start_idx = \
+                    (grid_col_idx + 1) * section_padding_size + grid_col_idx * section_width
+                section_col_stop_idx = section_col_start_idx + section_width
+
+                sampling_vis_img[section_row_start_idx:section_row_stop_idx,
+                                 section_col_start_idx:section_col_stop_idx] = \
+                    section_rays[img_idx, grid_row_idx, grid_col_idx, :, :, 2]
+                for pixel_row_idx, pixel_col_idx in zip(pixel_row_idxs_to_sample,
+                                                        pixel_col_idxs_to_sample):
+                    pixel_row_idx = int(pixel_row_idx + section_row_start_idx)
+                    pixel_col_idx = int(pixel_col_idx + section_col_start_idx)
+                    t_circles_start = perf_counter()
+                    circle(sampling_vis_img_np, (pixel_col_idx, pixel_row_idx), 3, (0, 0, 0),
+                           FILLED)
+                    circle(sampling_vis_img_np, (pixel_col_idx, pixel_row_idx), 2, (1, 1, 1),
+                           FILLED)
+                    circle(sampling_vis_img_np, (pixel_col_idx, pixel_row_idx), 1, (1, 0, 0),
+                           FILLED)
+                    t_circles += perf_counter() - t_circles_start
 
     if log_sampling_vis:
-        tensorboard.add_images(tensorboard_tag, sampling_imgs, train_iter_idx, dataformats='NHWC')
+        t_logging_start = perf_counter()
+        tensorboard.add_images(tensorboard_tag, sampling_vis_imgs,
+                               train_iter_idx, dataformats='NHWC')
+        t_logging = perf_counter() - t_logging_start
 
     t_delta = perf_counter() - t_start
     if verbose:
-        print(f' done in {t_delta:.4f} seconds.')
+        print(f' done in {t_delta:.3f} seconds.')
 
-    return (sampled_rays, section_sampled_bounding_idxs, section_rand_pixel_idxs,
-            section_sampling_start_idxs, t_delta)
+    print(f't_np:{t_np:.3f}, t_circles:{t_circles:.3f}, t_logging:{t_logging:.3f}')
+
+    return sampled_rays, section_sampled_bounding_idxs, t_delta
+
+
+def get_section_n_samples(prob_dist: torch.Tensor, n_samples: int) -> Tuple[torch.Tensor, float]:
+    """
+    @param prob_dist
+    @param n_samples
+    @returns - (section_n_samples, t_delta)
+        section_n_samples - Same shape as prob_dist. The number of times each element from prob_dist
+            should be sampled.
+        t_delta - Total execution time of this function.
+    """
+    t_start = perf_counter()
+
+    # Create a tensor in the same shape as the input probability distribution that will be returned
+    # and dictate how many times each element should be sampled.
+    section_n_samples = torch.zeros(prob_dist.shape, dtype=int)
+    # Create a flat view of section_n_samples for easier manipulation. Note that when this flat view
+    # is modified the appropriate element of the unflattened version will also be modified.
+    section_n_samples_flat = section_n_samples.view(-1)
+
+    # Flatten the input probability distribution and compute the cumulative probability
+    # distribution.
+    cumu_prob_dist_flat = torch.cumsum(torch.flatten(prob_dist), 0)
+
+    # Create n_samples random values between 0 and 1.
+    rand_vals = torch.rand(n_samples)
+
+    # For each value in rand_vals, find the index of the first value in the cumulative probability
+    # distribution that is greater than the value.
+    idxs_to_sample_flat = torch.bucketize(rand_vals, cumu_prob_dist_flat)
+    # Get the number of times each index was sampled.
+    unique_vals, unique_val_counts = torch.unique(idxs_to_sample_flat, return_counts=True)
+    # Update the return datastructure with the number of times to sample each element.
+    section_n_samples_flat[unique_vals] = unique_val_counts
+
+    t_delta = perf_counter() - t_start
+
+    return section_n_samples, t_delta
