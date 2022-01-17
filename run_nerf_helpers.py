@@ -470,7 +470,7 @@ def get_initial_section_rand_pixel_idxs(num_train_imgs: int, grid_size: int, sec
 
 
 def sample_section_rays(section_rays: torch.Tensor, section_n_rays_to_sample: torch.Tensor,
-                        n_train_imgs: int, img_height: int, img_width: int, grid_size: int,
+                        n_total_rays_to_sample: int, n_train_imgs: int, img_height: int, img_width: int, grid_size: int,
                         section_height: int, section_width: int, tensorboard: SummaryWriter,
                         tensorboard_tag: str, train_iter_idx: int, log_sampling_vis: bool = False,
                         verbose: bool = False
@@ -490,59 +490,79 @@ def sample_section_rays(section_rays: torch.Tensor, section_n_rays_to_sample: to
         sampling_vis_imgs = torch.ones((n_train_imgs, img_height + n_pad_pixels_per_axis,
                                         img_width + n_pad_pixels_per_axis, 3))
 
-    sampled_rays = torch.empty((torch.sum(section_n_rays_to_sample), 3, 3))
-    section_sampled_bounding_idxs = torch.empty((n_train_imgs, grid_size, grid_size, 2), dtype=int)
-    start_idx = 0
-    n_pixels_per_section = section_height * section_width
-    t_np = 0.0
-    t_circles = 0.0
-    for img_idx in range(n_train_imgs):
-        if log_sampling_vis:
-            sampling_vis_img = sampling_vis_imgs[img_idx]
-            t_np_start = perf_counter()
-            sampling_vis_img_np = sampling_vis_img.numpy()
-            t_np += perf_counter() - t_np_start
-        for grid_row_idx, grid_col_idx in product(range(grid_size), range(grid_size)):
-            n_rays_to_sample = int(section_n_rays_to_sample[img_idx, grid_row_idx, grid_col_idx])
+    section_sampled_bounding_idxs = torch.empty((n_train_imgs, grid_size, grid_size, 2), dtype=int,
+                                                device='cpu')
 
-            pixel_flat_idxs_to_sample = torch.randperm(n_pixels_per_section)[:n_rays_to_sample]
-            pixel_row_idxs_to_sample = torch.div(pixel_flat_idxs_to_sample, section_width,
-                                                 rounding_mode='floor')
-            pixel_col_idxs_to_sample = torch.fmod(pixel_flat_idxs_to_sample, section_width)
+    t_prob_dist_start = perf_counter()
+    pixel_sampling_prob_dist = section_n_rays_to_sample.float().unsqueeze(-1).unsqueeze(-1).repeat(
+        (1, 1, 1, section_height, section_width))
+    t_prob_dist = perf_counter() - t_prob_dist_start
 
-            stop_idx = start_idx + n_rays_to_sample
-            sampled_rays[start_idx:stop_idx] = \
-                section_rays[img_idx, grid_row_idx, grid_col_idx, pixel_row_idxs_to_sample,
-                             pixel_col_idxs_to_sample, :]
+    t_sample_start = perf_counter()
+    sampled_idxs_flat = torch.multinomial(pixel_sampling_prob_dist.view(-1), n_total_rays_to_sample)
+    t_sample = perf_counter() - t_sample_start
 
-            section_sampled_bounding_idxs[img_idx, grid_row_idx, grid_col_idx, 0] = start_idx
-            section_sampled_bounding_idxs[img_idx, grid_row_idx, grid_col_idx, 1] = stop_idx
-            start_idx = stop_idx
+    t_index_start = perf_counter()
+    sampled_rays = section_rays.view(-1, 3, 3)[sampled_idxs_flat]
+    t_index = perf_counter() - t_index_start
 
-            if log_sampling_vis:
-                section_row_start_idx = \
-                    (grid_row_idx + 1) * section_padding_size + grid_row_idx * section_height
-                section_row_stop_idx = section_row_start_idx + section_height
-                section_col_start_idx = \
-                    (grid_col_idx + 1) * section_padding_size + grid_col_idx * section_width
-                section_col_stop_idx = section_col_start_idx + section_width
+    print(f'{t_prob_dist:.3f}, {t_sample:.3f}, {t_index:.3f}')
 
-                sampling_vis_img[section_row_start_idx:section_row_stop_idx,
-                                 section_col_start_idx:section_col_stop_idx] = \
-                    section_rays[img_idx, grid_row_idx, grid_col_idx, :, :, 2]
-                for pixel_row_idx, pixel_col_idx in zip(pixel_row_idxs_to_sample,
-                                                        pixel_col_idxs_to_sample):
-                    pixel_row_idx = int(pixel_row_idx + section_row_start_idx)
-                    pixel_col_idx = int(pixel_col_idx + section_col_start_idx)
-                    t_circles_start = perf_counter()
-                    circle(sampling_vis_img_np, (pixel_col_idx, pixel_row_idx), 3, (0, 0, 0),
-                           FILLED)
-                    circle(sampling_vis_img_np, (pixel_col_idx, pixel_row_idx), 2, (1, 1, 1),
-                           FILLED)
-                    circle(sampling_vis_img_np, (pixel_col_idx, pixel_row_idx), 1, (1, 0, 0),
-                           FILLED)
-                    t_circles += perf_counter() - t_circles_start
+    # set_trace()
+#     for img_idx in range(n_train_imgs):
+#         if log_sampling_vis:
+#             sampling_vis_img = sampling_vis_imgs[img_idx]
+#             t_np_start = perf_counter()
+#             sampling_vis_img_np = sampling_vis_img.numpy()
+#             t_np += perf_counter() - t_np_start
 
+#         for grid_row_idx, grid_col_idx in product(range(grid_size), range(grid_size)):
+#             t_int_start = perf_counter()
+#             n_rays_to_sample = section_n_rays_to_sample[img_idx, grid_row_idx, grid_col_idx].item()
+#             t_int += perf_counter() - t_int_start
+#             t_pixel_sampling_start = perf_counter()
+#             pixel_flat_idxs_to_sample = torch.randperm(n_pixels_per_section)[:n_rays_to_sample]
+#             pixel_row_idxs_to_sample = torch.div(pixel_flat_idxs_to_sample, section_width,
+#                                                  rounding_mode='floor')
+#             pixel_col_idxs_to_sample = torch.fmod(pixel_flat_idxs_to_sample, section_width)
+#             t_pixel_sampling += perf_counter() - t_pixel_sampling_start
+
+#             t_insert_rays_start = perf_counter()
+#             stop_idx = start_idx + n_rays_to_sample
+#             sampled_rays[start_idx:stop_idx] = \
+#                 section_rays[img_idx, grid_row_idx, grid_col_idx, pixel_row_idxs_to_sample,
+#                              pixel_col_idxs_to_sample, :]
+
+#             section_sampled_bounding_idxs[img_idx, grid_row_idx, grid_col_idx, 0] = start_idx
+#             section_sampled_bounding_idxs[img_idx, grid_row_idx, grid_col_idx, 1] = stop_idx
+#             start_idx = stop_idx
+#             t_insert_rays += perf_counter() - t_insert_rays_start
+
+#             if log_sampling_vis:
+#                 section_row_start_idx = \
+#                     (grid_row_idx + 1) * section_padding_size + grid_row_idx * section_height
+#                 section_row_stop_idx = section_row_start_idx + section_height
+#                 section_col_start_idx = \
+#                     (grid_col_idx + 1) * section_padding_size + grid_col_idx * section_width
+#                 section_col_stop_idx = section_col_start_idx + section_width
+
+#                 sampling_vis_img[section_row_start_idx:section_row_stop_idx,
+#                                  section_col_start_idx:section_col_stop_idx] = \
+#                     section_rays[img_idx, grid_row_idx, grid_col_idx, :, :, 2]
+#                 for pixel_row_idx, pixel_col_idx in zip(pixel_row_idxs_to_sample,
+#                                                         pixel_col_idxs_to_sample):
+#                     t_circles_start = perf_counter()
+#                     pixel_row_idx = int(pixel_row_idx + section_row_start_idx)
+#                     pixel_col_idx = int(pixel_col_idx + section_col_start_idx)
+#                     circle(sampling_vis_img_np, (pixel_col_idx, pixel_row_idx), 3, (0, 0, 0),
+#                            FILLED)
+#                     circle(sampling_vis_img_np, (pixel_col_idx, pixel_row_idx), 2, (1, 1, 1),
+#                            FILLED)
+#                     circle(sampling_vis_img_np, (pixel_col_idx, pixel_row_idx), 1, (1, 0, 0),
+#                            FILLED)
+#                     t_circles += perf_counter() - t_circles_start
+
+    t_logging = 0.0
     if log_sampling_vis:
         t_logging_start = perf_counter()
         tensorboard.add_images(tensorboard_tag, sampling_vis_imgs,
@@ -553,7 +573,9 @@ def sample_section_rays(section_rays: torch.Tensor, section_n_rays_to_sample: to
     if verbose:
         print(f' done in {t_delta:.3f} seconds.')
 
-    print(f't_np:{t_np:.3f}, t_circles:{t_circles:.3f}, t_logging:{t_logging:.3f}')
+    # print(f't_make_empty: {t_make_empty:.3f}, t_np: {t_np: .3f}, t_int: {t_int:.3f}, t_pixel_sampling: {t_pixel_sampling: .3f}, '
+    #       f't_insert_rays: {t_insert_rays: .3f}, t_circles: {t_circles: .3f},'
+    #       f't_logging: {t_logging: .3f}')
 
     return sampled_rays, section_sampled_bounding_idxs, t_delta
 

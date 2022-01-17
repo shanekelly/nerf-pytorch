@@ -669,6 +669,7 @@ def train() -> None:
     n_sections_per_img = grid_size ** 2
     if do_active_sampling:
         n_rays_to_uniformly_sample_per_img = 200
+        n_total_rays_to_uniformly_sample = n_rays_to_uniformly_sample_per_img * n_train_imgs
         min_n_rays_to_uniformly_sample_per_section = \
             n_rays_to_uniformly_sample_per_img // n_sections_per_img
         remaining_n_rays_to_uniformly_sample = \
@@ -676,9 +677,11 @@ def train() -> None:
         section_uniform_sampling_prob_dist = torch.full((n_train_imgs, grid_size, grid_size),
                                                         1 / (n_train_imgs * grid_size * grid_size))
 
-        n_rays_to_actively_sample_per_img = N_rand // n_train_imgs
+        n_total_rays_to_actively_sample = N_rand
+        n_rays_to_actively_sample_per_img = n_total_rays_to_actively_sample // n_train_imgs
     else:
-        n_rays_to_sample_per_img = N_rand // n_train_imgs
+        n_total_rays_to_sample = N_rand
+        n_rays_to_sample_per_img = n_total_rays_to_sample // n_train_imgs
         n_rays_to_sample_per_section = n_rays_to_sample_per_img // n_sections_per_img
 
     # Get all rays from all training images.
@@ -686,15 +689,13 @@ def train() -> None:
                                    grid_size, section_height, section_width,
                                    verbose=True)
 
-    # section_rand_pixel_idxs, t_initial_shuffle_ = get_initial_section_rand_pixel_idxs(
-    #     n_train_imgs, grid_size, section_height, section_width, verbose=True)
-    # section_sampling_start_idxs = torch.zeros((n_train_imgs, grid_size, grid_size), dtype=int)
     if do_active_sampling:
         min_section_n_rays_to_uniformly_sample = \
             torch.full((n_train_imgs, grid_size, grid_size),
                        min_n_rays_to_uniformly_sample_per_section)
     else:
-        section_n_rays_to_sample = torch.broadcast_to(torch.tensor(n_rays_to_sample_per_section),
+        section_n_rays_to_sample = torch.broadcast_to(torch.tensor(n_rays_to_sample_per_section,
+                                                                   dtype=int),
                                                       (n_train_imgs, grid_size, grid_size))
 
     # TODO: make N_iters a command-line argument
@@ -719,6 +720,7 @@ def train() -> None:
             (uniformly_sampled_rays, section_uniformly_sampled_bounding_idxs,
                 t_uniform_sampling) = \
                 sample_section_rays(section_rays, section_n_rays_to_uniformly_sample,
+                                    n_total_rays_to_uniformly_sample,
                                     n_train_imgs, H, W, grid_size, section_height, section_width,
                                     tensorboard, 'train/uniform_sampling', train_iter_idx,
                                     log_sampling_vis=log_sampling_vis, verbose=verbose)
@@ -762,14 +764,16 @@ def train() -> None:
             # Active ray sampling.
             (actively_sampled_rays, _, t_active_sampling) = \
                 sample_section_rays(section_rays, section_n_rays_to_actively_sample,
+                                    n_total_rays_to_actively_sample,
                                     n_train_imgs, H, W, grid_size, section_height, section_width,
                                     tensorboard, 'train/active_sampling', train_iter_idx,
                                     log_sampling_vis=log_sampling_vis, verbose=verbose)
             sampled_rays = actively_sampled_rays
         else:
             (sampled_rays, _, t_sampling) = \
-                sample_section_rays(section_rays, section_n_rays_to_sample, n_train_imgs, H, W,
-                                    grid_size, section_height, section_width, n_pixels_per_section,
+                sample_section_rays(section_rays, section_n_rays_to_sample, n_total_rays_to_sample,
+                                    n_train_imgs, H, W,
+                                    grid_size, section_height, section_width,
                                     tensorboard, 'train/sampling', train_iter_idx,
                                     log_sampling_vis=log_sampling_vis, verbose=verbose)
 
@@ -878,7 +882,8 @@ def train() -> None:
                 f'b{t_backprop:.3f}')
         else:
             tqdm_bar.set_postfix_str(
-                f't{t_train_iter:.3f},s{t_sampling:.3f},r{t_rendering:.3f},b{t_backprop:.3f}')
+                f't{t_train_iter:.3f},s{t_sampling:.3f},b{t_batching:.3f},r{t_rendering:.3f},'
+                f'b{t_backprop:.3f}')
 
         global_step += 1
 
