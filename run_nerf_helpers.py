@@ -481,11 +481,26 @@ def nd_idxs_from_1d_idxs(flat_idxs: torch.Tensor, n_elems_per_chunks: torch.Tens
 
 
 def sample_section_rays(sw_rays: torch.Tensor, sw_sampling_prob_dist: torch.Tensor,
-                        n_total_rays_to_sample: int, n_train_imgs: int, img_height: int, img_width:
-                        int, grid_size: int, section_height: int, section_width: int, tensorboard:
-                        SummaryWriter, tensorboard_tag: str, train_iter_idx: int, log_sampling_vis:
-                        bool = False, verbose: bool = False
+                        n_total_rays_to_sample: int, n_train_imgs: int, img_height: int,
+                        img_width: int, grid_size: int, section_height: int, section_width: int,
+                        tensorboard: SummaryWriter, tensorboard_tag: str, train_iter_idx: int,
+                        log_sampling_vis: bool = False, verbose: bool = False
                         ) -> Tuple[torch.Tensor, torch.Tensor, float]:
+
+    #     for var in [sw_rays, sw_sampling_prob_dist, n_total_rays_to_sample, n_train_imgs, img_height,
+    #                 img_width, grid_size, section_height, section_width, tensorboard, tensorboard_tag,
+    #                 train_iter_idx, log_sampling_vis, verbose]:
+    #         if isinstance(var, torch.Tensor):
+    #             print(var.shape, var.dtype, var.device, var.requires_grad)
+    #         elif isinstance(var, int):
+    #             print(var)
+    #         elif isinstance(var, bool):
+    #             print(var)
+
+    #     print('')
+    #     print('')
+
+    #     set_trace()
 
     t_start = perf_counter()
 
@@ -517,7 +532,7 @@ def sample_section_rays(sw_rays: torch.Tensor, sw_sampling_prob_dist: torch.Tens
         n_pads = grid_size + 2
         n_pad_pixels_per_axis = section_padding_size * n_pads
         sampling_vis_imgs = torch.ones((n_train_imgs, img_height + n_pad_pixels_per_axis,
-                                        img_width + n_pad_pixels_per_axis, 3))
+                                        img_width + n_pad_pixels_per_axis, 3), device='cpu')
         sampling_vis_imgs_np = sampling_vis_imgs.numpy()
 
         # Draw all of the image sections on the sampling visualization images.

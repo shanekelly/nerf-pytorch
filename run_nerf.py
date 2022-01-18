@@ -690,8 +690,9 @@ def train() -> None:
                                    verbose=True)
 
     if do_active_sampling:
-        sw_n_rays_to_uniformly_sample = torch.tensor(1 /
-                                                     n_total_rays_to_uniformly_sample).expand(n_train_imgs, grid_size, grid_size)
+        sw_uniform_sampling_prob_dist = \
+            torch.tensor(1 / n_total_rays_to_uniformly_sample).repeat(n_train_imgs,
+                                                                      grid_size, grid_size)
     else:
         section_n_rays_to_sample = torch.broadcast_to(torch.tensor(n_rays_to_sample_per_section,
                                                                    dtype=int),
@@ -711,7 +712,7 @@ def train() -> None:
         if do_active_sampling:
             # Uniform ray sampling.
             (uniformly_sampled_rays, uniformly_sampled_pw_idxs, t_uniform_sampling) = \
-                sample_section_rays(section_rays, sw_n_rays_to_uniformly_sample,
+                sample_section_rays(section_rays, sw_uniform_sampling_prob_dist,
                                     n_total_rays_to_uniformly_sample,
                                     n_train_imgs, H, W, grid_size, section_height, section_width,
                                     tensorboard, 'train/uniform_sampling', train_iter_idx,
@@ -731,6 +732,7 @@ def train() -> None:
             t_uniform_rendering = perf_counter() - t_uniform_rendering_start
 
             # Computing section-wise loss for uniformly sampled rays.
+            t_uniform_loss_start = perf_counter()
             sw_n_rays_uniformly_sampled = torch.zeros((n_train_imgs, grid_size, grid_size))
             section_squared_diff = torch.zeros((n_train_imgs, grid_size, grid_size))
             for rendered_rgb, gt_rgb, sampled_pw_idx in zip(rendered_rgbs, gt_rgbs,
@@ -739,8 +741,8 @@ def train() -> None:
                 section_squared_diff[img_idx, grid_row_idx, grid_col_idx] += \
                     torch.mean((rendered_rgb - gt_rgb) ** 2)
                 sw_n_rays_uniformly_sampled[img_idx, grid_row_idx, grid_col_idx] += 1
-
-            section_loss = section_squared_diff / sw_n_rays_to_uniformly_sample
+            section_loss = torch.nan_to_num(section_squared_diff / sw_n_rays_uniformly_sampled)
+            t_uniform_loss = perf_counter() - t_uniform_loss_start
 
             # Active ray sampling.
             sw_active_sampling_prob_dist = section_loss / torch.sum(section_loss)
@@ -858,7 +860,7 @@ def train() -> None:
             tqdm_bar.set_postfix_str(
                 f't{t_train_iter:.3f},'
                 f'u:(s{t_uniform_sampling:.3f},b{t_uniform_batching:.3f},'
-                f'r{t_uniform_rendering:.3f}),'
+                f'l{t_uniform_loss:.3f},r{t_uniform_rendering:.3f}),'
                 f'a:(s{t_active_sampling:.3f},b{t_batching:.3f},r{t_rendering:.3f}),'
                 f'b{t_backprop:.3f}')
         else:
@@ -870,12 +872,10 @@ def train() -> None:
 
 
 if __name__ == '__main__':
-    torch.cuda.empty_cache()
-
     if torch.cuda.is_available():
         torch.set_default_tensor_type('torch.cuda.FloatTensor')
     else:
         torch.set_default_tensor_type('torch.FloatTensor')
 
-    with launch_ipdb_on_exception():
-        train()
+    # with launch_ipdb_on_exception():
+    train()
