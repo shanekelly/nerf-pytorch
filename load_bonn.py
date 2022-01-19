@@ -6,9 +6,9 @@ import numpy as np
 from cv2 import COLOR_BGR2RGB, cvtColor, imread, resize
 from ipdb import set_trace
 
-from util.transforms import (rotmat_from_euler_zyx,
-                             tfmat_from_rotmat_and_translation,
-                             tfmat_from_quat_and_translation)
+from im_util.transforms import (rotmat_from_euler_zyx,
+                                tfmat_from_rotmat_and_translation,
+                                tfmat_from_quat_and_translation)
 
 
 def load_bonn_data(base_dir, downsample_factor):

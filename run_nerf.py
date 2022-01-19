@@ -1,19 +1,20 @@
 import os
-import numpy as np
 import imageio
-import torch
 
-from ipdb import launch_ipdb_on_exception, set_trace
-from itertools import product
 from pathlib import Path
 from pickle import dump
 from time import time, perf_counter
+from typing import Callable, Dict, Optional
+
+import numpy as np
+import torch
+
+from ipdb import launch_ipdb_on_exception, set_trace
 from torch.nn.functional import relu
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm, trange
 
-from run_nerf_helpers import (sample_section_rays, get_all_rays, get_embedder,
-                              get_initial_section_rand_pixel_idxs, get_rays, get_section_n_samples,
+from run_nerf_helpers import (sample_section_rays, get_all_rays, get_embedder, get_rays,
                               img2mse, load_data, mse2psnr, NeRF, ndc_rays, sample_pdf, to8b)
 
 
@@ -53,8 +54,11 @@ def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     return outputs
 
 
-def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
-    """Render rays in smaller minibatches to avoid OOM.
+def batchify_rays(rays_flat: torch.Tensor, chunk: int = 1024*32, **kwargs) -> Dict:
+    """
+    @brief - Render rays in smaller minibatches to avoid OOM.
+    @param rays_flat: Shape (N, 8). [rays_o (Nx3), rays_d (Nx3), near (Nx1), far (Nx1)]
+    @param chunk - Maximum number of rays to process simultaneously.
     """
     all_ret = {}
 
@@ -66,14 +70,16 @@ def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
                 all_ret[k] = []
             all_ret[k].append(ret[k])
 
+    # sk: Merge outputs from batches.
     all_ret = {k: torch.cat(all_ret[k], 0) for k in all_ret}
 
     return all_ret
 
 
-def render(H: int, W: int, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
-           near=0., far=1.,
-           use_viewdirs=False, c2w_staticcam=None,
+def render(H: int, W: int, K: torch.Tensor, chunk: int = 1024*32,
+           rays: Optional[torch.Tensor] = None, c2w: Optional[torch.Tensor] = None,
+           ndc: bool = True, near: float = 0., far: float = 1.,
+           use_viewdirs: bool = False, c2w_staticcam: Optional[torch.Tensor] = None,
            **kwargs):
     """Render rays
     Args:
@@ -97,7 +103,6 @@ def render(H: int, W: int, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
       acc_map: [batch_size]. Accumulated opacity (alpha) along a ray.
       extras: dict with everything returned by render_rays().
     """
-
     if c2w is not None:
         # special case to render full image
         rays_o, rays_d = get_rays(H, W, K, c2w)
@@ -115,18 +120,18 @@ def render(H: int, W: int, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
         viewdirs = viewdirs / torch.norm(viewdirs, dim=-1, keepdim=True)
         viewdirs = torch.reshape(viewdirs, [-1, 3]).float()
 
-    sh = rays_d.shape  # [..., 3]
+    sh = rays_d.shape  # [N, 3]
 
     if ndc:
         # for forward facing scenes
         rays_o, rays_d = ndc_rays(H, W, K[0][0], 1., rays_o, rays_d)
 
     # Create ray batch
-    rays_o = torch.reshape(rays_o, [-1, 3]).float()
-    rays_d = torch.reshape(rays_d, [-1, 3]).float()
+    # rays_o = torch.reshape(rays_o, [-1, 3]).float()
+    # rays_d = torch.reshape(rays_d, [-1, 3]).float()
 
-    near, far = near * torch.ones_like(rays_d[..., :1]), far * torch.ones_like(rays_d[..., :1])
-    rays = torch.cat([rays_o, rays_d, near, far], -1)
+    near, far = near * torch.ones_like(rays_d[:, :1]), far * torch.ones_like(rays_d[:, :1])
+    rays = torch.cat([rays_o, rays_d, near, far], -1)  # shape: (N, 8)
 
     if use_viewdirs:
         rays = torch.cat([rays, viewdirs], -1)
@@ -338,19 +343,12 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     return rgb_map, disp_map, acc_map, weights, depth_map
 
 
-def render_rays(ray_batch,
-                network_fn,
-                network_query_fn,
-                N_samples,
-                retraw=False,
-                lindisp=False,
-                perturb=0.,
-                N_importance=0,
-                network_fine=None,
-                white_bkgd=False,
-                raw_noise_std=0.,
-                verbose=False,
-                pytest=False):
+def render_rays(ray_batch: torch.Tensor, network_fn: NeRF, network_query_fn: Callable,
+                N_samples: int, retraw: bool = False, lindisp: bool = False, perturb: float = 0.,
+                N_importance: int = 0, network_fine: Optional[NeRF] = None,
+                white_bkgd: bool = False, raw_noise_std: float = 0., verbose: bool = False,
+                pytest: bool = False
+                ) -> Dict:
     """Volumetric rendering.
     Args:
       ray_batch: array of shape [batch_size, ...]. All information necessary
@@ -369,7 +367,6 @@ def render_rays(ray_batch,
       network_fine: "fine" network with same spec as network_fn.
       white_bkgd: bool. If True, assume a white background.
       raw_noise_std: ...
-      verbose: bool. If True, print more debugging info.
     Returns:
       rgb_map: [num_rays, 3]. Estimated RGB color of a ray. Comes from fine model.
       disp_map: [num_rays]. Disparity map. 1 / depth.
@@ -413,12 +410,13 @@ def render_rays(ray_batch,
 
         z_vals = lower + (upper - lower) * t_rand
 
+    # sk: Points to query the volume at.
     pts = rays_o[..., None, :] + rays_d[..., None, :] * \
         z_vals[..., :, None]  # [N_rays, N_samples, 3]
 
 
 #     raw = run_network(pts)
-    raw = network_query_fn(pts, viewdirs, network_fn)
+    raw = network_query_fn(pts, viewdirs, network_fn)  # Shape: (N, N_samples ** 2, 5)
     rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
         raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
