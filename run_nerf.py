@@ -563,7 +563,7 @@ def config_parser():
                         help='will take every 1/N images as LLFF test set, paper uses 8')
 
     # logging/saving options
-    parser.add_argument("--i_loss",   type=int, default=100,
+    parser.add_argument("--i_scalars",   type=int, default=100,
                         help='frequency of console printout and metric loggin')
     parser.add_argument("--i_img",     type=int, default=500,
                         help='frequency of tensorboard image logging')
@@ -682,6 +682,8 @@ def train() -> None:
         n_rays_to_sample_per_img = n_total_rays_to_sample // n_train_imgs
         n_rays_to_sample_per_section = n_rays_to_sample_per_img // n_sections_per_img
 
+    sw_total_n_sampled = torch.zeros(n_train_imgs, grid_size, grid_size, dtype=torch.int64)
+
     # Get all rays from all training images.
     section_rays, _ = get_all_rays(images[train_idxs], H, W, K, poses[train_idxs], n_train_imgs,
                                    grid_size, section_height, section_width,
@@ -713,7 +715,7 @@ def train() -> None:
                 sample_section_rays(section_rays, sw_uniform_sampling_prob_dist,
                                     n_total_rays_to_uniformly_sample,
                                     n_train_imgs, H, W, grid_size, section_height, section_width,
-                                    tensorboard, 'train/uniform_sampling', train_iter_idx,
+                                    tensorboard, 'train/uniform_sampling/sampled_pixels', train_iter_idx,
                                     log_sampling_vis=log_sampling_vis, verbose=verbose)
 
             # Rendering uniformly sampled rays.
@@ -744,19 +746,27 @@ def train() -> None:
 
             # Active ray sampling.
             sw_active_sampling_prob_dist = sw_loss / torch.sum(sw_loss)
-            (actively_sampled_rays, _, t_active_sampling) = \
+            (actively_sampled_rays, actively_sampled_pw_idxs, t_active_sampling) = \
                 sample_section_rays(section_rays, sw_active_sampling_prob_dist,
                                     n_total_rays_to_actively_sample,
                                     n_train_imgs, H, W, grid_size, section_height, section_width,
-                                    tensorboard, 'train/active_sampling', train_iter_idx,
+                                    tensorboard, 'train/active_sampling/sampled_pixels', train_iter_idx,
                                     log_sampling_vis=log_sampling_vis, verbose=verbose)
+
             sampled_rays = actively_sampled_rays
+            sampled_pw_idxs = actively_sampled_pw_idxs
         else:
-            (sampled_rays, _, t_sampling) = \
+            (sampled_rays, sampled_pw_idxs, t_sampling) = \
                 sample_section_rays(section_rays, section_n_rays_to_sample, n_total_rays_to_sample,
                                     n_train_imgs, H, W, grid_size, section_height, section_width,
-                                    tensorboard, 'train/sampling', train_iter_idx,
+                                    tensorboard, 'train/sampling/sampled_pixels', train_iter_idx,
                                     log_sampling_vis=log_sampling_vis, verbose=verbose)
+
+        # Accumulate the number of times each section has been sampled from.
+        unique_sw_idxs, sw_n_sampled = \
+            torch.unique(sampled_pw_idxs[:, :3], dim=0, return_counts=True)
+        sw_total_n_sampled[unique_sw_idxs[:, 0], unique_sw_idxs[:, 1], unique_sw_idxs[:, 2]] += \
+            sw_n_sampled
 
         t_batching_start = perf_counter()
         batch = torch.transpose(sampled_rays.to(device), 0, 1)
@@ -828,9 +838,32 @@ def train() -> None:
                     gt_imgs=images[test_idxs], savedir=testsavedir)
             print('Saved test set')
 
-        if train_iter_idx % args.i_loss == 0:
+        if train_iter_idx % args.i_scalars == 0:
             tensorboard.add_scalar('train/loss', loss, train_iter_idx)
             tensorboard.add_scalar('train/psnr', psnr, train_iter_idx)
+
+        if log_sampling_vis:
+            sw_total_n_sampled_scaled = sw_total_n_sampled / torch.max(sw_total_n_sampled)
+            sw_total_n_sampled_imgs = torch.ones((n_train_imgs, grid_size, grid_size, 3))
+            sw_total_n_sampled_imgs[:, :, :, 1] -= sw_total_n_sampled_scaled
+            sw_total_n_sampled_imgs[:, :, :, 2] -= sw_total_n_sampled_scaled
+
+            # Add white border around each image.
+            padding_color = torch.tensor([0.6]).expand(3)
+            sw_total_n_sampled_imgs = torch.cat((
+                padding_color.expand(n_train_imgs, 1, grid_size, 3),
+                sw_total_n_sampled_imgs,
+                padding_color.expand(n_train_imgs, 1, grid_size, 3)),
+                dim=1)
+            sw_total_n_sampled_imgs = torch.cat((
+                padding_color.expand(n_train_imgs, grid_size + 2, 1, 3),
+                sw_total_n_sampled_imgs,
+                padding_color.expand(n_train_imgs, grid_size + 2, 1, 3)),
+                dim=2)
+
+            sampling_name = 'active_sampling' if do_active_sampling else 'sampling'
+            tensorboard.add_images(f'train/{sampling_name}/cumulative_samples_per_section',
+                                   sw_total_n_sampled_imgs, train_iter_idx, dataformats='NHWC')
 
         if train_iter_idx % args.i_img == 0:
             # Log a rendered validation view to Tensorboard
@@ -844,7 +877,8 @@ def train() -> None:
 
             psnr = mse2psnr(img2mse(rgb, target))
 
-            tensorboard.add_image('validation/rgb/estimate', rgb, train_iter_idx, dataformats='HWC')
+            tensorboard.add_image('validation/rgb/estimate', rgb,
+                                  train_iter_idx, dataformats='HWC')
             if train_iter_idx == args.i_img:
                 tensorboard.add_image('validation/rgb/groundtruth', target,
                                       train_iter_idx, dataformats='HWC')
