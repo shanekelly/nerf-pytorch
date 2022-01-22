@@ -585,6 +585,8 @@ def config_parser():
     parser.add_argument('--verbose', action='store_true', help='True to print additional info.')
     parser.add_argument('--no_active_sampling', action='store_true', help='Set to disable active '
                         'sampling.')
+    parser.add_argument('--n_training_iters', type=int, default=50000, help='The number of '
+                        'training iterations to run for.')
 
     return parser
 
@@ -700,12 +702,9 @@ def train() -> None:
                                                                    dtype=int),
                                                       (n_train_imgs, grid_size, grid_size))
 
-    # TODO: make N_iters a command-line argument
-    N_iters = 50000 + 1
-
     start_iter_idx += 1
-
-    tqdm_bar = trange(start_iter_idx, N_iters)
+    n_training_iters = args.n_training_iters + 1
+    tqdm_bar = trange(start_iter_idx, n_training_iters)
     for train_iter_idx in tqdm_bar:
         t_train_iter_start = perf_counter()
 
