@@ -18,7 +18,8 @@ from run_nerf_helpers import (sample_section_rays, get_all_rays, get_embedder, g
                               img2mse, load_data, mse2psnr, NeRF, ndc_rays, sample_pdf, to8b)
 
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+cpu = torch.device('cpu')
+gpu_if_available = torch.device('cuda') if torch.cuda.is_available() else cpu
 np.random.seed(0)
 DEBUG = False
 
@@ -105,7 +106,7 @@ def render(H: int, W: int, K: torch.Tensor, chunk: int = 1024*32,
     """
     if c2w is not None:
         # special case to render full image
-        rays_o, rays_d = get_rays(H, W, K, c2w)
+        rays_o, rays_d = get_rays(H, W, K, c2w, gpu_if_available)
     else:
         # use provided ray batch
         rays_o, rays_d = rays
@@ -116,7 +117,7 @@ def render(H: int, W: int, K: torch.Tensor, chunk: int = 1024*32,
 
         if c2w_staticcam is not None:
             # special case to visualize effect of viewdirs
-            rays_o, rays_d = get_rays(H, W, K, c2w_staticcam)
+            rays_o, rays_d = get_rays(H, W, K, c2w_staticcam, gpu_if_available)
         viewdirs = viewdirs / torch.norm(viewdirs, dim=-1, keepdim=True)
         viewdirs = torch.reshape(viewdirs, [-1, 3]).float()
 
@@ -127,10 +128,10 @@ def render(H: int, W: int, K: torch.Tensor, chunk: int = 1024*32,
         rays_o, rays_d = ndc_rays(H, W, K[0][0], 1., rays_o, rays_d)
 
     # Create ray batch
-    # rays_o = torch.reshape(rays_o, [-1, 3]).float()
-    # rays_d = torch.reshape(rays_d, [-1, 3]).float()
+    rays_o = torch.reshape(rays_o, [-1, 3]).float()
+    rays_d = torch.reshape(rays_d, [-1, 3]).float()
 
-    near, far = near * torch.ones_like(rays_d[:, :1]), far * torch.ones_like(rays_d[:, :1])
+    near, far = near * torch.ones_like(rays_d[..., :1]), far * torch.ones_like(rays_d[..., :1])
     rays = torch.cat([rays_o, rays_d, near, far], -1)  # shape: (N, 8)
 
     if use_viewdirs:
@@ -217,7 +218,7 @@ def create_nerf(args):
     skips = [4]
     model = NeRF(D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
-                 input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
+                 input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(gpu_if_available)
     grad_vars = list(model.parameters())
 
     model_fine = None
@@ -225,7 +226,8 @@ def create_nerf(args):
     if args.N_importance > 0:
         model_fine = NeRF(D=args.netdepth_fine, W=args.netwidth_fine,
                           input_ch=input_ch, output_ch=output_ch, skips=skips,
-                          input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
+                          input_ch_views=input_ch_views,
+                          use_viewdirs=args.use_viewdirs).to(gpu_if_available)
         grad_vars += list(model_fine.parameters())
 
     def network_query_fn(inputs, viewdirs, network_fn):
@@ -308,7 +310,7 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     def raw2alpha(raw, dists, act_fn=relu): return 1.-torch.exp(-act_fn(raw)*dists)
 
     dists = z_vals[..., 1:] - z_vals[..., :-1]
-    dists = torch.cat([dists, torch.Tensor([1e10]).expand(
+    dists = torch.cat([dists, torch.tensor([1e10], device=gpu_if_available).expand(
         dists[..., :1].shape)], -1)  # [N_rays, N_samples]
 
     dists = dists * torch.norm(rays_d[..., None, :], dim=-1)
@@ -317,19 +319,19 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     noise = 0.
 
     if raw_noise_std > 0.:
-        noise = torch.randn(raw[..., 3].shape) * raw_noise_std
+        noise = torch.randn(raw[..., 3].shape, device=gpu_if_available) * raw_noise_std
 
         # Overwrite randomly sampled data if pytest
 
         if pytest:
             np.random.seed(0)
             noise = np.random.rand(*list(raw[..., 3].shape)) * raw_noise_std
-            noise = torch.Tensor(noise)
+            noise = torch.tensor(noise, device=gpu_if_available)
 
     alpha = raw2alpha(raw[..., 3] + noise, dists)  # [N_rays, N_samples]
     # weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, -1, exclusive=True)
     weights = alpha * \
-        torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)),
+        torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1), device=gpu_if_available),
                       1.-alpha + 1e-10], -1), -1)[:, :-1]
     rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [N_rays, 3]
 
@@ -384,7 +386,7 @@ def render_rays(ray_batch: torch.Tensor, network_fn: NeRF, network_query_fn: Cal
     bounds = torch.reshape(ray_batch[..., 6:8], [-1, 1, 2])
     near, far = bounds[..., 0], bounds[..., 1]  # [-1,1]
 
-    t_vals = torch.linspace(0., 1., steps=N_samples)
+    t_vals = torch.linspace(0., 1., steps=N_samples, device=gpu_if_available)
 
     if not lindisp:
         z_vals = near * (1.-t_vals) + far * (t_vals)
@@ -399,14 +401,14 @@ def render_rays(ray_batch: torch.Tensor, network_fn: NeRF, network_query_fn: Cal
         upper = torch.cat([mids, z_vals[..., -1:]], -1)
         lower = torch.cat([z_vals[..., :1], mids], -1)
         # stratified samples in those intervals
-        t_rand = torch.rand(z_vals.shape)
+        t_rand = torch.rand(z_vals.shape, device=gpu_if_available)
 
         # Pytest, overwrite u with numpy's fixed random numbers
 
         if pytest:
             np.random.seed(0)
             t_rand = np.random.rand(*list(z_vals.shape))
-            t_rand = torch.Tensor(t_rand)
+            t_rand = torch.tensor(t_rand, device=gpu_if_available)
 
         z_vals = lower + (upper - lower) * t_rand
 
@@ -426,7 +428,7 @@ def render_rays(ray_batch: torch.Tensor, network_fn: NeRF, network_query_fn: Cal
 
         z_vals_mid = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
         z_samples = sample_pdf(z_vals_mid, weights[..., 1:-1],
-                               N_importance, det=(perturb == 0.), pytest=pytest)
+                               N_importance, gpu_if_available, det=(perturb == 0.), pytest=pytest)
         z_samples = z_samples.detach()
 
         z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
@@ -595,7 +597,7 @@ def train() -> None:
 
     # Load data from specified dataset.
     images, hwf, H, W, focal, K, poses, render_poses, train_idxs, test_idxs, val_idxs, near, far = \
-        load_data(args, device)
+        load_data(args, gpu_if_available)
 
     # Create log dir and copy the config file
     basedir = args.basedir
@@ -686,7 +688,7 @@ def train() -> None:
 
     # Get all rays from all training images.
     section_rays, _ = get_all_rays(images[train_idxs], H, W, K, poses[train_idxs], n_train_imgs,
-                                   grid_size, section_height, section_width,
+                                   grid_size, section_height, section_width, gpu_if_available,
                                    verbose=True)
 
     if do_active_sampling:
@@ -720,7 +722,7 @@ def train() -> None:
 
             # Rendering uniformly sampled rays.
             t_uniform_batching_start = perf_counter()
-            batch = torch.transpose(uniformly_sampled_rays.to(device), 0, 1)
+            batch = torch.transpose(uniformly_sampled_rays, 0, 1).to(gpu_if_available)
             batch_rays, gt_rgbs = batch[:2], batch[2]
             t_uniform_batching = perf_counter() - t_uniform_batching_start
 
@@ -735,6 +737,8 @@ def train() -> None:
             t_uniform_loss_start = perf_counter()
             sw_n_rays_uniformly_sampled = torch.zeros((n_train_imgs, grid_size, grid_size))
             sw_cumu_squared_diff = torch.zeros((n_train_imgs, grid_size, grid_size))
+            rendered_rgbs = rendered_rgbs.to(cpu)
+            gt_rgbs = gt_rgbs.to(cpu)
             for rendered_rgb, gt_rgb, sampled_pw_idx in zip(rendered_rgbs, gt_rgbs,
                                                             uniformly_sampled_pw_idxs):
                 img_idx, grid_row_idx, grid_col_idx, _, _ = sampled_pw_idx
@@ -769,7 +773,7 @@ def train() -> None:
             sw_n_sampled
 
         t_batching_start = perf_counter()
-        batch = torch.transpose(sampled_rays.to(device), 0, 1)
+        batch = torch.transpose(sampled_rays.to(gpu_if_available), 0, 1)
         batch_rays, target_s = batch[:2], batch[2]
         t_batching = perf_counter() - t_batching_start
 
@@ -833,8 +837,8 @@ def train() -> None:
             print('test poses shape', poses[test_idxs].shape)
             with torch.no_grad():
                 render_path(
-                    torch.Tensor(poses[test_idxs]).to(
-                        device), hwf, K, args.chunk, render_kwargs_test,
+                    torch.tensor(poses[test_idxs], device=gpu_if_available), hwf, K, args.chunk,
+                    render_kwargs_test,
                     gt_imgs=images[test_idxs], savedir=testsavedir)
             print('Saved test set')
 
@@ -870,7 +874,7 @@ def train() -> None:
             # img_i = np.random.choice(val_idxs)
             img_i = val_idxs[-2] if len(val_idxs) > 1 else val_idxs[0]
             target = images[img_i]
-            c2w = poses[img_i, :3, :4]
+            c2w = poses[img_i, :3, :4].to(gpu_if_available)
             with torch.no_grad():
                 rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, c2w=c2w,
                                                 **render_kwargs_test)
@@ -904,10 +908,5 @@ def train() -> None:
 
 
 if __name__ == '__main__':
-    if torch.cuda.is_available():
-        torch.set_default_tensor_type('torch.cuda.FloatTensor')
-    else:
-        torch.set_default_tensor_type('torch.FloatTensor')
-
     with launch_ipdb_on_exception():
         train()

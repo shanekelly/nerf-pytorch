@@ -21,7 +21,7 @@ from load_bonn import load_bonn_data
 
 # Misc
 def img2mse(x, y): return torch.mean((x - y) ** 2)
-def mse2psnr(x): return -10. * torch.log(x) / torch.log(torch.Tensor([10.]))
+def mse2psnr(x): return -10. * torch.log(x) / torch.log(torch.tensor([10.], device=x.device))
 
 
 def to8b(x): return (255*np.clip(x, 0, 1)).astype(np.uint8)
@@ -180,11 +180,12 @@ class NeRF(nn.Module):
 
 
 # Ray helpers
-def get_rays(H: int, W: int, K: torch.Tensor, c2w: torch.Tensor):
+def get_rays(H: int, W: int, K: torch.Tensor, c2w: torch.Tensor, gpu_if_available: torch.device):
     i, j = torch.meshgrid(torch.linspace(0, W-1, W), torch.linspace(0, H-1, H), indexing='ij')
     i = i.t()
     j = j.t()
-    dirs = torch.stack([(i-K[0][2])/K[0][0], -(j-K[1][2])/K[1][1], -torch.ones_like(i)], -1)
+    dirs = torch.stack([(i-K[0][2])/K[0][0], -(j-K[1][2])/K[1][1], -torch.ones_like(i)],
+                       -1).to(gpu_if_available)
     # Rotate ray directions from camera frame to the world frame
     # dot product, equals to: [c2w.dot(dir) for dir in dirs]
     rays_d = torch.sum(dirs[..., np.newaxis, :] * c2w[:3, :3], -1)
@@ -228,7 +229,7 @@ def ndc_rays(H, W, focal, near, rays_o, rays_d):
 
 
 # Hierarchical sampling (section 5.2)
-def sample_pdf(bins, weights, N_samples, det=False, pytest=False):
+def sample_pdf(bins, weights, N_samples, gpu_if_available: torch.device, det=False, pytest=False):
     # Get pdf
     weights = weights + 1e-5  # prevent nans
     pdf = weights / torch.sum(weights, -1, keepdim=True)
@@ -238,10 +239,10 @@ def sample_pdf(bins, weights, N_samples, det=False, pytest=False):
     # Take uniform samples
 
     if det:
-        u = torch.linspace(0., 1., steps=N_samples)
+        u = torch.linspace(0., 1., steps=N_samples, device=gpu_if_available)
         u = u.expand(list(cdf.shape[:-1]) + [N_samples])
     else:
-        u = torch.rand(list(cdf.shape[:-1]) + [N_samples])
+        u = torch.rand(list(cdf.shape[:-1]) + [N_samples], device=gpu_if_available)
 
     # Pytest, overwrite u with numpy's fixed random numbers
 
@@ -254,7 +255,7 @@ def sample_pdf(bins, weights, N_samples, det=False, pytest=False):
             u = np.broadcast_to(u, new_shape)
         else:
             u = np.random.rand(*new_shape)
-        u = torch.Tensor(u)
+        u = torch.tensor(u, device=gpu_if_available)
 
     # Invert CDF
     u = u.contiguous()
@@ -277,7 +278,7 @@ def sample_pdf(bins, weights, N_samples, det=False, pytest=False):
     return samples
 
 
-def load_data(args: Namespace, device: str
+def load_data(args: Namespace, gpu_if_available: torch.device
               ) -> Tuple[torch.Tensor, List[int], int, int, float, torch.Tensor, torch.Tensor,
                          torch.Tensor, List[int], List[int], List[int], float, float]:
     # Load data
@@ -378,11 +379,12 @@ def load_data(args: Namespace, device: str
     if args.render_test:
         render_poses = np.array(poses[test_idxs])
 
-    # Move data to GPU.
-    images = torch.Tensor(images).to(device)
     K = torch.tensor(K)
-    poses = torch.Tensor(poses).to(device)
-    render_poses = torch.Tensor(render_poses).to(device)
+
+    # Attempt to move data to the GPU.
+    images = torch.tensor(images, device=gpu_if_available, dtype=torch.float32)
+    poses = torch.tensor(poses, device=gpu_if_available, dtype=torch.float32)
+    render_poses = torch.tensor(render_poses, device=gpu_if_available, dtype=torch.float32)
 
     print('TRAIN views are', train_idxs)
     print('TEST views are', test_idxs)
@@ -394,7 +396,8 @@ def load_data(args: Namespace, device: str
 
 def get_all_rays(images: torch.Tensor, H: int, W: int, K: torch.Tensor, poses: torch.Tensor,
                  n_train_imgs: int,  grid_size: int, section_height: int,
-                 section_width: int, verbose=False) -> Tuple[torch.Tensor, float]:
+                 section_width: int, gpu_if_available: torch.device, verbose=False
+                 ) -> Tuple[torch.Tensor, float]:
     """
     @param images - Training images.
     @param poses - Pose for each training image.
@@ -405,7 +408,8 @@ def get_all_rays(images: torch.Tensor, H: int, W: int, K: torch.Tensor, poses: t
     t_start = perf_counter()
 
     # sk: A ray for every pixel of every camera image. Shape (N, ro+rd, H, W, 3).
-    rays = torch.stack([torch.stack(get_rays(H, W, K, p)) for p in poses[:, :3, :4]])
+    rays = torch.stack([torch.stack(get_rays(H, W, K, p, gpu_if_available))
+                       for p in poses[:, :3, :4]])
 
     rays = torch.cat([rays, images[:, None]], 1)  # (N, ro+rd+rgb, H, W, 3)
     rays = torch.permute(rays, (0, 2, 3, 1, 4))  # (N, H, W, ro+rd+rgb, 3)

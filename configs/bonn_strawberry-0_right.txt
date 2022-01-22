@@ -1,4 +1,4 @@
-expname = strawberry-0_3-frames_camera-right_testing
+expname = 3-frames_active-sampling_200k
 basedir = ./logs
 datadir = ~/eth/implicit-mapping/datasets/strawberry/0/3-frames/orbslam/front-camera/right-camera/all-frames
 dataset_type = bonn
