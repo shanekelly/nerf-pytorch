@@ -3,7 +3,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-from cv2 import COLOR_BGR2RGB, cvtColor, imread, resize
+from cv2 import COLOR_BGR2RGB, cvtColor, imread, resize, IMREAD_ANYDEPTH
 from ipdb import set_trace
 
 from im_util.transforms import (rotmat_from_euler_zyx,
@@ -13,8 +13,8 @@ from im_util.transforms import (rotmat_from_euler_zyx,
 
 def load_bonn_data(base_dir, downsample_factor):
     """
-    @returns - (images, hwf, poses, render_poses, train_idxs, test_idxs)
-      images: (N,H,W,3) RGB images
+    @returns - (rgb_imgs, hwf, poses, render_poses, train_idxs, test_idxs)
+      rgb_imgs: (N,H,W,3) RGB images
       hwf: (3,) image height, image width, focal distance
       poses: (N,3,4) homogeneous transform matrices corresponding to the groundtruth positions of
         each image
@@ -40,6 +40,7 @@ def load_bonn_data(base_dir, downsample_factor):
     height = int(camera_info['height'] * scale_factor)
     width = int(camera_info['width'] * scale_factor)
     focal_length = camera_info['focal_length'] * scale_factor
+    depth_scale = camera_info['depth_scale']
     hwf = [height, width, focal_length]
     camera_info_file.close()
 
@@ -48,7 +49,8 @@ def load_bonn_data(base_dir, downsample_factor):
     assert trajectory_fpath.exists()
     trajectory_file = open(trajectory_fpath.as_posix(), 'r')
 
-    images = []
+    rgb_imgs = []
+    depth_imgs = []
     poses = []
 
     for line in trajectory_file.readlines():
@@ -56,11 +58,18 @@ def load_bonn_data(base_dir, downsample_factor):
         # Convert timestamp from seconds to microseconds.
         timestamp = int(timestamp_s * MICROSECONDS_PER_SECOND)
 
-        img_fpath = base_dirpath / 'images' / f'{timestamp}.png'
-        assert img_fpath.exists()
-        image = resize(cvtColor(imread(img_fpath.as_posix()), COLOR_BGR2RGB),
-                       (width, height))
-        images.append(image)
+        rgb_img_fpath = base_dirpath / 'images' / f'rgb_{timestamp}.png'
+        assert rgb_img_fpath.exists()
+        rgb_img = resize(cvtColor(imread(rgb_img_fpath.as_posix()), COLOR_BGR2RGB),
+                         (width, height))
+        rgb_imgs.append(rgb_img)
+
+        depth_img_fpath = base_dirpath / 'images' / f'depth_{timestamp}.png'
+        assert depth_img_fpath.exists()
+        # IMREAD_ANYDEPTH allows the depth image to be read in a 16 bit format if the image is saved
+        # with such information.
+        depth_img = resize(imread(depth_img_fpath.as_posix(), IMREAD_ANYDEPTH), (width, height))
+        depth_imgs.append(depth_img)
 
         quat = np.array([qx, qy, qz, qw])
         translation = np.array([px, py, pz])
@@ -68,9 +77,10 @@ def load_bonn_data(base_dir, downsample_factor):
 
     trajectory_file.close()
 
-    images = np.array(images) / 255.
+    rgb_imgs = np.array(rgb_imgs) / 255.
+    depth_imgs = np.array(depth_imgs) * depth_scale  # Convert to units of meters.
     poses = np.array(poses)
-    assert images.shape[0] == poses.shape[0]
+    assert rgb_imgs.shape[0] == depth_imgs.shape[0] == poses.shape[0]
 
     # Compute render poses.
     # Move forward by 1 meter in even steps over the first half of the number of render poses, then
@@ -103,14 +113,16 @@ def load_bonn_data(base_dir, downsample_factor):
     render_poses = np.array(render_poses)
 
     # Compute train indices and test indices.
-    all_idxs = list(range(images.shape[0]))
+    all_idxs = list(range(rgb_imgs.shape[0]))
     if len(all_idxs) <= 5:
         test_idxs = [len(all_idxs) // 2]
     else:
         test_idxs = all_idxs[::8]
     train_idxs = [idx for idx in all_idxs if idx not in test_idxs]
 
-    return images, hwf, poses, render_poses, train_idxs, test_idxs
+    set_trace()
+
+    return rgb_imgs, depth_imgs, hwf, poses, render_poses, train_idxs, test_idxs
 
 
 if __name__ == '__main__':

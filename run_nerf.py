@@ -598,8 +598,8 @@ def train() -> None:
     tensorboard = SummaryWriter(log_dir=Path(args.basedir) / args.expname, flush_secs=10)
 
     # Load data from specified dataset.
-    images, hwf, H, W, focal, K, poses, render_poses, train_idxs, test_idxs, val_idxs, near, far = \
-        load_data(args, gpu_if_available)
+    (rgb_imgs, depth_imgs, hwf, H, W, focal, K, poses, render_poses, train_idxs, test_idxs,
+     val_idxs, near, far) = load_data(args, gpu_if_available)
 
     # Create log dir and copy the config file
     basedir = args.basedir
@@ -635,10 +635,10 @@ def train() -> None:
         with torch.no_grad():
             if args.render_test:
                 # render_test switches to test poses
-                images = images[test_idxs]
+                rgb_imgs = rgb_imgs[test_idxs]
             else:
                 # Default is smoother render_poses path
-                images = None
+                rgb_imgs = None
 
             testsavedir = os.path.join(basedir, expname, 'renderonly_{}_{:06d}'.format(
                 'test' if args.render_test else 'path', start_iter_idx))
@@ -646,7 +646,7 @@ def train() -> None:
             print('test poses shape', render_poses.shape)
 
             rgbs, _ = \
-                render_path(render_poses, hwf, K, args.chunk, render_kwargs_test, gt_imgs=images,
+                render_path(render_poses, hwf, K, args.chunk, render_kwargs_test, gt_imgs=rgb_imgs,
                             savedir=testsavedir, render_factor=args.render_factor)
             print('Done rendering', testsavedir)
             imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
@@ -689,7 +689,7 @@ def train() -> None:
     sw_total_n_sampled = torch.zeros(n_train_imgs, grid_size, grid_size, dtype=torch.int64)
 
     # Get all rays from all training images.
-    section_rays, _ = get_all_rays(images[train_idxs], H, W, K, poses[train_idxs], n_train_imgs,
+    section_rays, _ = get_all_rays(rgb_imgs[train_idxs], H, W, K, poses[train_idxs], n_train_imgs,
                                    grid_size, section_height, section_width, gpu_if_available,
                                    verbose=True)
 
@@ -838,7 +838,7 @@ def train() -> None:
                 render_path(
                     torch.tensor(poses[test_idxs], device=gpu_if_available), hwf, K, args.chunk,
                     render_kwargs_test,
-                    gt_imgs=images[test_idxs], savedir=testsavedir)
+                    gt_imgs=rgb_imgs[test_idxs], savedir=testsavedir)
             print('Saved test set')
 
         if train_iter_idx % args.i_scalars == 0:
@@ -872,7 +872,7 @@ def train() -> None:
             # Log a rendered validation view to Tensorboard
             # img_i = np.random.choice(val_idxs)
             img_i = val_idxs[-2] if len(val_idxs) > 1 else val_idxs[0]
-            target = images[img_i]
+            target = rgb_imgs[img_i]
             c2w = poses[img_i, :3, :4].to(gpu_if_available)
             with torch.no_grad():
                 rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, c2w=c2w,

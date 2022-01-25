@@ -279,28 +279,28 @@ def sample_pdf(bins, weights, N_samples, gpu_if_available: torch.device, det=Fal
 
 
 def load_data(args: Namespace, gpu_if_available: torch.device
-              ) -> Tuple[torch.Tensor, List[int], int, int, float, torch.Tensor, torch.Tensor,
-                         torch.Tensor, List[int], List[int], List[int], float, float]:
+              ) -> Tuple[torch.Tensor, torch.Tensor, List[int], int, int, float, torch.Tensor,
+                         torch.Tensor, torch.Tensor, List[int], List[int], List[int], float, float]:
     # Load data
     K = None
 
     if args.dataset_type == 'llff':
-        images, poses, bds, render_poses, test_idxs = load_llff_data(args.datadir, args.factor,
-                                                                     recenter=True, bd_factor=.75,
-                                                                     spherify=args.spherify)
+        rgb_imgs, poses, bds, render_poses, test_idxs = load_llff_data(args.datadir, args.factor,
+                                                                       recenter=True, bd_factor=.75,
+                                                                       spherify=args.spherify)
         hwf = poses[0, :3, -1]
         poses = poses[:, :3, :4]
-        print('Loaded llff', images.shape, render_poses.shape, hwf, args.datadir)
+        print('Loaded llff', rgb_imgs.shape, render_poses.shape, hwf, args.datadir)
 
         if not isinstance(test_idxs, list):
             test_idxs = [test_idxs]
 
         if args.llffhold > 0:
             print('Auto LLFF holdout,', args.llffhold)
-            test_idxs = np.arange(images.shape[0])[::args.llffhold]
+            test_idxs = np.arange(rgb_imgs.shape[0])[::args.llffhold]
 
         val_idxs = test_idxs
-        train_idxs = np.array([i for i in np.arange(int(images.shape[0])) if
+        train_idxs = np.array([i for i in np.arange(int(rgb_imgs.shape[0])) if
                                (i not in test_idxs and i not in val_idxs)])
 
         print('DEFINING BOUNDS')
@@ -315,38 +315,38 @@ def load_data(args: Namespace, gpu_if_available: torch.device
         print('NEAR FAR', near, far)
 
     elif args.dataset_type == 'blender':
-        images, poses, render_poses, hwf, i_split = load_blender_data(
+        rgb_imgs, poses, render_poses, hwf, i_split = load_blender_data(
             args.datadir, args.half_res, args.testskip)
-        print('Loaded blender', images.shape, render_poses.shape, hwf, args.datadir)
+        print('Loaded blender', rgb_imgs.shape, render_poses.shape, hwf, args.datadir)
         train_idxs, val_idxs, test_idxs = i_split
 
         near = 2.
         far = 6.
 
         if args.white_bkgd:
-            images = images[..., :3]*images[..., -1:] + (1.-images[..., -1:])
+            rgb_imgs = rgb_imgs[..., :3]*rgb_imgs[..., -1:] + (1.-rgb_imgs[..., -1:])
         else:
-            images = images[..., :3]
+            rgb_imgs = rgb_imgs[..., :3]
 
     elif args.dataset_type == 'LINEMOD':
-        images, poses, render_poses, hwf, K, i_split, near, far = load_LINEMOD_data(
+        rgb_imgs, poses, render_poses, hwf, K, i_split, near, far = load_LINEMOD_data(
             args.datadir, args.half_res, args.testskip)
-        print(f'Loaded LINEMOD, images shape: {images.shape}, hwf: {hwf}, K: {K}')
+        print(f'Loaded LINEMOD, rgb_imgs shape: {rgb_imgs.shape}, hwf: {hwf}, K: {K}')
         print(f'[CHECK HERE] near: {near}, far: {far}.')
         train_idxs, val_idxs, test_idxs = i_split
 
         if args.white_bkgd:
-            images = images[..., :3]*images[..., -1:] + (1.-images[..., -1:])
+            rgb_imgs = rgb_imgs[..., :3]*rgb_imgs[..., -1:] + (1.-rgb_imgs[..., -1:])
         else:
-            images = images[..., :3]
+            rgb_imgs = rgb_imgs[..., :3]
 
     elif args.dataset_type == 'deepvoxels':
 
-        images, poses, render_poses, hwf, i_split = load_dv_data(scene=args.shape,
-                                                                 basedir=args.datadir,
-                                                                 testskip=args.testskip)
+        rgb_imgs, poses, render_poses, hwf, i_split = load_dv_data(scene=args.shape,
+                                                                   basedir=args.datadir,
+                                                                   testskip=args.testskip)
 
-        print('Loaded deepvoxels', images.shape, render_poses.shape, hwf, args.datadir)
+        print('Loaded deepvoxels', rgb_imgs.shape, render_poses.shape, hwf, args.datadir)
         train_idxs, val_idxs, test_idxs = i_split
 
         hemi_R = np.mean(np.linalg.norm(poses[:, :3, -1], axis=-1))
@@ -354,7 +354,7 @@ def load_data(args: Namespace, gpu_if_available: torch.device
         far = hemi_R+1.
 
     elif args.dataset_type == 'bonn':
-        images, hwf, poses, render_poses, train_idxs, test_idxs = load_bonn_data(
+        rgb_imgs, depth_imgs, hwf, poses, render_poses, train_idxs, test_idxs = load_bonn_data(
             args.datadir, downsample_factor=args.factor)
 
         val_idxs = test_idxs
@@ -382,7 +382,7 @@ def load_data(args: Namespace, gpu_if_available: torch.device
     K = torch.tensor(K)
 
     # Attempt to move data to the GPU.
-    images = torch.tensor(images, device=gpu_if_available, dtype=torch.float32)
+    rgb_imgs = torch.tensor(rgb_imgs, device=gpu_if_available, dtype=torch.float32)
     poses = torch.tensor(poses, device=gpu_if_available, dtype=torch.float32)
     render_poses = torch.tensor(render_poses, device=gpu_if_available, dtype=torch.float32)
 
@@ -390,8 +390,8 @@ def load_data(args: Namespace, gpu_if_available: torch.device
     print('TEST views are', test_idxs)
     print('VAL views are', val_idxs)
 
-    return (images, hwf, H, W, focal, K, poses, render_poses, train_idxs, test_idxs, val_idxs,
-            near, far)
+    return (rgb_imgs, depth_imgs, hwf, H, W, focal, K, poses, render_poses, train_idxs, test_idxs,
+            val_idxs, near, far)
 
 
 def get_all_rays(images: torch.Tensor, H: int, W: int, K: torch.Tensor, poses: torch.Tensor,
@@ -490,22 +490,6 @@ def sample_section_rays(sw_rays: torch.Tensor, sw_sampling_prob_dist: torch.Tens
                         tensorboard: SummaryWriter, tensorboard_tag: str, train_iter_idx: int,
                         log_sampling_vis: bool = False, verbose: bool = False
                         ) -> Tuple[torch.Tensor, torch.Tensor, float]:
-
-    #     for var in [sw_rays, sw_sampling_prob_dist, n_total_rays_to_sample, n_train_imgs, img_height,
-    #                 img_width, grid_size, section_height, section_width, tensorboard, tensorboard_tag,
-    #                 train_iter_idx, log_sampling_vis, verbose]:
-    #         if isinstance(var, torch.Tensor):
-    #             print(var.shape, var.dtype, var.device, var.requires_grad)
-    #         elif isinstance(var, int):
-    #             print(var)
-    #         elif isinstance(var, bool):
-    #             print(var)
-
-    #     print('')
-    #     print('')
-
-    #     set_trace()
-
     t_start = perf_counter()
 
     if verbose:
