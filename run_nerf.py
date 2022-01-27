@@ -14,12 +14,18 @@ from torch.nn.functional import relu
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm, trange
 
-from run_nerf_helpers import (sample_section_rays, get_all_rays, get_embedder, get_rays,
-                              img2mse, load_data, mse2psnr, NeRF, ndc_rays, sample_pdf, to8b)
+from run_nerf_helpers import (add_1d_imgs_to_tensorboard, get_idxs_tuple, get_sw_n_sampled,
+                              get_sw_rays, get_embedder, get_rays, get_sw_loss, img2mse, load_data,
+                              mse2psnr, NeRF, ndc_rays, sample_pdf, sample_sw_rays, to8b)
 
 
 cpu = torch.device('cpu')
-gpu_if_available = torch.device('cuda') if torch.cuda.is_available() else cpu
+if torch.cuda.is_available():
+    gpu_if_available = torch.device('cuda')
+    print('GPU is available!')
+else:
+    gpu_if_available = cpu
+    print('GPU not available!')
 np.random.seed(0)
 DEBUG = False
 
@@ -582,11 +588,18 @@ def config_parser():
                         'image active sampling.')
     parser.add_argument('--i_sampling_vis', type=int, default=500, help='The frequency of '
                         'logging visualizations about ray sampling to tensorboard.')
+    parser.add_argument('--n_training_iters', type=int, default=50000, help='The number of '
+                        'training iterations to run for.')
+
     parser.add_argument('--verbose', action='store_true', help='True to print additional info.')
     parser.add_argument('--no_active_sampling', action='store_true', help='Set to disable active '
                         'sampling.')
-    parser.add_argument('--n_training_iters', type=int, default=50000, help='The number of '
-                        'training iterations to run for.')
+    parser.add_argument('--uniformly_sample_every_iteration', action='store_true', help='Set to '
+                        'uniformly sampled over every image on every iteration in order to '
+                        'maintain the estimated probability distribution of loss over image. If '
+                        'not set, then all images will be uniformly sampled once at the start, '
+                        'but then only active samples will update the estimated probability '
+                        'distribution of loss over images.')
 
     return parser
 
@@ -661,46 +674,33 @@ def train() -> None:
     n_train_imgs = len(train_idxs)
     grid_size = args.img_grid_side_len
     do_active_sampling = not args.no_active_sampling
+    do_uniform_sampling_every_iter = args.uniformly_sample_every_iteration
 
     assert H % grid_size == 0
     assert W % grid_size == 0
     section_height = H // grid_size
     section_width = W // grid_size
-    n_pixels_per_section = section_height * section_width
 
     n_sections_per_img = grid_size ** 2
+    n_total_sections = n_train_imgs * n_sections_per_img
+    dims_sw = (n_train_imgs, grid_size, grid_size)
     if do_active_sampling:
         n_rays_to_uniformly_sample_per_img = 200
         n_total_rays_to_uniformly_sample = n_rays_to_uniformly_sample_per_img * n_train_imgs
-        min_n_rays_to_uniformly_sample_per_section = \
-            n_rays_to_uniformly_sample_per_img // n_sections_per_img
-        remaining_n_rays_to_uniformly_sample = \
-            n_rays_to_uniformly_sample_per_img % n_sections_per_img
-        section_uniform_sampling_prob_dist = torch.full((n_train_imgs, grid_size, grid_size),
-                                                        1 / (n_train_imgs * grid_size * grid_size))
-
+        sw_uniform_sampling_prob_dist = torch.tensor(1 / n_total_sections).repeat(dims_sw)
+        sw_loss = torch.zeros(dims_sw)
         n_total_rays_to_actively_sample = N_rand
-        n_rays_to_actively_sample_per_img = n_total_rays_to_actively_sample // n_train_imgs
     else:
         n_total_rays_to_sample = N_rand
-        n_rays_to_sample_per_img = n_total_rays_to_sample // n_train_imgs
-        n_rays_to_sample_per_section = n_rays_to_sample_per_img // n_sections_per_img
+        sw_sampling_prob_dist = \
+            torch.tensor(1 / n_total_sections).expand(dims_sw)
 
-    sw_total_n_sampled = torch.zeros(n_train_imgs, grid_size, grid_size, dtype=torch.int64)
+    sw_total_n_sampled = torch.zeros(dims_sw, dtype=torch.int64)
 
     # Get all rays from all training images.
-    section_rays, _ = get_all_rays(rgb_imgs[train_idxs], H, W, K, poses[train_idxs], n_train_imgs,
-                                   grid_size, section_height, section_width, gpu_if_available,
-                                   verbose=True)
-
-    if do_active_sampling:
-        sw_uniform_sampling_prob_dist = \
-            torch.tensor(1 / n_total_rays_to_uniformly_sample).repeat(n_train_imgs,
-                                                                      grid_size, grid_size)
-    else:
-        section_n_rays_to_sample = torch.broadcast_to(torch.tensor(n_rays_to_sample_per_section,
-                                                                   dtype=int),
-                                                      (n_train_imgs, grid_size, grid_size))
+    sw_rays, _ = get_sw_rays(rgb_imgs[train_idxs], H, W, K, poses[train_idxs], n_train_imgs,
+                             grid_size, section_height, section_width, gpu_if_available,
+                             verbose=True)
 
     start_iter_idx += 1
     n_training_iters = args.n_training_iters + 1
@@ -711,85 +711,88 @@ def train() -> None:
         log_sampling_vis = train_iter_idx % args.i_sampling_vis == 0
 
         if do_active_sampling:
-            # Uniform ray sampling.
-            (uniformly_sampled_rays, uniformly_sampled_pw_idxs, t_uniform_sampling) = \
-                sample_section_rays(section_rays, sw_uniform_sampling_prob_dist,
-                                    n_total_rays_to_uniformly_sample,
-                                    n_train_imgs, H, W, grid_size, section_height, section_width,
-                                    tensorboard, 'train/uniform_sampling/sampled_pixels', train_iter_idx,
-                                    log_sampling_vis=log_sampling_vis, verbose=verbose)
+            # If we aren't uniformly sampling on every iteration, then we should only uniformly
+            # sample on the first iteration of this run.
+            t_uniform_sampling = 0.0
+            t_uniform_batching = 0.0
+            t_uniform_loss = 0.0
+            t_uniform_rendering = 0.0
+            if do_uniform_sampling_every_iter or train_iter_idx == start_iter_idx:
+                # Uniform ray sampling.
+                enforce_min_samples = False if do_uniform_sampling_every_iter else True
+                (uniformly_sampled_rays, uniformly_sampled_pw_idxs, t_uniform_sampling) = \
+                    sample_sw_rays(sw_rays, sw_uniform_sampling_prob_dist,
+                                   n_total_rays_to_uniformly_sample,
+                                   n_train_imgs, H, W, grid_size, section_height, section_width,
+                                   tensorboard, 'train/uniform_sampling/sampled_pixels', train_iter_idx,
+                                   log_sampling_vis=log_sampling_vis, verbose=verbose,
+                                   enforce_min_samples=enforce_min_samples)
 
-            # Rendering uniformly sampled rays.
-            t_uniform_batching_start = perf_counter()
-            batch = torch.transpose(uniformly_sampled_rays, 0, 1).to(gpu_if_available)
-            batch_rays, gt_rgbs = batch[:2], batch[2]
-            t_uniform_batching = perf_counter() - t_uniform_batching_start
+                # Render the uniformly sampled rays.
+                t_uniform_batching_start = perf_counter()
+                batch = torch.transpose(uniformly_sampled_rays, 0, 1).to(gpu_if_available)
+                batch_rays, gt_rgbs = batch[:2], batch[2]
+                t_uniform_batching = perf_counter() - t_uniform_batching_start
 
-            t_uniform_rendering_start = perf_counter()
-            with torch.no_grad():
-                rendered_rgbs, _, _, _ = render(H, W, K, chunk=args.chunk, rays=batch_rays,
-                                                verbose=train_iter_idx < 10, retraw=True,
-                                                **render_kwargs_train)
-            t_uniform_rendering = perf_counter() - t_uniform_rendering_start
+                t_uniform_rendering_start = perf_counter()
+                with torch.no_grad():
+                    rendered_rgbs, _, _, _ = render(H, W, K, chunk=args.chunk, rays=batch_rays,
+                                                    verbose=train_iter_idx < 10, retraw=True,
+                                                    **render_kwargs_train)
+                t_uniform_rendering = perf_counter() - t_uniform_rendering_start
 
-            # Computing section-wise loss for uniformly sampled rays.
-            t_uniform_loss_start = perf_counter()
-            sw_n_rays_uniformly_sampled = torch.zeros((n_train_imgs, grid_size, grid_size))
-            sw_cumu_squared_diff = torch.zeros((n_train_imgs, grid_size, grid_size))
-            rendered_rgbs = rendered_rgbs.to(cpu)
-            gt_rgbs = gt_rgbs.to(cpu)
-            for rendered_rgb, gt_rgb, sampled_pw_idx in zip(rendered_rgbs, gt_rgbs,
-                                                            uniformly_sampled_pw_idxs):
-                img_idx, grid_row_idx, grid_col_idx, _, _ = sampled_pw_idx
-                sw_cumu_squared_diff[img_idx, grid_row_idx, grid_col_idx] += \
-                    torch.mean((rendered_rgb - gt_rgb) ** 2)
-                sw_n_rays_uniformly_sampled[img_idx, grid_row_idx, grid_col_idx] += 1
-            sw_loss = torch.nan_to_num(sw_cumu_squared_diff / sw_n_rays_uniformly_sampled)
-            t_uniform_loss = perf_counter() - t_uniform_loss_start
+                # Computing section-wise loss for uniformly sampled rays.
+                sampled_sw_idxs_tuple = get_idxs_tuple(uniformly_sampled_pw_idxs[:, :3])
+                sw_n_newly_sampled = get_sw_n_sampled(sampled_sw_idxs_tuple, dims_sw)
+                sw_loss, t_uniform_loss = \
+                    get_sw_loss(rendered_rgbs, gt_rgbs, sw_n_newly_sampled, sampled_sw_idxs_tuple,
+                                dims_sw, cpu)
 
             # Active ray sampling.
             sw_active_sampling_prob_dist = sw_loss / torch.sum(sw_loss)
             (actively_sampled_rays, actively_sampled_pw_idxs, t_active_sampling) = \
-                sample_section_rays(section_rays, sw_active_sampling_prob_dist,
-                                    n_total_rays_to_actively_sample,
-                                    n_train_imgs, H, W, grid_size, section_height, section_width,
-                                    tensorboard, 'train/active_sampling/sampled_pixels', train_iter_idx,
-                                    log_sampling_vis=log_sampling_vis, verbose=verbose)
+                sample_sw_rays(sw_rays, sw_active_sampling_prob_dist,
+                               n_total_rays_to_actively_sample,
+                               n_train_imgs, H, W, grid_size, section_height, section_width,
+                               tensorboard, 'train/active_sampling/sampled_pixels',
+                               train_iter_idx, log_sampling_vis=log_sampling_vis,
+                               verbose=verbose)
 
             sampled_rays = actively_sampled_rays
             sampled_pw_idxs = actively_sampled_pw_idxs
         else:
+            # Active sampling is disabled, so simply sample uniformly over all sections.
             (sampled_rays, sampled_pw_idxs, t_sampling) = \
-                sample_section_rays(section_rays, section_n_rays_to_sample, n_total_rays_to_sample,
-                                    n_train_imgs, H, W, grid_size, section_height, section_width,
-                                    tensorboard, 'train/sampling/sampled_pixels', train_iter_idx,
-                                    log_sampling_vis=log_sampling_vis, verbose=verbose)
+                sample_sw_rays(sw_rays, sw_sampling_prob_dist, n_total_rays_to_sample,
+                               n_train_imgs, H, W, grid_size, section_height, section_width,
+                               tensorboard, 'train/sampling/sampled_pixels', train_iter_idx,
+                               log_sampling_vis=log_sampling_vis, verbose=verbose)
 
-        # Accumulate the number of times each section has been sampled from.
-        unique_sw_idxs, sw_n_sampled = \
-            torch.unique(sampled_pw_idxs[:, :3], dim=0, return_counts=True)
-        sw_total_n_sampled[unique_sw_idxs[:, 0], unique_sw_idxs[:, 1], unique_sw_idxs[:, 2]] += \
-            sw_n_sampled
+        # Accumulate the total number of times each section has been sampled from so that it can be
+        # visualized when log_sampling_vis is True.
+        sampled_sw_idxs_tuple = get_idxs_tuple(sampled_pw_idxs[:, :3])
+        sw_n_newly_sampled = get_sw_n_sampled(sampled_sw_idxs_tuple, dims_sw)
+        sw_total_n_sampled += sw_n_newly_sampled
 
         t_batching_start = perf_counter()
         batch = torch.transpose(sampled_rays.to(gpu_if_available), 0, 1)
-        batch_rays, target_s = batch[:2], batch[2]
+        batch_rays, gt_rgbs = batch[:2], batch[2]
         t_batching = perf_counter() - t_batching_start
 
         # Core optimization loop! #
         t_rendering_start = perf_counter()
-        rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
-                                        verbose=train_iter_idx < 10, retraw=True,
-                                        **render_kwargs_train)
+        rendered_rgbs, _, _, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
+                                             verbose=train_iter_idx < 10, retraw=True,
+                                             **render_kwargs_train)
         t_rendering = perf_counter() - t_rendering_start
 
         t_loss_start = perf_counter()
         optimizer.zero_grad()
-        img_loss = img2mse(rgb, target_s)
+        img_loss = img2mse(rendered_rgbs, gt_rgbs)
         loss = img_loss
         psnr = mse2psnr(img_loss)
         if 'rgb0' in extras:
-            img_loss0 = img2mse(extras['rgb0'], target_s)
+            img_loss0 = img2mse(extras['rgb0'], gt_rgbs)
             loss += img_loss0
             # psnr0 = mse2psnr(img_loss0)
         t_loss = perf_counter() - t_loss_start
@@ -808,7 +811,7 @@ def train() -> None:
         for param_group in optimizer.param_groups:
             param_group['lr'] = new_lrate
 
-        # Rest is logging.
+            # Rest is logging.
 
         if train_iter_idx % args.i_weights == 0:
             path = os.path.join(basedir, expname, '{:06d}.tar'.format(train_iter_idx))
@@ -846,27 +849,13 @@ def train() -> None:
             tensorboard.add_scalar('train/psnr', psnr, train_iter_idx)
 
         if log_sampling_vis:
-            sw_total_n_sampled_scaled = sw_total_n_sampled / torch.max(sw_total_n_sampled)
-            sw_total_n_sampled_imgs = torch.ones((n_train_imgs, grid_size, grid_size, 3))
-            sw_total_n_sampled_imgs[:, :, :, 1] -= sw_total_n_sampled_scaled
-            sw_total_n_sampled_imgs[:, :, :, 2] -= sw_total_n_sampled_scaled
-
-            # Add white border around each image.
-            padding_color = torch.tensor([0.6]).expand(3)
-            sw_total_n_sampled_imgs = torch.cat((
-                padding_color.expand(n_train_imgs, 1, grid_size, 3),
-                sw_total_n_sampled_imgs,
-                padding_color.expand(n_train_imgs, 1, grid_size, 3)),
-                dim=1)
-            sw_total_n_sampled_imgs = torch.cat((
-                padding_color.expand(n_train_imgs, grid_size + 2, 1, 3),
-                sw_total_n_sampled_imgs,
-                padding_color.expand(n_train_imgs, grid_size + 2, 1, 3)),
-                dim=2)
-
             sampling_name = 'active_sampling' if do_active_sampling else 'sampling'
-            tensorboard.add_images(f'train/{sampling_name}/cumulative_samples_per_section',
-                                   sw_total_n_sampled_imgs, train_iter_idx, dataformats='NHWC')
+            add_1d_imgs_to_tensorboard(sw_total_n_sampled, torch.Tensor([1, 0, 0]), tensorboard,
+                                       f'train/{sampling_name}/cumulative_samples_per_section',
+                                       train_iter_idx)
+
+            add_1d_imgs_to_tensorboard(sw_loss, torch.Tensor([0, 0.8, 0]), tensorboard,
+                                       'train/estimated_loss_distribution', train_iter_idx)
 
         if train_iter_idx % args.i_img == 0:
             # Log a rendered validation view to Tensorboard
@@ -888,6 +877,15 @@ def train() -> None:
             tensorboard.add_image('validation/disp/estimate', disp,
                                   train_iter_idx, dataformats='HW')
             tensorboard.add_scalar('validation/psnr', psnr, train_iter_idx)
+
+        if do_active_sampling and not do_uniform_sampling_every_iter:
+            # Update the estimated section-wise loss probability distribution using the loss from
+            # the rays that were just actively sampled.
+            with torch.no_grad():
+                new_loss, _ = get_sw_loss(rendered_rgbs, gt_rgbs, sw_n_newly_sampled,
+                                          sampled_sw_idxs_tuple, dims_sw, cpu)
+                # Only update the loss of sections that were sampled from.
+                sw_loss[sampled_sw_idxs_tuple] = new_loss[sampled_sw_idxs_tuple]
 
         t_train_iter = perf_counter() - t_train_iter_start
 

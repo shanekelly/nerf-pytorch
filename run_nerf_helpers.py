@@ -1,7 +1,7 @@
 from argparse import Namespace
 from itertools import product
 from time import perf_counter
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -394,10 +394,10 @@ def load_data(args: Namespace, gpu_if_available: torch.device
             val_idxs, near, far)
 
 
-def get_all_rays(images: torch.Tensor, H: int, W: int, K: torch.Tensor, poses: torch.Tensor,
-                 n_train_imgs: int,  grid_size: int, section_height: int,
-                 section_width: int, gpu_if_available: torch.device, verbose=False
-                 ) -> Tuple[torch.Tensor, float]:
+def get_sw_rays(images: torch.Tensor, H: int, W: int, K: torch.Tensor, poses: torch.Tensor,
+                n_train_imgs: int,  grid_size: int, section_height: int,
+                section_width: int, gpu_if_available: torch.device, verbose=False
+                ) -> Tuple[torch.Tensor, float]:
     """
     @param images - Training images.
     @param poses - Pose for each training image.
@@ -484,34 +484,68 @@ def nd_idxs_from_1d_idxs(flat_idxs: torch.Tensor, n_elems_per_chunks: torch.Tens
     return nd_idxs
 
 
-def sample_section_rays(sw_rays: torch.Tensor, sw_sampling_prob_dist: torch.Tensor,
-                        n_total_rays_to_sample: int, n_train_imgs: int, img_height: int,
-                        img_width: int, grid_size: int, section_height: int, section_width: int,
-                        tensorboard: SummaryWriter, tensorboard_tag: str, train_iter_idx: int,
-                        log_sampling_vis: bool = False, verbose: bool = False
-                        ) -> Tuple[torch.Tensor, torch.Tensor, float]:
+def sample_sw_rays(sw_rays: torch.Tensor, sw_sampling_prob_dist: torch.Tensor,
+                   n_total_rays_to_sample: int, n_train_imgs: int, img_height: int,
+                   img_width: int, grid_size: int, section_height: int, section_width: int,
+                   tensorboard: SummaryWriter, tensorboard_tag: str, train_iter_idx: int,
+                   log_sampling_vis: bool = False, verbose: bool = False,
+                   enforce_min_samples: bool = False
+                   ) -> Tuple[torch.Tensor, torch.Tensor, float]:
     t_start = perf_counter()
 
     if verbose:
         print('Sampling rays across grid sections...', end='')
 
-    pw_sampling_prob_dist = sw_sampling_prob_dist.float().unsqueeze(-1).unsqueeze(-1).repeat(
-        (1, 1, 1, section_height, section_width))
-    sampled_flat_idxs = torch.multinomial(pw_sampling_prob_dist.view(-1), n_total_rays_to_sample)
-    sampled_rays = sw_rays.view(-1, 3, 3)[sampled_flat_idxs]
-
-    n_pixels_per_img = img_height * img_width
+    # Values for converting between flat idxs and section-wise / pixel-wise indices.
     n_pixels_per_section = section_height * section_width
-
     n_pixels_per_img = img_height * img_width
     n_pixels_per_grid_row_in_img = grid_size * n_pixels_per_section
     n_pixels_per_grid_col_in_grid_row = n_pixels_per_section
     n_pixels_per_pixel_row_in_grid_col = section_width
     n_pixels_per_pixel_col_in_pixel_row = 1
-    n_pixels_per_chunks = \
-        torch.tensor([n_pixels_per_img, n_pixels_per_grid_row_in_img,
-                      n_pixels_per_grid_col_in_grid_row, n_pixels_per_pixel_row_in_grid_col,
-                      n_pixels_per_pixel_col_in_pixel_row])
+
+    # A tensor that contains, for every pixel, the probability that pixel should be sampled
+    # with.  Shape (n_train_imgs, grid_size, grid_size, section_height, section_width).
+    pw_sampling_prob_dist = sw_sampling_prob_dist.float().unsqueeze(-1).unsqueeze(-1).repeat(
+        (1, 1, 1, section_height, section_width))
+
+    if enforce_min_samples:
+        sampled_flat_idxs = torch.empty((n_total_rays_to_sample), dtype=torch.int64)
+        sw_min_n_to_sample = \
+            torch.floor(n_total_rays_to_sample * sw_sampling_prob_dist).to(torch.int64)
+        n_remaining_samples = n_total_rays_to_sample - torch.sum(sw_min_n_to_sample)
+        sw_additional_n_to_sample, _ = get_n_to_sample(sw_sampling_prob_dist,
+                                                       n_remaining_samples.item())
+        sw_n_to_sample = sw_min_n_to_sample + sw_additional_n_to_sample
+        start_insert_idx = 0
+        for img_idx, grid_row_idx, grid_col_idx in product(range(n_train_imgs), range(grid_size),
+                                                           range(grid_size)):
+            start_sampled_idx = (img_idx * n_pixels_per_img +
+                                 grid_row_idx * n_pixels_per_grid_row_in_img +
+                                 grid_col_idx * n_pixels_per_grid_col_in_grid_row)
+            sampling_prob_dist = pw_sampling_prob_dist[img_idx, grid_row_idx, grid_col_idx, :, :]
+            n_to_sample = sw_n_to_sample[img_idx, grid_row_idx, grid_col_idx]
+            new_sampled_flat_idxs = \
+                torch.multinomial(sampling_prob_dist.view(-1), n_to_sample) + start_sampled_idx
+            stop_insert_idx = start_insert_idx + n_to_sample
+            sampled_flat_idxs[start_insert_idx:stop_insert_idx] = new_sampled_flat_idxs
+
+            start_insert_idx = stop_insert_idx
+    else:
+        # A 1D tensor filled with indices into a flat version of all pixels. Thus, the minimum index
+        # value is 0 and the maximum index value is (n_train_imgs * grid_size * grid_size *
+        # section_height * section_width - 1). Each index refers to a pixel that should be sampled.
+        # Shape (n_total_rays_to_sample, ).
+        sampled_flat_idxs = \
+            torch.multinomial(pw_sampling_prob_dist.view(-1), n_total_rays_to_sample)
+
+    # Use sampled_flat_idxs to index into the rays. Now have obtained the sampled rays. Shape
+    # (n_total_rays_to_sample, 3, 3).
+    sampled_rays = sw_rays.view(-1, 3, 3)[sampled_flat_idxs]
+
+    n_pixels_per_chunks = torch.tensor([n_pixels_per_img, n_pixels_per_grid_row_in_img,
+                                        n_pixels_per_grid_col_in_grid_row, n_pixels_per_pixel_row_in_grid_col,
+                                        n_pixels_per_pixel_col_in_pixel_row])
     sampled_pw_idxs = nd_idxs_from_1d_idxs(sampled_flat_idxs, n_pixels_per_chunks)
 
     if log_sampling_vis:
@@ -526,16 +560,15 @@ def sample_section_rays(sw_rays: torch.Tensor, sw_sampling_prob_dist: torch.Tens
         # Draw all of the image sections on the sampling visualization images.
         for img_idx, grid_row_idx, grid_col_idx in product(range(n_train_imgs), range(grid_size),
                                                            range(grid_size)):
-            section_row_start_idx = \
-                (grid_row_idx + 1) * section_padding_size + grid_row_idx * section_height
+            section_row_start_idx = (grid_row_idx + 1) * section_padding_size + \
+                grid_row_idx * section_height
             section_row_stop_idx = section_row_start_idx + section_height
-            section_col_start_idx = \
-                (grid_col_idx + 1) * section_padding_size + grid_col_idx * section_width
+            section_col_start_idx = (grid_col_idx + 1) * section_padding_size + \
+                grid_col_idx * section_width
             section_col_stop_idx = section_col_start_idx + section_width
 
             sampling_vis_imgs[img_idx, section_row_start_idx:section_row_stop_idx,
-                              section_col_start_idx:section_col_stop_idx] = \
-                sw_rays[img_idx, grid_row_idx, grid_col_idx, :, :, 2]
+                              section_col_start_idx:section_col_stop_idx] = sw_rays[img_idx, grid_row_idx, grid_col_idx, :, :, 2]
 
         # Draw a dot at the location of every sampled pixel.
         for img_idx, grid_row_idx, grid_col_idx, pixel_row_idx, pixel_col_idx in sampled_pw_idxs:
@@ -562,7 +595,8 @@ def sample_section_rays(sw_rays: torch.Tensor, sw_sampling_prob_dist: torch.Tens
     return sampled_rays, sampled_pw_idxs, t_delta
 
 
-def get_section_n_samples(prob_dist: torch.Tensor, n_samples: int) -> Tuple[torch.Tensor, float]:
+def get_n_to_sample(prob_dist: torch.Tensor, n_samples: int
+                    ) -> Tuple[torch.Tensor, float]:
     """
     @param prob_dist
     @param n_samples
@@ -598,3 +632,78 @@ def get_section_n_samples(prob_dist: torch.Tensor, n_samples: int) -> Tuple[torc
     t_delta = perf_counter() - t_start
 
     return section_n_samples, t_delta
+
+
+def get_idxs_tuple(idxs: torch.Tensor
+                   ) -> Tuple[torch.Tensor, ...]:
+    """
+    @param idxs - Shape (num indices, num dimensions that the indices index into).
+    @returns - A tuple, which can be directly used to index into a tensor, eg tensor[idxs_tuple].
+        The tuple has (num dimensions that the indices index into) tensors, where each tensor has
+        (num indices) elements.
+    """
+    return tuple(torch.transpose(idxs, 0, 1))
+
+
+def get_sw_n_sampled(sampled_sw_idxs_tuple: Tuple[torch.Tensor, ...], dims_sw: Tuple[int, int, int]
+                     ) -> torch.Tensor:
+    sw_n_sampled = torch.index_put(torch.zeros(dims_sw, dtype=torch.int64), sampled_sw_idxs_tuple,
+                                   torch.tensor([1], dtype=torch.int64), accumulate=True)
+
+    return sw_n_sampled
+
+
+def get_sw_loss(rendered_rgbs: torch.Tensor, gt_rgbs: torch.Tensor, sw_n_sampled: torch.Tensor,
+                sampled_sw_idxs_tuple: Tuple[torch.Tensor, ...], dims_sw: Tuple[int, int, int],
+                cpu: torch.device,
+                ) -> Tuple[torch.Tensor, float]:
+    t_start = perf_counter()
+
+    rendered_rgbs = rendered_rgbs.to(cpu)
+    gt_rgbs = gt_rgbs.to(cpu)
+
+    mean_squared_diffs = torch.mean((rendered_rgbs - gt_rgbs) ** 2, axis=1)
+    sw_cumu_mean_squared_diffs = torch.index_put(torch.zeros(dims_sw), sampled_sw_idxs_tuple,
+                                                 mean_squared_diffs, accumulate=True)
+    # For each section, the average mean squared difference between rendered RGB and groundtruth RGB
+    # for each sampled pixel within the section.
+    sw_loss = torch.nan_to_num(sw_cumu_mean_squared_diffs / sw_n_sampled, nan=0)
+
+    t_delta = perf_counter() - t_start
+
+    return sw_loss, t_delta
+
+
+def add_1d_imgs_to_tensorboard(imgs: torch.Tensor, img_rgb: torch.Tensor,
+                               tensorboard: SummaryWriter, tag: str, iter_idx: int,
+                               padding_rgb: torch.Tensor = torch.tensor([0.6]).expand(3)
+                               ) -> torch.Tensor:
+    assert imgs.dim() == 3
+
+    # Scale all elements between 0 and 1.
+    imgs_scaled = imgs / torch.max(imgs)
+
+    # If an element has the value 0, then it should receive the RGB value of zero_rgb.
+    zero_rgb = torch.Tensor([1]).expand(3)
+    # If an element has the value 1 (the max value after scaling), then it should receive the RGB
+    # value of max_rgb.
+    max_rgb = img_rgb
+    diff_rgb = max_rgb - zero_rgb
+
+    # Scale the
+    output_imgs = (zero_rgb.repeat(imgs.shape[0], imgs.shape[1], imgs.shape[2], 1) +
+                   imgs_scaled.unsqueeze(-1).repeat(1, 1, 1, 3) * diff_rgb)
+
+    # Add gray border around each image.
+    output_imgs = torch.cat((
+        padding_rgb.expand(imgs.shape[0], 1, imgs.shape[2], 3),
+        output_imgs,
+        padding_rgb.expand(imgs.shape[0], 1, imgs.shape[2], 3)),
+        dim=1)
+    output_imgs = torch.cat((
+        padding_rgb.expand(imgs.shape[0], imgs.shape[1] + 2, 1, 3),
+        output_imgs,
+        padding_rgb.expand(imgs.shape[0], imgs.shape[1] + 2, 1, 3)),
+        dim=2)
+
+    tensorboard.add_images(tag, output_imgs, iter_idx, dataformats='NHWC')

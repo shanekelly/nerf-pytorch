@@ -120,8 +120,6 @@ def load_bonn_data(base_dir, downsample_factor):
         test_idxs = all_idxs[::8]
     train_idxs = [idx for idx in all_idxs if idx not in test_idxs]
 
-    set_trace()
-
     return rgb_imgs, depth_imgs, hwf, poses, render_poses, train_idxs, test_idxs
 
 
