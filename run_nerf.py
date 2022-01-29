@@ -7,16 +7,21 @@ from time import time, perf_counter
 from typing import Callable, Dict, Optional
 
 import numpy as np
+import open3d as o3d
 import torch
 
 from ipdb import launch_ipdb_on_exception, set_trace
+from open3d.visualization.tensorboard_plugin import summary
+from open3d.visualization.tensorboard_plugin.util import to_dict_batch
+from torch.nn import Parameter
 from torch.nn.functional import relu
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm, trange
 
-from run_nerf_helpers import (add_1d_imgs_to_tensorboard, get_idxs_tuple, get_sw_n_sampled,
-                              get_sw_rays, get_embedder, get_rays, get_sw_loss, img2mse, load_data,
-                              mse2psnr, NeRF, ndc_rays, sample_pdf, sample_sw_rays, to8b)
+from run_nerf_helpers import (add_1d_imgs_to_tensorboard, get_coordinate_frames, get_idxs_tuple,
+                              get_sw_n_sampled, get_sw_rays, get_embedder, get_rays, get_sw_loss,
+                              img2mse, load_data, mse2psnr, NeRF, ndc_rays, sample_pdf,
+                              sample_sw_rays, to8b, tfmats_from_minreps, minreps_from_tfmats)
 
 
 cpu = torch.device('cpu')
@@ -210,7 +215,7 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
     return rgbs, disps
 
 
-def create_nerf(args):
+def create_nerf(args, initial_poses: torch.Tensor):
     """Instantiate NeRF's MLP model.
     """
     embed_fn, input_ch = get_embedder(args.multires, args.i_embed)
@@ -239,6 +244,15 @@ def create_nerf(args):
     def network_query_fn(inputs, viewdirs, network_fn):
         return run_network(inputs, viewdirs, network_fn, embed_fn=embed_fn,
                            embeddirs_fn=embeddirs_fn, netchunk=args.netchunk)
+
+    if args.no_pose_optimization:
+        train_poses_params = None
+    else:
+        # Convert the initial pose transformation matrices into 6-element minimal representations,
+        # then add them to grad_vars, which will get passed to the optimizer.
+        train_poses_params = Parameter(minreps_from_tfmats(initial_poses, gpu_if_available))
+        with torch.no_grad():
+            grad_vars.extend([train_poses_params])
 
     # Create optimizer
     optimizer = torch.optim.Adam(params=grad_vars, lr=args.lrate, betas=(0.9, 0.999))
@@ -297,7 +311,8 @@ def create_nerf(args):
     render_kwargs_test['perturb'] = False
     render_kwargs_test['raw_noise_std'] = 0.
 
-    return render_kwargs_train, render_kwargs_test, start_iter_idx, grad_vars, optimizer
+    return (render_kwargs_train, render_kwargs_test, start_iter_idx, grad_vars, optimizer,
+            train_poses_params)
 
 
 def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False):
@@ -586,10 +601,13 @@ def config_parser():
     parser.add_argument('--img_grid_side_len',   type=int, default=8,
                         help='The side length of the grid used to split up training images for '
                         'image active sampling.')
-    parser.add_argument('--i_sampling_vis', type=int, default=500, help='The frequency of '
-                        'logging visualizations about ray sampling to tensorboard.')
     parser.add_argument('--n_training_iters', type=int, default=50000, help='The number of '
                         'training iterations to run for.')
+
+    parser.add_argument('--i_sampling_vis', type=int, default=500, help='The frequency of '
+                        'logging visualizations about ray sampling to tensorboard.')
+    parser.add_argument('--i_pose_vis', type=int, default=500, help='The frequency of '
+                        'logging visualizations about the camera frame poses to tensorboard.')
 
     parser.add_argument('--verbose', action='store_true', help='True to print additional info.')
     parser.add_argument('--no_active_sampling', action='store_true', help='Set to disable active '
@@ -600,6 +618,8 @@ def config_parser():
                         'not set, then all images will be uniformly sampled once at the start, '
                         'but then only active samples will update the estimated probability '
                         'distribution of loss over images.')
+    parser.add_argument('--no_pose_optimization', action='store_true', help='Set to make initial '
+                        'poses static and disable learning refined poses.')
 
     return parser
 
@@ -608,11 +628,14 @@ def train() -> None:
     parser = config_parser()
     args = parser.parse_args()
 
-    tensorboard = SummaryWriter(log_dir=Path(args.basedir) / args.expname, flush_secs=10)
+    tensorboard = SummaryWriter(Path(args.basedir) / args.expname, flush_secs=10)
 
     # Load data from specified dataset.
     (rgb_imgs, depth_imgs, hwf, H, W, focal, K, poses, render_poses, train_idxs, test_idxs,
      val_idxs, near, far) = load_data(args, gpu_if_available)
+    train_rgb_imgs = rgb_imgs[train_idxs]
+    initial_train_poses = poses[train_idxs]
+    test_poses = poses[test_idxs]
 
     # Create log dir and copy the config file
     basedir = args.basedir
@@ -630,8 +653,8 @@ def train() -> None:
             file.write(open(args.config, 'r').read())
 
     # Create nerf model
-    render_kwargs_train, render_kwargs_test, start_iter_idx, grad_vars, optimizer = create_nerf(
-        args)
+    (render_kwargs_train, render_kwargs_test, start_iter_idx, grad_vars, optimizer,
+     train_poses_params) = create_nerf(args, initial_train_poses)
     global_step = start_iter_idx
 
     bds_dict = {
@@ -675,6 +698,7 @@ def train() -> None:
     grid_size = args.img_grid_side_len
     do_active_sampling = not args.no_active_sampling
     do_uniform_sampling_every_iter = args.uniformly_sample_every_iteration
+    do_pose_optimization = not args.no_pose_optimization
 
     assert H % grid_size == 0
     assert W % grid_size == 0
@@ -698,9 +722,14 @@ def train() -> None:
     sw_total_n_sampled = torch.zeros(dims_sw, dtype=torch.int64)
 
     # Get all rays from all training images.
-    sw_rays, _ = get_sw_rays(rgb_imgs[train_idxs], H, W, K, poses[train_idxs], n_train_imgs,
-                             grid_size, section_height, section_width, gpu_if_available,
-                             verbose=True)
+    train_poses = initial_train_poses.clone()
+
+    if not do_pose_optimization:
+        # Poses are not being optimized, so we only need to compute the rays once since they will
+        # stay the same throughout all training iterations.
+        sw_rays, t_get_rays = \
+            get_sw_rays(train_rgb_imgs, H, W, K, train_poses, n_train_imgs,
+                        grid_size, section_height, section_width, gpu_if_available)
 
     start_iter_idx += 1
     n_training_iters = args.n_training_iters + 1
@@ -709,6 +738,22 @@ def train() -> None:
         t_train_iter_start = perf_counter()
 
         log_sampling_vis = train_iter_idx % args.i_sampling_vis == 0
+        log_pose_vis = train_iter_idx % args.i_pose_vis == 0
+        is_first_iter = train_iter_idx == start_iter_idx
+
+        if not do_pose_optimization and not is_first_iter:
+            t_get_rays = 0.0
+        if do_pose_optimization:
+            # Poses are being optimized, so we need to compute the rays on every training iteration
+            # since they will change as the poses change.
+
+            # Unpack the minimal representations of the poses from the optimizer's parameters, then
+            # convert them into 4x4 transformation matrices.
+            train_poses = tfmats_from_minreps(train_poses_params, initial_train_poses[0])
+            # Compute the rays from the optimized poses.
+            sw_rays, t_get_rays = \
+                get_sw_rays(train_rgb_imgs, H, W, K, train_poses, n_train_imgs,
+                            grid_size, section_height, section_width, gpu_if_available)
 
         if do_active_sampling:
             # If we aren't uniformly sampling on every iteration, then we should only uniformly
@@ -717,16 +762,17 @@ def train() -> None:
             t_uniform_batching = 0.0
             t_uniform_loss = 0.0
             t_uniform_rendering = 0.0
-            if do_uniform_sampling_every_iter or train_iter_idx == start_iter_idx:
+            if do_uniform_sampling_every_iter or is_first_iter:
                 # Uniform ray sampling.
                 enforce_min_samples = False if do_uniform_sampling_every_iter else True
-                (uniformly_sampled_rays, uniformly_sampled_pw_idxs, t_uniform_sampling) = \
-                    sample_sw_rays(sw_rays, sw_uniform_sampling_prob_dist,
-                                   n_total_rays_to_uniformly_sample,
-                                   n_train_imgs, H, W, grid_size, section_height, section_width,
-                                   tensorboard, 'train/uniform_sampling/sampled_pixels', train_iter_idx,
-                                   log_sampling_vis=log_sampling_vis, verbose=verbose,
-                                   enforce_min_samples=enforce_min_samples)
+                with torch.no_grad():
+                    (uniformly_sampled_rays, uniformly_sampled_pw_idxs, t_uniform_sampling) = \
+                        sample_sw_rays(sw_rays, sw_uniform_sampling_prob_dist,
+                                       n_total_rays_to_uniformly_sample,
+                                       n_train_imgs, H, W, grid_size, section_height, section_width,
+                                       tensorboard, 'train/uniform_sampling/sampled_pixels', train_iter_idx,
+                                       log_sampling_vis=log_sampling_vis, verbose=verbose,
+                                       enforce_min_samples=enforce_min_samples)
 
                 # Render the uniformly sampled rays.
                 t_uniform_batching_start = perf_counter()
@@ -836,10 +882,10 @@ def train() -> None:
         if train_iter_idx % args.i_testset == 0 and train_iter_idx > 0:
             testsavedir = os.path.join(basedir, expname, f'testset_{train_iter_idx:06d}')
             os.makedirs(testsavedir, exist_ok=True)
-            print('test poses shape', poses[test_idxs].shape)
+            print('test poses shape', test_poses.shape)
             with torch.no_grad():
                 render_path(
-                    torch.tensor(poses[test_idxs], device=gpu_if_available), hwf, K, args.chunk,
+                    torch.tensor(test_poses, device=gpu_if_available), hwf, K, args.chunk,
                     render_kwargs_test,
                     gt_imgs=rgb_imgs[test_idxs], savedir=testsavedir)
             print('Saved test set')
@@ -878,6 +924,21 @@ def train() -> None:
                                   train_iter_idx, dataformats='HW')
             tensorboard.add_scalar('validation/psnr', psnr, train_iter_idx)
 
+        if log_pose_vis:
+            # Create a set of Open3D XYZ coordinate axes at the location of every initial pose and
+            # optimized pose, then log them to tensorboard for visualization.
+            initial_train_poses_np = initial_train_poses.cpu().numpy()
+            train_poses_np = train_poses.detach().cpu().numpy()
+            initial_coordinate_frames = get_coordinate_frames(initial_train_poses_np, gray_out=True)
+            optimized_coordinate_frames = get_coordinate_frames(train_poses_np)
+            for idx in range(len(initial_coordinate_frames)):
+                # TODO: Efficiently store initial poses, since they are always the same at every
+                # iteration.
+                tensorboard.add_3d(f'train/pose{idx:03d}-initial',
+                                   to_dict_batch([initial_coordinate_frames[idx]]), step=train_iter_idx)
+                tensorboard.add_3d(f'train/pose{idx:03d}-optimized',
+                                   to_dict_batch([optimized_coordinate_frames[idx]]), step=train_iter_idx)
+
         if do_active_sampling and not do_uniform_sampling_every_iter:
             # Update the estimated section-wise loss probability distribution using the loss from
             # the rays that were just actively sampled.
@@ -891,15 +952,15 @@ def train() -> None:
 
         if do_active_sampling:
             tqdm_bar.set_postfix_str(
-                f't{t_train_iter:.3f},'
+                f't{t_train_iter:.3f},gr{t_get_rays:.3f},'
                 f'u:(s{t_uniform_sampling:.3f},b{t_uniform_batching:.3f},'
                 f'l{t_uniform_loss:.3f},r{t_uniform_rendering:.3f}),'
                 f'a:(s{t_active_sampling:.3f},b{t_batching:.3f},r{t_rendering:.3f}),'
                 f'b{t_backprop:.3f}')
         else:
             tqdm_bar.set_postfix_str(
-                f't{t_train_iter:.3f},s{t_sampling:.3f},b{t_batching:.3f},r{t_rendering:.3f},'
-                f'b{t_backprop:.3f}')
+                f't{t_train_iter:.3f},gr{t_get_ray:.3f},s{t_sampling:.3f},b{t_batching:.3f},'
+                f'r{t_rendering:.3f},b{t_backprop:.3f}')
 
         global_step += 1
 

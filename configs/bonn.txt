@@ -1,4 +1,4 @@
-expname = 3-frames_open3d-testing
+expname = testing
 basedir = ./logs
 datadir = ~/eth/implicit-mapping/datasets/strawberry/0/3-frames/orbslam/front-camera/right-camera/all-frames
 dataset_type = bonn

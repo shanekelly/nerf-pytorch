@@ -4,6 +4,7 @@ from time import perf_counter
 from typing import List, Optional, Tuple
 
 import numpy as np
+import open3d as o3d
 import torch
 import torch.nn as nn
 
@@ -707,3 +708,106 @@ def add_1d_imgs_to_tensorboard(imgs: torch.Tensor, img_rgb: torch.Tensor,
         dim=2)
 
     tensorboard.add_images(tag, output_imgs, iter_idx, dataformats='NHWC')
+
+
+def skew_symmetric(w):
+    w0, w1, w2 = w.unbind(dim=-1)
+    O = torch.zeros_like(w0)
+    wx = torch.stack([torch.stack([O, -w2, w1], dim=-1),
+                      torch.stack([w2, O, -w0], dim=-1),
+                      torch.stack([-w1, w0, O], dim=-1)], dim=-2)
+    return wx
+
+
+def taylor_A(x, nth=10):
+    # Taylor expansion of sin(x)/x
+    ans = torch.zeros_like(x)
+    denom = 1.
+    for i in range(nth+1):
+        if i > 0:
+            denom *= (2*i)*(2*i+1)
+        ans = ans+(-1)**i*x**(2*i)/denom
+    return ans
+
+
+def taylor_B(x, nth=10):
+    # Taylor expansion of (1-cos(x))/x**2
+    ans = torch.zeros_like(x)
+    denom = 1.
+    for i in range(nth+1):
+        denom *= (2*i+1)*(2*i+2)
+        ans = ans+(-1)**i*x**(2*i)/denom
+    return ans
+
+
+def taylor_C(x, nth=10):
+    # Taylor expansion of (x-sin(x))/x**3
+    ans = torch.zeros_like(x)
+    denom = 1.
+    for i in range(nth+1):
+        denom *= (2*i+2)*(2*i+3)
+        ans = ans+(-1)**i*x**(2*i)/denom
+    return ans
+
+
+def SO3_to_so3(R, eps=1e-7):  # [...,3,3]
+    trace = R[..., 0, 0]+R[..., 1, 1]+R[..., 2, 2]
+    # ln(R) will explode if theta==pi
+    theta = ((trace-1)/2).clamp(-1+eps, 1-eps).acos_()[..., None, None] % np.pi
+    lnR = 1/(2*taylor_A(theta)+1e-8) * \
+        (R-R.transpose(-2, -1))  # FIXME: wei-chiu finds it weird
+    w0, w1, w2 = lnR[..., 2, 1], lnR[..., 0, 2], lnR[..., 1, 0]
+    w = torch.stack([w0, w1, w2], dim=-1)
+    return w
+
+
+def tfmats_from_minreps(wu, world_from_camera1):  # [...,3]
+    w, u = wu.split([3, 3], dim=-1)
+    wx = skew_symmetric(w)
+    theta = w.norm(dim=-1)[..., None, None]
+    I = torch.eye(3, device=w.device, dtype=torch.float32)
+    A = taylor_A(theta)
+    B = taylor_B(theta)
+    C = taylor_C(theta)
+    R = I+A*wx+B*wx@wx
+    V = I+B*wx+C*wx@wx
+    Rt = torch.cat([R, (V@u[..., None])], dim=-1)
+    camera1_from_cameras = \
+        torch.cat((Rt, torch.tensor([0, 0, 0, 1]).expand(Rt.shape[0], 1, 4)), axis=1)
+    world_from_cameras = \
+        torch.cat((world_from_camera1.unsqueeze(0), world_from_camera1.matmul(camera1_from_cameras)))
+
+    return world_from_cameras
+
+
+def minreps_from_tfmats(Rt, gpu_if_available, eps=1e-8):  # [...,3,4]
+    # Transform the N poses relative to the world frame to N - 1 poses relative to the first pose.
+    camera1_from_world = Rt[0].inverse()
+    world_from_cameras = Rt[1:]
+    camera1_from_cameras = camera1_from_world.matmul(world_from_cameras)
+
+    Rt = camera1_from_cameras[:, :3, :]
+    R, t = Rt.split([3, 1], dim=-1)
+    w = SO3_to_so3(R)
+    wx = skew_symmetric(w)
+    theta = w.norm(dim=-1)[..., None, None]
+    I = torch.eye(3, device=w.device, dtype=torch.float32)
+    A = taylor_A(theta)
+    B = taylor_B(theta)
+    invV = I-0.5*wx+(1-A/(2*B))/(theta**2+eps)*wx@wx
+    u = (invV@t)[..., 0]
+    wu = torch.cat([w, u], dim=-1).to(gpu_if_available)
+    return wu
+
+
+def get_coordinate_frames(poses, coordinate_frame_size: float = 0.05, gray_out: bool = False):
+    coordinate_frames = []
+    for pose in poses:
+        coordinate_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
+            coordinate_frame_size).transform(pose)
+        if gray_out:
+            coordinate_frame.vertex_colors = o3d.utility.Vector3dVector(
+                np.clip(np.asarray(coordinate_frame.vertex_colors) + 0.5, 0, 1))
+        coordinate_frames.append(coordinate_frame)
+
+    return coordinate_frames
