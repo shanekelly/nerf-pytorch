@@ -3,7 +3,7 @@ basedir = ./logs
 datadir = ~/eth/implicit-mapping/datasets/strawberry/0/3-frames/orbslam/front-camera/right-camera/all-frames
 dataset_type = bonn
 
-factor = 2  # Downsampling factor.
+factor = 4  # Downsampling factor.
 
 chunk = 8192  # Default value (1024*32=32768) divided by 4.
 netchunk = 32768  # Default value (1024*64=65536) divided by 2.

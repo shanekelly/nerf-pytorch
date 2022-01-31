@@ -569,7 +569,8 @@ def sample_sw_rays(sw_rays: torch.Tensor, sw_sampling_prob_dist: torch.Tensor,
             section_col_stop_idx = section_col_start_idx + section_width
 
             sampling_vis_imgs[img_idx, section_row_start_idx:section_row_stop_idx,
-                              section_col_start_idx:section_col_stop_idx] = sw_rays[img_idx, grid_row_idx, grid_col_idx, :, :, 2]
+                              section_col_start_idx:section_col_stop_idx] = \
+                sw_rays[img_idx, grid_row_idx, grid_col_idx, :, :, 2]
 
         # Draw a dot at the location of every sampled pixel.
         for img_idx, grid_row_idx, grid_col_idx, pixel_row_idx, pixel_col_idx in sampled_pw_idxs:
@@ -675,13 +676,30 @@ def get_sw_loss(rendered_rgbs: torch.Tensor, gt_rgbs: torch.Tensor, sw_n_sampled
     return sw_loss, t_delta
 
 
+def pad_imgs(imgs: torch.Tensor, padding_rgb: torch.Tensor, padding_width: int
+             ) -> torch.Tensor:
+    assert imgs.dim() == 4  # Shape (N, H, W, C).
+    assert imgs.shape[-1] == 3  # C is RGB.
+
+    padded_imgs = imgs.clone()
+
+    padding_top_bottom = padding_rgb.expand(imgs.shape[0], padding_width, imgs.shape[2], 3)
+    padded_imgs = torch.cat((padding_top_bottom, padded_imgs, padding_top_bottom), dim=1)
+    padding_left_right = \
+        padding_rgb.expand(imgs.shape[0], imgs.shape[1] + 2 * padding_width, padding_width, 3)
+    padded_imgs = torch.cat((padding_left_right, padded_imgs, padding_left_right), dim=2)
+
+    return padded_imgs
+
+
 def add_1d_imgs_to_tensorboard(imgs: torch.Tensor, img_rgb: torch.Tensor,
                                tensorboard: SummaryWriter, tag: str, iter_idx: int,
-                               padding_rgb: torch.Tensor = torch.tensor([0.6]).expand(3)
+                               padding_rgb: torch.Tensor = torch.tensor([0.6]).expand(3),
+                               padding_width: int = 1
                                ) -> torch.Tensor:
     assert imgs.dim() == 3
 
-    # Scale all elements between 0 and 1.
+    # Scale all pixels between 0 and 1.
     imgs_scaled = imgs / torch.max(imgs)
 
     # If an element has the value 0, then it should receive the RGB value of zero_rgb.
@@ -691,21 +709,12 @@ def add_1d_imgs_to_tensorboard(imgs: torch.Tensor, img_rgb: torch.Tensor,
     max_rgb = img_rgb
     diff_rgb = max_rgb - zero_rgb
 
-    # Scale the
+    # Linear interpolation between zero_rgb and max_rgb based on the value of each pixel.
     output_imgs = (zero_rgb.repeat(imgs.shape[0], imgs.shape[1], imgs.shape[2], 1) +
                    imgs_scaled.unsqueeze(-1).repeat(1, 1, 1, 3) * diff_rgb)
 
-    # Add gray border around each image.
-    output_imgs = torch.cat((
-        padding_rgb.expand(imgs.shape[0], 1, imgs.shape[2], 3),
-        output_imgs,
-        padding_rgb.expand(imgs.shape[0], 1, imgs.shape[2], 3)),
-        dim=1)
-    output_imgs = torch.cat((
-        padding_rgb.expand(imgs.shape[0], imgs.shape[1] + 2, 1, 3),
-        output_imgs,
-        padding_rgb.expand(imgs.shape[0], imgs.shape[1] + 2, 1, 3)),
-        dim=2)
+    # Add border around each image.
+    output_imgs = pad_imgs(output_imgs, padding_rgb, padding_width)
 
     tensorboard.add_images(tag, output_imgs, iter_idx, dataformats='NHWC')
 
@@ -772,10 +781,10 @@ def tfmats_from_minreps(wu, world_from_camera1):  # [...,3]
     R = I+A*wx+B*wx@wx
     V = I+B*wx+C*wx@wx
     Rt = torch.cat([R, (V@u[..., None])], dim=-1)
-    camera1_from_cameras = \
-        torch.cat((Rt, torch.tensor([0, 0, 0, 1]).expand(Rt.shape[0], 1, 4)), axis=1)
-    world_from_cameras = \
-        torch.cat((world_from_camera1.unsqueeze(0), world_from_camera1.matmul(camera1_from_cameras)))
+    camera1_from_cameras = torch.cat(
+        (Rt, torch.tensor([0, 0, 0, 1]).expand(Rt.shape[0], 1, 4)), axis=1)
+    world_from_cameras = torch.cat((world_from_camera1.unsqueeze(
+        0), world_from_camera1.matmul(camera1_from_cameras)))
 
     return world_from_cameras
 
