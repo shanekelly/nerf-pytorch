@@ -18,10 +18,11 @@ from torch.nn.functional import relu
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm, trange
 
-from run_nerf_helpers import (add_1d_imgs_to_tensorboard, get_coordinate_frames, get_idxs_tuple,
-                              get_sw_n_sampled, get_sw_rays, get_embedder, get_rays, get_sw_loss,
-                              img2mse, load_data, mse2psnr, NeRF, ndc_rays, pad_imgs, sample_pdf,
-                              sample_sw_rays, to8b, tfmats_from_minreps, minreps_from_tfmats)
+from run_nerf_helpers import (add_1d_imgs_to_tensorboard, create_keyframes, get_coordinate_frames,
+                              get_idxs_tuple, get_sw_n_sampled, get_sw_rays, get_embedder, get_rays,
+                              get_sw_loss, img2mse, load_data, mse2psnr, NeRF, ndc_rays, pad_imgs,
+                              sample_pdf, sample_sw_rays, to8b, tfmats_from_minreps,
+                              minreps_from_tfmats)
 
 
 cpu = torch.device('cpu')
@@ -248,13 +249,13 @@ def create_nerf(args, initial_poses: torch.Tensor):
                            embeddirs_fn=embeddirs_fn, netchunk=args.netchunk)
 
     if args.no_pose_optimization:
-        train_poses_params = None
+        kf_poses_params = None
     else:
         # Convert the initial pose transformation matrices into 6-element minimal representations,
         # then add them to grad_vars, which will get passed to the optimizer.
-        train_poses_params = Parameter(minreps_from_tfmats(initial_poses, gpu_if_available))
+        kf_poses_params = Parameter(minreps_from_tfmats(initial_poses, gpu_if_available))
         with torch.no_grad():
-            grad_vars.extend([train_poses_params])
+            grad_vars.extend([kf_poses_params])
 
     # Create optimizer
     optimizer = torch.optim.Adam(params=grad_vars, lr=args.lrate, betas=(0.9, 0.999))
@@ -314,7 +315,7 @@ def create_nerf(args, initial_poses: torch.Tensor):
     render_kwargs_test['raw_noise_std'] = 0.
 
     return (render_kwargs_train, render_kwargs_test, start_iter_idx, grad_vars, optimizer,
-            train_poses_params)
+            kf_poses_params)
 
 
 def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False):
@@ -622,6 +623,23 @@ def config_parser():
                         'distribution of loss over images.')
     parser.add_argument('--no_pose_optimization', action='store_true', help='Set to make initial '
                         'poses static and disable learning refined poses.')
+    parser.add_argument('--keyframe_creation_strategy', choices=['all', 'every_Nth'], default='all',
+                        help='The keyframe creation strategy to use. Choose between using every '
+                        'frame as a keyframe or using every Nth frame as a keyframe, where N is '
+                        'defined by --every_Nth.')
+    parser.add_argument('--every_Nth', type=int, help='Only used if '
+                        '--keyframe_creation_strategy is "every_Nth". The value of N to use when '
+                        'choosing every Nth frame as a keyframe.')
+#     parser.add_argument('--keyframe_selection_strategy', choices=['all', 'every_Nth'], default='all',
+#                         help='The keyframe creation strategy to use. Choose between using every '
+#                         'frame as a keyframe or using every Nth frame as a keyframe, where N is '
+#                         'defined by --every_Nth.')
+#     parser.add_argument('--n_explore', type=int, help='Only used if '
+#                         '--keyframe_selection_strategy is "loss_explore_exploit". The number of '
+#                         'keyframes to randomly select.')
+#     parser.add_argument('--n_exploit', type=int, help='Only used if '
+#                         '--keyframe_selection_strategy is "loss_explore_exploit". The number of '
+#                         'keyframes with the highest loss to select.')
 
     return parser
 
@@ -635,10 +653,12 @@ def train() -> None:
     # Load data from specified dataset.
     (rgb_imgs, depth_imgs, hwf, H, W, focal, K, poses, render_poses, train_idxs, test_idxs,
      val_idxs, near, far) = load_data(args, gpu_if_available)
-    train_rgb_imgs = rgb_imgs[train_idxs]
     test_rgb_imgs = rgb_imgs[test_idxs]
-    initial_train_poses = poses[train_idxs]
     test_poses = poses[test_idxs]
+
+    kf_rgb_imgs, kf_initial_poses, kf_idxs, n_kfs = \
+        create_keyframes(rgb_imgs, poses, train_idxs, args.keyframe_creation_strategy,
+                         args.every_Nth)
 
     # Create log dir and copy the config file
     basedir = args.basedir
@@ -657,7 +677,7 @@ def train() -> None:
 
     # Create nerf model
     (render_kwargs_train, render_kwargs_test, start_iter_idx, grad_vars, optimizer,
-     train_poses_params) = create_nerf(args, initial_train_poses)
+     kf_poses_params) = create_nerf(args, kf_initial_poses)
     global_step = start_iter_idx
 
     bds_dict = {
@@ -697,7 +717,6 @@ def train() -> None:
     use_batching = not args.no_batching
     assert use_batching is True
     verbose = args.verbose
-    n_train_imgs = len(train_idxs)
     grid_size = args.img_grid_side_len
     do_active_sampling = not args.no_active_sampling
     do_uniform_sampling_every_iter = args.uniformly_sample_every_iteration
@@ -709,11 +728,11 @@ def train() -> None:
     section_width = W // grid_size
 
     n_sections_per_img = grid_size ** 2
-    n_total_sections = n_train_imgs * n_sections_per_img
-    dims_sw = (n_train_imgs, grid_size, grid_size)
+    n_total_sections = n_kfs * n_sections_per_img
+    dims_sw = (n_kfs, grid_size, grid_size)
     if do_active_sampling:
         n_rays_to_uniformly_sample_per_img = 200
-        n_total_rays_to_uniformly_sample = n_rays_to_uniformly_sample_per_img * n_train_imgs
+        n_total_rays_to_uniformly_sample = n_rays_to_uniformly_sample_per_img * n_kfs
         sw_uniform_sampling_prob_dist = torch.tensor(1 / n_total_sections).repeat(dims_sw)
         sw_train_loss = torch.zeros(dims_sw)
         n_total_rays_to_actively_sample = N_rand
@@ -724,14 +743,13 @@ def train() -> None:
 
     sw_total_n_sampled = torch.zeros(dims_sw, dtype=torch.int64)
 
-    # Get all rays from all training images.
-    train_poses = initial_train_poses.clone()
+    kf_poses = kf_initial_poses.clone()
 
     if not do_pose_optimization:
         # Poses are not being optimized, so we only need to compute the rays once since they will
         # stay the same throughout all training iterations.
         sw_rays, t_get_rays = \
-            get_sw_rays(train_rgb_imgs, H, W, K, train_poses, n_train_imgs,
+            get_sw_rays(kf_rgb_imgs, H, W, K, kf_poses, n_kfs,
                         grid_size, section_height, section_width, gpu_if_available)
 
     start_iter_idx += 1
@@ -752,10 +770,10 @@ def train() -> None:
 
             # Unpack the minimal representations of the poses from the optimizer's parameters, then
             # convert them into 4x4 transformation matrices.
-            train_poses = tfmats_from_minreps(train_poses_params, initial_train_poses[0])
+            kf_poses = tfmats_from_minreps(kf_poses_params, kf_initial_poses[0])
             # Compute the rays from the optimized poses.
             sw_rays, t_get_rays = \
-                get_sw_rays(train_rgb_imgs, H, W, K, train_poses, n_train_imgs,
+                get_sw_rays(kf_rgb_imgs, H, W, K, kf_poses, n_kfs,
                             grid_size, section_height, section_width, gpu_if_available)
 
         if do_active_sampling:
@@ -772,7 +790,7 @@ def train() -> None:
                     (uniformly_sampled_rays, uniformly_sampled_pw_idxs, t_uniform_sampling) = \
                         sample_sw_rays(sw_rays, sw_uniform_sampling_prob_dist,
                                        n_total_rays_to_uniformly_sample,
-                                       n_train_imgs, H, W, grid_size, section_height, section_width,
+                                       n_kfs, H, W, grid_size, section_height, section_width,
                                        tensorboard, 'train/uniform_sampling/sampled_pixels', train_iter_idx,
                                        log_sampling_vis=log_sampling_vis, verbose=verbose,
                                        enforce_min_samples=enforce_min_samples)
@@ -802,7 +820,7 @@ def train() -> None:
             (actively_sampled_rays, actively_sampled_pw_idxs, t_active_sampling) = \
                 sample_sw_rays(sw_rays, sw_active_sampling_prob_dist,
                                n_total_rays_to_actively_sample,
-                               n_train_imgs, H, W, grid_size, section_height, section_width,
+                               n_kfs, H, W, grid_size, section_height, section_width,
                                tensorboard, 'train/active_sampling/sampled_pixels',
                                train_iter_idx, log_sampling_vis=log_sampling_vis,
                                verbose=verbose)
@@ -813,7 +831,7 @@ def train() -> None:
             # Active sampling is disabled, so simply sample uniformly over all sections.
             (sampled_rays, sampled_pw_idxs, t_sampling) = \
                 sample_sw_rays(sw_rays, sw_sampling_prob_dist, n_total_rays_to_sample,
-                               n_train_imgs, H, W, grid_size, section_height, section_width,
+                               n_kfs, H, W, grid_size, section_height, section_width,
                                tensorboard, 'train/sampling/sampled_pixels', train_iter_idx,
                                log_sampling_vis=log_sampling_vis, verbose=verbose)
 
@@ -936,10 +954,10 @@ def train() -> None:
         if log_pose_vis:
             # Create a set of Open3D XYZ coordinate axes at the location of every initial pose and
             # optimized pose, then log them to tensorboard for visualization.
-            initial_train_poses_np = initial_train_poses.cpu().numpy()
-            train_poses_np = train_poses.detach().cpu().numpy()
-            initial_coordinate_frames = get_coordinate_frames(initial_train_poses_np, gray_out=True)
-            optimized_coordinate_frames = get_coordinate_frames(train_poses_np)
+            initial_kf_poses_np = kf_initial_poses.cpu().numpy()
+            kf_poses_np = kf_poses.detach().cpu().numpy()
+            initial_coordinate_frames = get_coordinate_frames(initial_kf_poses_np, gray_out=True)
+            optimized_coordinate_frames = get_coordinate_frames(kf_poses_np)
             for idx in range(len(initial_coordinate_frames)):
                 # TODO: Efficiently store initial poses, since they are always the same at every
                 # iteration.

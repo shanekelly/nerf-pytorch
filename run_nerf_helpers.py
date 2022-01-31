@@ -396,7 +396,7 @@ def load_data(args: Namespace, gpu_if_available: torch.device
 
 
 def get_sw_rays(images: torch.Tensor, H: int, W: int, K: torch.Tensor, poses: torch.Tensor,
-                n_train_imgs: int,  grid_size: int, section_height: int,
+                n_kfs: int,  grid_size: int, section_height: int,
                 section_width: int, gpu_if_available: torch.device, verbose=False
                 ) -> Tuple[torch.Tensor, float]:
     """
@@ -415,7 +415,7 @@ def get_sw_rays(images: torch.Tensor, H: int, W: int, K: torch.Tensor, poses: to
     rays = torch.cat([rays, images[:, None]], 1)  # (N, ro+rd+rgb, H, W, 3)
     rays = torch.permute(rays, (0, 2, 3, 1, 4))  # (N, H, W, ro+rd+rgb, 3)
 
-    sw_rays = torch.empty((n_train_imgs, grid_size, grid_size,
+    sw_rays = torch.empty((n_kfs, grid_size, grid_size,
                            section_height, section_width, 3, 3))
     for grid_row_idx, grid_col_idx in product(range(grid_size), range(grid_size)):
         img_start_row_idx = grid_row_idx * section_height
@@ -486,7 +486,7 @@ def nd_idxs_from_1d_idxs(flat_idxs: torch.Tensor, n_elems_per_chunks: torch.Tens
 
 
 def sample_sw_rays(sw_rays: torch.Tensor, sw_sampling_prob_dist: torch.Tensor,
-                   n_total_rays_to_sample: int, n_train_imgs: int, img_height: int,
+                   n_total_rays_to_sample: int, n_kfs: int, img_height: int,
                    img_width: int, grid_size: int, section_height: int, section_width: int,
                    tensorboard: SummaryWriter, tensorboard_tag: str, train_iter_idx: int,
                    log_sampling_vis: bool = False, verbose: bool = False,
@@ -506,7 +506,7 @@ def sample_sw_rays(sw_rays: torch.Tensor, sw_sampling_prob_dist: torch.Tensor,
     n_pixels_per_pixel_col_in_pixel_row = 1
 
     # A tensor that contains, for every pixel, the probability that pixel should be sampled
-    # with.  Shape (n_train_imgs, grid_size, grid_size, section_height, section_width).
+    # with.  Shape (n_kfs, grid_size, grid_size, section_height, section_width).
     pw_sampling_prob_dist = sw_sampling_prob_dist.float().unsqueeze(-1).unsqueeze(-1).repeat(
         (1, 1, 1, section_height, section_width))
 
@@ -519,7 +519,7 @@ def sample_sw_rays(sw_rays: torch.Tensor, sw_sampling_prob_dist: torch.Tensor,
                                                        n_remaining_samples.item())
         sw_n_to_sample = sw_min_n_to_sample + sw_additional_n_to_sample
         start_insert_idx = 0
-        for img_idx, grid_row_idx, grid_col_idx in product(range(n_train_imgs), range(grid_size),
+        for img_idx, grid_row_idx, grid_col_idx in product(range(n_kfs), range(grid_size),
                                                            range(grid_size)):
             start_sampled_idx = (img_idx * n_pixels_per_img +
                                  grid_row_idx * n_pixels_per_grid_row_in_img +
@@ -534,7 +534,7 @@ def sample_sw_rays(sw_rays: torch.Tensor, sw_sampling_prob_dist: torch.Tensor,
             start_insert_idx = stop_insert_idx
     else:
         # A 1D tensor filled with indices into a flat version of all pixels. Thus, the minimum index
-        # value is 0 and the maximum index value is (n_train_imgs * grid_size * grid_size *
+        # value is 0 and the maximum index value is (n_kfs * grid_size * grid_size *
         # section_height * section_width - 1). Each index refers to a pixel that should be sampled.
         # Shape (n_total_rays_to_sample, ).
         sampled_flat_idxs = \
@@ -554,12 +554,12 @@ def sample_sw_rays(sw_rays: torch.Tensor, sw_sampling_prob_dist: torch.Tensor,
         section_padding_size = 5
         n_pads = grid_size + 2
         n_pad_pixels_per_axis = section_padding_size * n_pads
-        sampling_vis_imgs = torch.ones((n_train_imgs, img_height + n_pad_pixels_per_axis,
+        sampling_vis_imgs = torch.ones((n_kfs, img_height + n_pad_pixels_per_axis,
                                         img_width + n_pad_pixels_per_axis, 3), device='cpu')
         sampling_vis_imgs_np = sampling_vis_imgs.numpy()
 
         # Draw all of the image sections on the sampling visualization images.
-        for img_idx, grid_row_idx, grid_col_idx in product(range(n_train_imgs), range(grid_size),
+        for img_idx, grid_row_idx, grid_col_idx in product(range(n_kfs), range(grid_size),
                                                            range(grid_size)):
             section_row_start_idx = (grid_row_idx + 1) * section_padding_size + \
                 grid_row_idx * section_height
@@ -820,3 +820,25 @@ def get_coordinate_frames(poses, coordinate_frame_size: float = 0.05, gray_out: 
         coordinate_frames.append(coordinate_frame)
 
     return coordinate_frames
+
+
+def create_keyframes(rgb_imgs: torch.Tensor, initial_poses: torch.Tensor,
+                     train_idxs: List[int], keyframe_creation_strategy, every_Nth
+                     ) -> Tuple[torch.Tensor, torch.Tensor, List[int], int]:
+    if keyframe_creation_strategy == 'all':
+        kf_idxs = train_idxs
+    elif keyframe_creation_strategy == 'every_Nth':
+        assert every_Nth is not None, ('If --keyframe_creation_strategy is set to "every_Nth", '
+                                       'then --every_Nth must also be defined.')
+        kf_idxs = train_idxs[::every_Nth]
+    else:
+        raise RuntimeError(
+            f'Unknown keyframe creation strategy "{keyframe_creation_strategy}". Exiting.')
+
+    kf_rgb_imgs = rgb_imgs[kf_idxs]
+    kf_initial_poses = initial_poses[kf_idxs]
+    n_kfs = len(kf_idxs)
+
+    print('Keyframe views are ', kf_idxs)
+
+    return kf_rgb_imgs, kf_initial_poses, kf_idxs, n_kfs
