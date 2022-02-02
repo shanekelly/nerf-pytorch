@@ -4,7 +4,7 @@ import imageio
 from pathlib import Path
 from pickle import dump
 from time import time, perf_counter
-from typing import Callable, Dict, Optional
+from typing import Dict, Optional
 
 import numpy as np
 import open3d as o3d
@@ -19,9 +19,10 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm, trange
 
 from run_nerf_helpers import (add_1d_imgs_to_tensorboard, create_keyframes, get_coordinate_frames,
-                              get_idxs_tuple, get_sw_n_sampled, get_sw_rays, get_embedder, get_rays,
-                              get_sw_loss, img2mse, load_data, mse2psnr, NeRF, ndc_rays, pad_imgs,
-                              sample_pdf, sample_sw_rays, to8b, tfmats_from_minreps,
+                              get_idxs_tuple, get_kf_poses, get_sw_n_sampled, get_sw_rays,
+                              get_embedder, get_rays, get_sw_loss, img2mse, load_data, mse2psnr,
+                              NeRF, ndc_rays, pad_imgs, render, render_and_compute_loss, sample_pdf,
+                              sample_sw_rays, select_keyframes, to8b, tfmats_from_minreps,
                               minreps_from_tfmats)
 
 
@@ -69,102 +70,6 @@ def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     return outputs
 
 
-def batchify_rays(rays_flat: torch.Tensor, chunk: int = 1024*32, **kwargs) -> Dict:
-    """
-    @brief - Render rays in smaller minibatches to avoid OOM.
-    @param rays_flat: Shape (N, 8). [rays_o (Nx3), rays_d (Nx3), near (Nx1), far (Nx1)]
-    @param chunk - Maximum number of rays to process simultaneously.
-    """
-    all_ret = {}
-
-    for i in range(0, rays_flat.shape[0], chunk):
-        ret = render_rays(rays_flat[i:i+chunk], **kwargs)
-
-        for k in ret:
-            if k not in all_ret:
-                all_ret[k] = []
-            all_ret[k].append(ret[k])
-
-    # sk: Merge outputs from batches.
-    all_ret = {k: torch.cat(all_ret[k], 0) for k in all_ret}
-
-    return all_ret
-
-
-def render(H: int, W: int, K: torch.Tensor, chunk: int = 1024*32,
-           rays: Optional[torch.Tensor] = None, c2w: Optional[torch.Tensor] = None,
-           ndc: bool = True, near: float = 0., far: float = 1.,
-           use_viewdirs: bool = False, c2w_staticcam: Optional[torch.Tensor] = None,
-           **kwargs):
-    """Render rays
-    Args:
-      H: int. Height of image in pixels.
-      W: int. Width of image in pixels.
-      K: array of shape [3, 3]. Camera intrinsics matrix.
-      chunk: int. Maximum number of rays to process simultaneously. Used to
-        control maximum memory usage. Does not affect final results.
-      rays: array of shape [2, batch_size, 3]. Ray origin and direction for
-        each example in batch.
-      c2w: array of shape [3, 4]. Camera-to-world transformation matrix.
-      ndc: bool. If True, represent ray origin, direction in NDC coordinates.
-      near: float or array of shape [batch_size]. Nearest distance for a ray.
-      far: float or array of shape [batch_size]. Farthest distance for a ray.
-      use_viewdirs: bool. If True, use viewing direction of a point in space in model.
-      c2w_staticcam: array of shape [3, 4]. If not None, use this transformation matrix for
-       camera while using other c2w argument for viewing directions.
-    Returns:
-      rgb_map: [batch_size, 3]. Predicted RGB values for rays.
-      disp_map: [batch_size]. Disparity map. Inverse of depth.
-      acc_map: [batch_size]. Accumulated opacity (alpha) along a ray.
-      extras: dict with everything returned by render_rays().
-    """
-    if c2w is not None:
-        # special case to render full image
-        rays_o, rays_d = get_rays(H, W, K, c2w, gpu_if_available)
-    else:
-        # use provided ray batch
-        rays_o, rays_d = rays
-
-    if use_viewdirs:
-        # provide ray directions as input
-        viewdirs = rays_d
-
-        if c2w_staticcam is not None:
-            # special case to visualize effect of viewdirs
-            rays_o, rays_d = get_rays(H, W, K, c2w_staticcam, gpu_if_available)
-        viewdirs = viewdirs / torch.norm(viewdirs, dim=-1, keepdim=True)
-        viewdirs = torch.reshape(viewdirs, [-1, 3]).float()
-
-    sh = rays_d.shape  # [N, 3]
-
-    if ndc:
-        # for forward facing scenes
-        rays_o, rays_d = ndc_rays(H, W, K[0][0], 1., rays_o, rays_d)
-
-    # Create ray batch
-    rays_o = torch.reshape(rays_o, [-1, 3]).float()
-    rays_d = torch.reshape(rays_d, [-1, 3]).float()
-
-    near, far = near * torch.ones_like(rays_d[..., :1]), far * torch.ones_like(rays_d[..., :1])
-    rays = torch.cat([rays_o, rays_d, near, far], -1)  # shape: (N, 8)
-
-    if use_viewdirs:
-        rays = torch.cat([rays, viewdirs], -1)
-
-    # Render and reshape
-    all_ret = batchify_rays(rays, chunk, **kwargs)
-
-    for k in all_ret:
-        k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
-        all_ret[k] = torch.reshape(all_ret[k], k_sh)
-
-    k_extract = ['rgb_map', 'disp_map', 'acc_map']
-    ret_list = [all_ret[k] for k in k_extract]
-    ret_dict = {k: all_ret[k] for k in all_ret if k not in k_extract}
-
-    return ret_list + [ret_dict]
-
-
 def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedir=None,
                 render_factor=0):
 
@@ -184,7 +89,8 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
     for i, c2w in enumerate(tqdm(render_poses)):
         # print(i, time() - t)
         t = time()
-        rgb, disp, acc, _ = render(H, W, K, chunk=chunk, c2w=c2w[:3, :4], **render_kwargs)
+        rgb, disp, acc, _ = render(H, W, K, gpu_if_available, chunk=chunk,
+                                   c2w=c2w[:3, :4], **render_kwargs)
         rgbs.append(rgb.cpu().numpy())
         disps.append(disp.cpu().numpy())
 
@@ -316,172 +222,6 @@ def create_nerf(args, initial_poses: torch.Tensor):
 
     return (render_kwargs_train, render_kwargs_test, start_iter_idx, grad_vars, optimizer,
             kf_poses_params)
-
-
-def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False):
-    """Transforms model's predictions to semantically meaningful values.
-    Args:
-        raw: [num_rays, num_samples along ray, 4]. Prediction from model.
-        z_vals: [num_rays, num_samples along ray]. Integration time.
-        rays_d: [num_rays, 3]. Direction of each ray.
-    Returns:
-        rgb_map: [num_rays, 3]. Estimated RGB color of a ray.
-        disp_map: [num_rays]. Disparity map. Inverse of depth map.
-        acc_map: [num_rays]. Sum of weights along each ray.
-        weights: [num_rays, num_samples]. Weights assigned to each sampled color.
-        depth_map: [num_rays]. Estimated distance to object.
-    """
-    def raw2alpha(raw, dists, act_fn=relu): return 1.-torch.exp(-act_fn(raw)*dists)
-
-    dists = z_vals[..., 1:] - z_vals[..., :-1]
-    dists = torch.cat([dists, torch.tensor([1e10], device=gpu_if_available).expand(
-        dists[..., :1].shape)], -1)  # [N_rays, N_samples]
-
-    dists = dists * torch.norm(rays_d[..., None, :], dim=-1)
-
-    rgb = torch.sigmoid(raw[..., :3])  # [N_rays, N_samples, 3]
-    noise = 0.
-
-    if raw_noise_std > 0.:
-        noise = torch.randn(raw[..., 3].shape, device=gpu_if_available) * raw_noise_std
-
-        # Overwrite randomly sampled data if pytest
-
-        if pytest:
-            np.random.seed(0)
-            noise = np.random.rand(*list(raw[..., 3].shape)) * raw_noise_std
-            noise = torch.tensor(noise, device=gpu_if_available)
-
-    alpha = raw2alpha(raw[..., 3] + noise, dists)  # [N_rays, N_samples]
-    # weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, -1, exclusive=True)
-    weights = alpha * \
-        torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1), device=gpu_if_available),
-                      1.-alpha + 1e-10], -1), -1)[:, :-1]
-    rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [N_rays, 3]
-
-    depth_map = torch.sum(weights * z_vals, -1)
-    disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1))
-    acc_map = torch.sum(weights, -1)
-
-    if white_bkgd:
-        rgb_map = rgb_map + (1.-acc_map[..., None])
-
-    return rgb_map, disp_map, acc_map, weights, depth_map
-
-
-def render_rays(ray_batch: torch.Tensor, network_fn: NeRF, network_query_fn: Callable,
-                N_samples: int, retraw: bool = False, lindisp: bool = False, perturb: float = 0.,
-                N_importance: int = 0, network_fine: Optional[NeRF] = None,
-                white_bkgd: bool = False, raw_noise_std: float = 0., verbose: bool = False,
-                pytest: bool = False
-                ) -> Dict:
-    """Volumetric rendering.
-    Args:
-      ray_batch: array of shape [batch_size, ...]. All information necessary
-        for sampling along a ray, including: ray origin, ray direction, min
-        dist, max dist, and unit-magnitude viewing direction.
-      network_fn: function. Model for predicting RGB and density at each point
-        in space.
-      network_query_fn: function used for passing queries to network_fn.
-      N_samples: int. Number of different times to sample along each ray.
-      retraw: bool. If True, include model's raw, unprocessed predictions.
-      lindisp: bool. If True, sample linearly in inverse depth rather than in depth.
-      perturb: float, 0 or 1. If non-zero, each ray is sampled at stratified
-        random points in time.
-      N_importance: int. Number of additional times to sample along each ray.
-        These samples are only passed to network_fine.
-      network_fine: "fine" network with same spec as network_fn.
-      white_bkgd: bool. If True, assume a white background.
-      raw_noise_std: ...
-    Returns:
-      rgb_map: [num_rays, 3]. Estimated RGB color of a ray. Comes from fine model.
-      disp_map: [num_rays]. Disparity map. 1 / depth.
-      acc_map: [num_rays]. Accumulated opacity along each ray. Comes from fine model.
-      raw: [num_rays, num_samples, 4]. Raw predictions from model.
-      rgb0: See rgb_map. Output for coarse model.
-      disp0: See disp_map. Output for coarse model.
-      acc0: See acc_map. Output for coarse model.
-      z_std: [num_rays]. Standard deviation of distances along ray for each
-        sample.
-    """
-    N_rays = ray_batch.shape[0]
-    rays_o, rays_d = ray_batch[:, 0:3], ray_batch[:, 3:6]  # [N_rays, 3] each
-    viewdirs = ray_batch[:, -3:] if ray_batch.shape[-1] > 8 else None
-    bounds = torch.reshape(ray_batch[..., 6:8], [-1, 1, 2])
-    near, far = bounds[..., 0], bounds[..., 1]  # [-1,1]
-
-    t_vals = torch.linspace(0., 1., steps=N_samples, device=gpu_if_available)
-
-    if not lindisp:
-        z_vals = near * (1.-t_vals) + far * (t_vals)
-    else:
-        z_vals = 1./(1./near * (1.-t_vals) + 1./far * (t_vals))
-
-    z_vals = z_vals.expand([N_rays, N_samples])
-
-    if perturb > 0.:
-        # get intervals between samples
-        mids = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
-        upper = torch.cat([mids, z_vals[..., -1:]], -1)
-        lower = torch.cat([z_vals[..., :1], mids], -1)
-        # stratified samples in those intervals
-        t_rand = torch.rand(z_vals.shape, device=gpu_if_available)
-
-        # Pytest, overwrite u with numpy's fixed random numbers
-
-        if pytest:
-            np.random.seed(0)
-            t_rand = np.random.rand(*list(z_vals.shape))
-            t_rand = torch.tensor(t_rand, device=gpu_if_available)
-
-        z_vals = lower + (upper - lower) * t_rand
-
-    # sk: Points to query the volume at.
-    pts = rays_o[..., None, :] + rays_d[..., None, :] * \
-        z_vals[..., :, None]  # [N_rays, N_samples, 3]
-
-
-#     raw = run_network(pts)
-    raw = network_query_fn(pts, viewdirs, network_fn)  # Shape: (N, N_samples ** 2, 5)
-    rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
-        raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
-
-    if N_importance > 0:
-
-        rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map
-
-        z_vals_mid = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
-        z_samples = sample_pdf(z_vals_mid, weights[..., 1:-1],
-                               N_importance, gpu_if_available, det=(perturb == 0.), pytest=pytest)
-        z_samples = z_samples.detach()
-
-        z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
-        pts = rays_o[..., None, :] + rays_d[..., None, :] * \
-            z_vals[..., :, None]  # [N_rays, N_samples + N_importance, 3]
-
-        run_fn = network_fn if network_fine is None else network_fine
-#         raw = run_network(pts, fn=run_fn)
-        raw = network_query_fn(pts, viewdirs, run_fn)
-
-        rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
-            raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
-
-    ret = {'rgb_map': rgb_map, 'disp_map': disp_map, 'acc_map': acc_map}
-
-    if retraw:
-        ret['raw'] = raw
-
-    if N_importance > 0:
-        ret['rgb0'] = rgb_map_0
-        ret['disp0'] = disp_map_0
-        ret['acc0'] = acc_map_0
-        ret['z_std'] = torch.std(z_samples, dim=-1, unbiased=False)  # [N_rays]
-
-    for k in ret:
-        if (torch.isnan(ret[k]).any() or torch.isinf(ret[k]).any()) and DEBUG:
-            print(f"! [Numerical Error] {k} contains nan or inf.")
-
-    return ret
 
 
 def config_parser():
@@ -630,16 +370,16 @@ def config_parser():
     parser.add_argument('--every_Nth', type=int, help='Only used if '
                         '--keyframe_creation_strategy is "every_Nth". The value of N to use when '
                         'choosing every Nth frame as a keyframe.')
-#     parser.add_argument('--keyframe_selection_strategy', choices=['all', 'every_Nth'], default='all',
-#                         help='The keyframe creation strategy to use. Choose between using every '
-#                         'frame as a keyframe or using every Nth frame as a keyframe, where N is '
-#                         'defined by --every_Nth.')
-#     parser.add_argument('--n_explore', type=int, help='Only used if '
-#                         '--keyframe_selection_strategy is "loss_explore_exploit". The number of '
-#                         'keyframes to randomly select.')
-#     parser.add_argument('--n_exploit', type=int, help='Only used if '
-#                         '--keyframe_selection_strategy is "loss_explore_exploit". The number of '
-#                         'keyframes with the highest loss to select.')
+    parser.add_argument('--keyframe_selection_strategy', choices=['all', 'explore_exploit'],
+                        default='all', help='The keyframe creation strategy to use. Choose between '
+                        'using every frame as a keyframe or using every Nth frame as a keyframe, '
+                        'where N is defined by --every_Nth.')
+    parser.add_argument('--n_explore', type=int, help='Only used if '
+                        '--keyframe_selection_strategy is "explore_exploit". The number of '
+                        'keyframes to randomly select.')
+    parser.add_argument('--n_exploit', type=int, help='Only used if '
+                        '--keyframe_selection_strategy is "explore_exploit". The number of '
+                        'keyframes with the highest loss to select.')
 
     return parser
 
@@ -729,28 +469,20 @@ def train() -> None:
 
     n_sections_per_img = grid_size ** 2
     n_total_sections = n_kfs * n_sections_per_img
-    dims_sw = (n_kfs, grid_size, grid_size)
+    dims_kf_pw = (n_kfs, grid_size, grid_size, section_height, section_width)
+    dims_kf_sw = dims_kf_pw[:3]
     if do_active_sampling:
         n_rays_to_uniformly_sample_per_img = 200
         n_total_rays_to_uniformly_sample = n_rays_to_uniformly_sample_per_img * n_kfs
-        sw_uniform_sampling_prob_dist = torch.tensor(1 / n_total_sections).repeat(dims_sw)
-        sw_train_loss = torch.zeros(dims_sw)
+        sw_unif_sampling_prob_dist = torch.tensor(1 / n_total_sections).repeat(dims_kf_sw)
+        sw_kf_loss = torch.zeros(dims_kf_sw)
         n_total_rays_to_actively_sample = N_rand
     else:
         n_total_rays_to_sample = N_rand
         sw_sampling_prob_dist = \
-            torch.tensor(1 / n_total_sections).expand(dims_sw)
+            torch.tensor(1 / n_total_sections).expand(dims_kf_sw)
 
-    sw_total_n_sampled = torch.zeros(dims_sw, dtype=torch.int64)
-
-    kf_poses = kf_initial_poses.clone()
-
-    if not do_pose_optimization:
-        # Poses are not being optimized, so we only need to compute the rays once since they will
-        # stay the same throughout all training iterations.
-        sw_rays, t_get_rays = \
-            get_sw_rays(kf_rgb_imgs, H, W, K, kf_poses, n_kfs,
-                        grid_size, section_height, section_width, gpu_if_available)
+    sw_total_n_sampled = torch.zeros(dims_kf_sw, dtype=torch.int64)
 
     start_iter_idx += 1
     n_training_iters = args.n_training_iters + 1
@@ -762,19 +494,23 @@ def train() -> None:
         log_pose_vis = train_iter_idx % args.i_pose_vis == 0
         is_first_iter = train_iter_idx == start_iter_idx
 
-        if not do_pose_optimization and not is_first_iter:
-            t_get_rays = 0.0
-        if do_pose_optimization:
-            # Poses are being optimized, so we need to compute the rays on every training iteration
-            # since they will change as the poses change.
+        # Get the keyframe poses.
+        kf_poses = get_kf_poses(kf_initial_poses, kf_poses_params, do_pose_optimization)
 
-            # Unpack the minimal representations of the poses from the optimizer's parameters, then
-            # convert them into 4x4 transformation matrices.
-            kf_poses = tfmats_from_minreps(kf_poses_params, kf_initial_poses[0])
-            # Compute the rays from the optimized poses.
-            sw_rays, t_get_rays = \
-                get_sw_rays(kf_rgb_imgs, H, W, K, kf_poses, n_kfs,
-                            grid_size, section_height, section_width, gpu_if_available)
+        # Select a subset of the keyframes to actually use in this training iteration.
+        (skf_rgb_imgs, skf_poses, skf_idxs, n_skfs, dims_skf_pw, sw_kf_loss, sw_skf_loss,
+         skf_from_kf_idxs) = \
+            select_keyframes(kf_rgb_imgs, kf_poses, kf_idxs, sw_kf_loss, H, W, K, is_first_iter,
+                             n_total_rays_to_uniformly_sample, dims_kf_pw,
+                             args.keyframe_selection_strategy, args.n_explore, args.n_exploit,
+                             sw_unif_sampling_prob_dist, tensorboard, verbose, train_iter_idx,
+                             optimizer, args.chunk, render_kwargs_train, cpu, gpu_if_available)
+        dims_skf_sw = dims_skf_pw[:3]
+
+        # Compute the rays from the selected keyframe images and poses.
+        sw_skf_rays, t_get_rays = \
+            get_sw_rays(skf_rgb_imgs, H, W, K, skf_poses, n_skfs,
+                        grid_size, section_height, section_width, gpu_if_available)
 
         if do_active_sampling:
             # If we aren't uniformly sampling on every iteration, then we should only uniformly
@@ -783,14 +519,14 @@ def train() -> None:
             t_uniform_batching = 0.0
             t_uniform_loss = 0.0
             t_uniform_rendering = 0.0
-            if do_uniform_sampling_every_iter or is_first_iter:
+            if do_uniform_sampling_every_iter:
                 # Uniform ray sampling.
-                enforce_min_samples = False if do_uniform_sampling_every_iter else True
+                enforce_min_samples = False
                 with torch.no_grad():
-                    (uniformly_sampled_rays, uniformly_sampled_pw_idxs, t_uniform_sampling) = \
-                        sample_sw_rays(sw_rays, sw_uniform_sampling_prob_dist,
+                    (uniformly_sampled_rays, uniformly_sampled_pw_idxs, sw_n_newly_sampled, t_uniform_sampling) = \
+                        sample_sw_rays(sw_skf_rays, sw_unif_sampling_prob_dist,
                                        n_total_rays_to_uniformly_sample,
-                                       n_kfs, H, W, grid_size, section_height, section_width,
+                                       H, W, dims_kf_pw,
                                        tensorboard, 'train/uniform_sampling/sampled_pixels', train_iter_idx,
                                        log_sampling_vis=log_sampling_vis, verbose=verbose,
                                        enforce_min_samples=enforce_min_samples)
@@ -803,65 +539,66 @@ def train() -> None:
 
                 t_uniform_rendering_start = perf_counter()
                 with torch.no_grad():
-                    unif_rendered_rgbs, _, _, _ = render(H, W, K, chunk=args.chunk, rays=batch_rays,
+                    unif_rendered_rgbs, _, _, _ = render(H, W, K, gpu_if_available, chunk=args.chunk, rays=batch_rays,
                                                          verbose=train_iter_idx < 10, retraw=True,
                                                          **render_kwargs_train)
                 t_uniform_rendering = perf_counter() - t_uniform_rendering_start
 
                 # Computing section-wise loss for uniformly sampled rays.
-                sampled_sw_idxs_tuple = get_idxs_tuple(uniformly_sampled_pw_idxs[:, :3])
-                sw_n_newly_sampled = get_sw_n_sampled(sampled_sw_idxs_tuple, dims_sw)
-                sw_train_loss, t_uniform_loss = \
-                    get_sw_loss(unif_rendered_rgbs, unif_gt_rgbs, sw_n_newly_sampled, sampled_sw_idxs_tuple,
-                                dims_sw, cpu)
+                # TODO: should this not be sw_kf_loss?
+                sw_kf_loss, t_uniform_loss = \
+                    get_sw_loss(unif_rendered_rgbs, unif_gt_rgbs, sw_n_newly_sampled,
+                                sampled_skf_sw_idxs_tuple,
+                                dims_kf_sw, cpu)
 
             # Active ray sampling.
-            sw_active_sampling_prob_dist = sw_train_loss / torch.sum(sw_train_loss)
-            (actively_sampled_rays, actively_sampled_pw_idxs, t_active_sampling) = \
-                sample_sw_rays(sw_rays, sw_active_sampling_prob_dist,
+            sw_active_sampling_prob_dist = sw_skf_loss / torch.sum(sw_skf_loss)
+            (sampled_rays, sampled_skf_sw_idxs, sw_n_newly_sampled, t_active_sampling) = \
+                sample_sw_rays(sw_skf_rays, sw_active_sampling_prob_dist,
                                n_total_rays_to_actively_sample,
-                               n_kfs, H, W, grid_size, section_height, section_width,
+                               H, W, dims_skf_pw,
                                tensorboard, 'train/active_sampling/sampled_pixels',
                                train_iter_idx, log_sampling_vis=log_sampling_vis,
                                verbose=verbose)
-
-            sampled_rays = actively_sampled_rays
-            sampled_pw_idxs = actively_sampled_pw_idxs
         else:
             # Active sampling is disabled, so simply sample uniformly over all sections.
-            (sampled_rays, sampled_pw_idxs, t_sampling) = \
-                sample_sw_rays(sw_rays, sw_sampling_prob_dist, n_total_rays_to_sample,
-                               n_kfs, H, W, grid_size, section_height, section_width,
+            (sampled_rays, sampled_skf_sw_idxs, sw_n_newly_sampled, t_sampling) = \
+                sample_sw_rays(sw_skf_rays, sw_sampling_prob_dist, n_total_rays_to_sample,
+                               H, W, dims_kf_pw,
                                tensorboard, 'train/sampling/sampled_pixels', train_iter_idx,
                                log_sampling_vis=log_sampling_vis, verbose=verbose)
 
         # Accumulate the total number of times each section has been sampled from so that it can be
         # visualized when log_sampling_vis is True.
-        sampled_sw_idxs_tuple = get_idxs_tuple(sampled_pw_idxs[:, :3])
-        sw_n_newly_sampled = get_sw_n_sampled(sampled_sw_idxs_tuple, dims_sw)
-        sw_total_n_sampled += sw_n_newly_sampled
+        sw_total_n_sampled[skf_from_kf_idxs] += sw_n_newly_sampled
 
-        t_batching_start = perf_counter()
-        batch = torch.transpose(sampled_rays.to(gpu_if_available), 0, 1)
-        batch_rays, train_gt_rgbs = batch[:2], batch[2]
-        t_batching = perf_counter() - t_batching_start
+        sampled_skf_sw_idxs_tuple = get_idxs_tuple(sampled_skf_sw_idxs[:, :3])
+        (train_rendered_rgbs, train_gt_rgbs, _, new_sw_skf_loss, train_loss, train_psnr, t_batching,
+         t_rendering, t_loss) = \
+            render_and_compute_loss(sampled_rays, K, render_kwargs_train, H, W, dims_skf_sw, args.chunk,
+                                    sampled_skf_sw_idxs_tuple, sw_n_newly_sampled, optimizer,
+                                    train_iter_idx, cpu, gpu_if_available)
 
-        # Core optimization loop! #
-        t_rendering_start = perf_counter()
-        train_rendered_rgbs, _, _, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
-                                                   verbose=train_iter_idx < 10, retraw=True,
-                                                   **render_kwargs_train)
-        t_rendering = perf_counter() - t_rendering_start
+#         t_batching_start = perf_counter()
+#         batch = torch.transpose(sampled_rays.to(gpu_if_available), 0, 1)
+#         batch_rays, train_gt_rgbs = batch[:2], batch[2]
+#         t_batching = perf_counter() - t_batching_start
 
-        t_loss_start = perf_counter()
-        optimizer.zero_grad()
-        train_loss = img2mse(train_rendered_rgbs, train_gt_rgbs)
-        train_psnr = mse2psnr(train_loss)
-        if 'rgb0' in extras:
-            img_loss0 = img2mse(extras['rgb0'], train_gt_rgbs)
-            train_loss += img_loss0
-            # psnr0 = mse2psnr(img_loss0)
-        t_loss = perf_counter() - t_loss_start
+#         t_rendering_start = perf_counter()
+#         train_rendered_rgbs, _, _, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
+#                                                    verbose=train_iter_idx < 10, retraw=True,
+#                                                    **render_kwargs_train)
+#         t_rendering = perf_counter() - t_rendering_start
+
+#         t_loss_start = perf_counter()
+#         optimizer.zero_grad()
+#         train_loss = img2mse(train_rendered_rgbs, train_gt_rgbs)
+#         train_psnr = mse2psnr(train_loss)
+#         if 'rgb0' in extras:
+#             img_loss0 = img2mse(extras['rgb0'], train_gt_rgbs)
+#             train_loss += img_loss0
+#             # psnr0 = mse2psnr(img_loss0)
+#         t_loss = perf_counter() - t_loss_start
 
         t_backprop_start = perf_counter()
         train_loss.backward()
@@ -926,7 +663,7 @@ def train() -> None:
                                        f'train/{sampling_name}/cumulative_samples_per_section',
                                        train_iter_idx)
 
-            add_1d_imgs_to_tensorboard(sw_train_loss, torch.Tensor([0, 0.8, 0]), tensorboard,
+            add_1d_imgs_to_tensorboard(sw_kf_loss, torch.Tensor([0, 0.8, 0]), tensorboard,
                                        'train/estimated_loss_distribution', train_iter_idx)
 
         if train_iter_idx % args.i_val == 0:
@@ -936,7 +673,8 @@ def train() -> None:
             c2w = poses[img_i, :3, :4].to(gpu_if_available)
             with torch.no_grad():
                 val_rendered_rgb, val_rendered_disp, _, extras = \
-                    render(H, W, K, chunk=args.chunk, c2w=c2w, **render_kwargs_test)
+                    render(H, W, K, gpu_if_available, chunk=args.chunk,
+                           c2w=c2w, **render_kwargs_test)
 
             val_loss = img2mse(val_rendered_rgb, val_gt_rgbs)
             val_psnr = mse2psnr(val_loss)
@@ -954,9 +692,9 @@ def train() -> None:
         if log_pose_vis:
             # Create a set of Open3D XYZ coordinate axes at the location of every initial pose and
             # optimized pose, then log them to tensorboard for visualization.
-            initial_kf_poses_np = kf_initial_poses.cpu().numpy()
+            kf_initial_poses_np = kf_initial_poses.cpu().numpy()
             kf_poses_np = kf_poses.detach().cpu().numpy()
-            initial_coordinate_frames = get_coordinate_frames(initial_kf_poses_np, gray_out=True)
+            initial_coordinate_frames = get_coordinate_frames(kf_initial_poses_np, gray_out=True)
             optimized_coordinate_frames = get_coordinate_frames(kf_poses_np)
             for idx in range(len(initial_coordinate_frames)):
                 # TODO: Efficiently store initial poses, since they are always the same at every
@@ -970,10 +708,14 @@ def train() -> None:
             # Update the estimated section-wise loss probability distribution using the loss from
             # the rays that were just actively sampled.
             with torch.no_grad():
-                new_loss, _ = get_sw_loss(train_rendered_rgbs, train_gt_rgbs, sw_n_newly_sampled,
-                                          sampled_sw_idxs_tuple, dims_sw, cpu)
+                # new_loss, _ = get_sw_loss(train_rendered_rgbs, train_gt_rgbs, sw_n_newly_sampled,
+                #                           sampled_skf_sw_idxs_tuple, dims_skf_sw, cpu)
                 # Only update the loss of sections that were sampled from.
-                sw_train_loss[sampled_sw_idxs_tuple] = new_loss[sampled_sw_idxs_tuple]
+                sampled_kf_sw_idxs_tuple = \
+                    tuple([torch.tensor([skf_from_kf_idxs[idx] for idx in sampled_skf_sw_idxs_tuple[0]]),
+                           sampled_skf_sw_idxs_tuple[1], sampled_skf_sw_idxs_tuple[2]])
+                sw_kf_loss[sampled_kf_sw_idxs_tuple] = new_sw_skf_loss[sampled_skf_sw_idxs_tuple]
+                # set_trace()
 
         t_train_iter = perf_counter() - t_train_iter_start
 
