@@ -761,7 +761,7 @@ def SO3_to_so3(R, eps=1e-7):  # [...,3,3]
     return w
 
 
-def tfmats_from_minreps(wu, world_from_camera1):  # [...,3]
+def tfmats_from_minreps(wu, world_from_camera1, gpu_if_available):  # [...,3]
     w, u = wu.split([3, 3], dim=-1)
     wx = skew_symmetric(w)
     theta = w.norm(dim=-1)[..., None, None]
@@ -773,9 +773,12 @@ def tfmats_from_minreps(wu, world_from_camera1):  # [...,3]
     V = I+B*wx+C*wx@wx
     Rt = torch.cat([R, (V@u[..., None])], dim=-1)
     camera1_from_cameras = \
-        torch.cat((Rt, torch.tensor([0, 0, 0, 1]).expand(Rt.shape[0], 1, 4)), axis=1)
+        torch.cat((Rt, torch.tensor([0, 0, 0, 1], device=gpu_if_available).expand(
+            Rt.shape[0], 1, 4)), axis=1)
+    # Convert N - 1 poses relative to first pose into N poses relative to world frame.
     world_from_cameras = \
-        torch.cat((world_from_camera1.unsqueeze(0), world_from_camera1.matmul(camera1_from_cameras)))
+        torch.cat((world_from_camera1.unsqueeze(0),
+                   world_from_camera1.matmul(camera1_from_cameras)))
 
     return world_from_cameras
 

@@ -731,6 +731,7 @@ def train() -> None:
             get_sw_rays(train_rgb_imgs, H, W, K, train_poses, n_train_imgs,
                         grid_size, section_height, section_width, gpu_if_available)
 
+    open3d_vis_count = 1
     start_iter_idx += 1
     n_training_iters = args.n_training_iters + 1
     tqdm_bar = trange(start_iter_idx, n_training_iters)
@@ -749,7 +750,8 @@ def train() -> None:
 
             # Unpack the minimal representations of the poses from the optimizer's parameters, then
             # convert them into 4x4 transformation matrices.
-            train_poses = tfmats_from_minreps(train_poses_params, initial_train_poses[0])
+            train_poses = tfmats_from_minreps(train_poses_params, first_initial_train_pose,
+                                              gpu_if_available)
             # Compute the rays from the optimized poses.
             sw_rays, t_get_rays = \
                 get_sw_rays(train_rgb_imgs, H, W, K, train_poses, n_train_imgs,
@@ -935,9 +937,13 @@ def train() -> None:
                 # TODO: Efficiently store initial poses, since they are always the same at every
                 # iteration.
                 tensorboard.add_3d(f'train/pose{idx:03d}-initial',
-                                   to_dict_batch([initial_coordinate_frames[idx]]), step=train_iter_idx)
+                                   to_dict_batch([initial_coordinate_frames[idx]]),
+                                   step=open3d_vis_count)
                 tensorboard.add_3d(f'train/pose{idx:03d}-optimized',
-                                   to_dict_batch([optimized_coordinate_frames[idx]]), step=train_iter_idx)
+                                   to_dict_batch([optimized_coordinate_frames[idx]]),
+                                   step=open3d_vis_count)
+
+            open3d_vis_count += 1
 
         if do_active_sampling and not do_uniform_sampling_every_iter:
             # Update the estimated section-wise loss probability distribution using the loss from
