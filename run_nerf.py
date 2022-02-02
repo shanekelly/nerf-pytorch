@@ -335,7 +335,7 @@ def config_parser():
                         help='frequency of tensorboard image logging')
     parser.add_argument("--i_weights", type=int, default=10000,
                         help='frequency of weight ckpt saving')
-    parser.add_argument("--i_test", type=int, default=50000,
+    parser.add_argument("--i_test", type=int, default=5000,
                         help='frequency of testset saving')
     parser.add_argument("--i_video",   type=int, default=50000,
                         help='frequency of render_poses video saving')
@@ -646,7 +646,7 @@ def train() -> None:
                     render_kwargs_test,
                     gt_imgs=test_rgb_imgs, savedir=testsavedir)
             test_rendered_rgbs = torch.from_numpy(test_rendered_rgbs_np)
-            test_loss = img2mse(test_rendered_rgbs, test_rgb_imgs)
+            test_loss = img2mse(test_rendered_rgbs, test_rgb_imgs.to(cpu))
             test_psnr = mse2psnr(test_loss)
 
             tensorboard.add_images('test/rgb', pad_imgs(test_rendered_rgbs, white_rgb, 5),

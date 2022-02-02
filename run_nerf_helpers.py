@@ -952,7 +952,7 @@ def get_sw_loss(rendered_rgbs: torch.Tensor, gt_rgbs: torch.Tensor, sw_n_sampled
 
     if 'rgb0' in extras:
         # Get section-wise fine loss.
-        sw_loss += get_sw_coarse_or_fine_loss(extras['rgb0'])
+        sw_loss += get_sw_coarse_or_fine_loss(extras['rgb0'].to(cpu))
 
     t_delta = perf_counter() - t_start
 
