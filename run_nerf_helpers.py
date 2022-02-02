@@ -20,7 +20,9 @@ from load_LINEMOD import load_LINEMOD_data
 from load_bonn import load_bonn_data
 
 
-# Misc
+white_rgb = torch.tensor([1.0]).expand(3)
+
+
 def img2mse(x, y): return torch.mean((x - y) ** 2)
 def mse2psnr(x): return -10. * torch.log(x) / torch.log(torch.tensor([10.], device=x.device))
 
@@ -752,12 +754,69 @@ def nd_idxs_from_1d_idxs(flat_idxs: torch.Tensor, n_elems_per_chunks: torch.Tens
     return nd_idxs
 
 
+def pad_imgs(imgs: torch.Tensor, padding_rgb: torch.Tensor, padding_width: int
+             ) -> torch.Tensor:
+    assert imgs.dim() == 4  # Shape (N, H, W, C).
+    assert imgs.shape[-1] == 3  # C is RGB.
+
+    padded_imgs = imgs.clone()
+
+    padding_top_bottom = padding_rgb.expand(imgs.shape[0], padding_width, imgs.shape[2], 3)
+    padded_imgs = torch.cat((padding_top_bottom, padded_imgs, padding_top_bottom), dim=1)
+    padding_left_right = \
+        padding_rgb.expand(imgs.shape[0], imgs.shape[1] + 2 * padding_width, padding_width, 3)
+    padded_imgs = torch.cat((padding_left_right, padded_imgs, padding_left_right), dim=2)
+
+    return padded_imgs
+
+
+def pad_sections(imgs: torch.Tensor, dims_pw: Tuple[int, int, int, int, int],
+                 padding_rgb: torch.Tensor, padding_width: int
+                 ) -> torch.Tensor:
+    n_imgs, img_height, img_width, _ = imgs.shape
+    _, grid_size, _, section_height, section_width = dims_pw
+
+    n_pads = grid_size + 2
+    n_pad_pixels_per_axis = padding_width * n_pads
+    padded_imgs = padding_rgb.repeat(n_imgs, img_height + n_pad_pixels_per_axis,
+                                     img_width + n_pad_pixels_per_axis, 1)
+
+    # Draw all of the image sections on the sampling visualization images.
+    for grid_row_idx, grid_col_idx in product(range(grid_size), range(grid_size)):
+        section_row_start_idx = grid_row_idx * section_height
+        padded_section_row_start_idx = section_row_start_idx + (grid_row_idx + 1) * padding_width
+        section_row_stop_idx = section_row_start_idx + section_height
+        padded_section_row_stop_idx = padded_section_row_start_idx + section_height
+
+        section_col_start_idx = grid_col_idx * section_width
+        padded_section_col_start_idx = section_col_start_idx + (grid_col_idx + 1) * padding_width
+        section_col_stop_idx = section_col_start_idx + section_width
+        padded_section_col_stop_idx = padded_section_col_start_idx + section_width
+
+        padded_imgs[:, padded_section_row_start_idx:padded_section_row_stop_idx,
+                    padded_section_col_start_idx:padded_section_col_stop_idx] = \
+            imgs[:, section_row_start_idx:section_row_stop_idx,
+                 section_col_start_idx:section_col_stop_idx, :]
+
+    return padded_imgs
+
+
 def sample_sw_rays(sw_rays: torch.Tensor, sw_sampling_prob_dist: torch.Tensor,
-                   n_total_rays_to_sample: int, img_height: int, img_width: int,
-                   dims_kf_pw: Tuple[int, int, int, int, int], tensorboard: SummaryWriter,
+                   n_total_rays_to_sample: int, kf_rgb_imgs: torch.Tensor, img_height: int, img_width: int,
+                   dims_kf_pw: Tuple[int, int, int, int, int], dims_pw: Tuple[int, int, int, int,
+                                                                              int],
+                   sampled_from_kf_idxs, tensorboard: SummaryWriter,
                    tensorboard_tag: str, train_iter_idx: int, log_sampling_vis: bool = False,
                    verbose: bool = False, enforce_min_samples: bool = False
                    ) -> Tuple[torch.Tensor, torch.Tensor, float]:
+    """
+    @param dims_kf_pw - Pixel-wise dimensions of all keyframes. At least needed for visualizing all
+    keyframes during the sampling visualization.
+    @param dims_pw - Pixel-wise dimensions of whatever frames are being sampled from. If sampling
+    from all keyframes, then this will be equal to dims_kf_pw. If sampling from selected keyframes,
+    then this will be equal to dims_kf_pw except for the first element, which will store the number
+    of selected keyframes.
+    """
     t_start = perf_counter()
 
     if verbose:
@@ -765,6 +824,8 @@ def sample_sw_rays(sw_rays: torch.Tensor, sw_sampling_prob_dist: torch.Tensor,
 
     n_kfs, grid_size, _, section_height, section_width = dims_kf_pw
     dims_kf_sw = dims_kf_pw[:3]
+
+    dims_sw = dims_pw[:3]
 
     # Values for converting between flat idxs and section-wise / pixel-wise indices.
     n_pixels_per_section = section_height * section_width
@@ -819,42 +880,26 @@ def sample_sw_rays(sw_rays: torch.Tensor, sw_sampling_prob_dist: torch.Tensor,
     sampled_pw_idxs = nd_idxs_from_1d_idxs(sampled_flat_idxs, n_pixels_per_chunks)
 
     sampled_sw_idxs_tuple = get_idxs_tuple(sampled_pw_idxs[:, :3])
-    sw_n_newly_sampled = get_sw_n_sampled(sampled_sw_idxs_tuple, dims_kf_sw)
+    sw_n_newly_sampled = get_sw_n_sampled(sampled_sw_idxs_tuple, dims_sw)
 
     if log_sampling_vis:
-        # The number of white pixels between each grid section.
-        section_padding_size = 5
-        n_pads = grid_size + 2
-        n_pad_pixels_per_axis = section_padding_size * n_pads
-        sampling_vis_imgs = torch.ones((n_kfs, img_height + n_pad_pixels_per_axis,
-                                        img_width + n_pad_pixels_per_axis, 3), device='cpu')
+        section_padding_width = 2
+        sampling_vis_imgs = pad_sections(kf_rgb_imgs, dims_kf_pw, white_rgb,
+                                         section_padding_width)
         sampling_vis_imgs_np = sampling_vis_imgs.numpy()
-
-        # Draw all of the image sections on the sampling visualization images.
-        for img_idx, grid_row_idx, grid_col_idx in product(range(n_kfs), range(grid_size),
-                                                           range(grid_size)):
-            section_row_start_idx = (grid_row_idx + 1) * section_padding_size + \
-                grid_row_idx * section_height
-            section_row_stop_idx = section_row_start_idx + section_height
-            section_col_start_idx = (grid_col_idx + 1) * section_padding_size + \
-                grid_col_idx * section_width
-            section_col_stop_idx = section_col_start_idx + section_width
-
-            sampling_vis_imgs[img_idx, section_row_start_idx:section_row_stop_idx,
-                              section_col_start_idx:section_col_stop_idx] = \
-                sw_rays[img_idx, grid_row_idx, grid_col_idx, :, :, 2]
 
         # Draw a dot at the location of every sampled pixel.
         for img_idx, grid_row_idx, grid_col_idx, pixel_row_idx, pixel_col_idx in sampled_pw_idxs:
-            section_row_start_idx = (grid_row_idx + 1) * section_padding_size + \
+            kf_idx = sampled_from_kf_idxs[img_idx]
+            section_row_start_idx = (grid_row_idx + 1) * section_padding_width + \
                 grid_row_idx * section_height
-            section_col_start_idx = (grid_col_idx + 1) * section_padding_size + \
+            section_col_start_idx = (grid_col_idx + 1) * section_padding_width + \
                 grid_col_idx * section_width
 
             pixel_row_idx = (pixel_row_idx + section_row_start_idx).item()
             pixel_col_idx = (pixel_col_idx + section_col_start_idx).item()
 
-            sampling_vis_img_np = sampling_vis_imgs_np[img_idx]
+            sampling_vis_img_np = sampling_vis_imgs_np[kf_idx]
             # circle(sampling_vis_img_np, (pixel_col_idx, pixel_row_idx), 3, (0, 0, 0), FILLED)
             # circle(sampling_vis_img_np, (pixel_col_idx, pixel_row_idx), 2, (1, 1, 1), FILLED)
             circle(sampling_vis_img_np, (pixel_col_idx, pixel_row_idx), 1, (1, 0, 0), FILLED)
@@ -959,22 +1004,6 @@ def get_sw_loss(rendered_rgbs: torch.Tensor, gt_rgbs: torch.Tensor, sw_n_sampled
     return sw_loss, t_delta
 
 
-def pad_imgs(imgs: torch.Tensor, padding_rgb: torch.Tensor, padding_width: int
-             ) -> torch.Tensor:
-    assert imgs.dim() == 4  # Shape (N, H, W, C).
-    assert imgs.shape[-1] == 3  # C is RGB.
-
-    padded_imgs = imgs.clone()
-
-    padding_top_bottom = padding_rgb.expand(imgs.shape[0], padding_width, imgs.shape[2], 3)
-    padded_imgs = torch.cat((padding_top_bottom, padded_imgs, padding_top_bottom), dim=1)
-    padding_left_right = \
-        padding_rgb.expand(imgs.shape[0], imgs.shape[1] + 2 * padding_width, padding_width, 3)
-    padded_imgs = torch.cat((padding_left_right, padded_imgs, padding_left_right), dim=2)
-
-    return padded_imgs
-
-
 def add_1d_imgs_to_tensorboard(imgs: torch.Tensor, img_rgb: torch.Tensor,
                                tensorboard: SummaryWriter, tag: str, iter_idx: int,
                                padding_rgb: torch.Tensor = torch.tensor([0.6]).expand(3),
@@ -1064,13 +1093,11 @@ def tfmats_from_minreps(wu, world_from_camera1, gpu_if_available):  # [...,3]
     R = I+A*wx+B*wx@wx
     V = I+B*wx+C*wx@wx
     Rt = torch.cat([R, (V@u[..., None])], dim=-1)
-    camera1_from_cameras = \
-        torch.cat((Rt, torch.tensor([0, 0, 0, 1], device=gpu_if_available).expand(
-            Rt.shape[0], 1, 4)), axis=1)
+    camera1_from_cameras = torch.cat((Rt, torch.tensor([0, 0, 0, 1], device=gpu_if_available).expand(
+        Rt.shape[0], 1, 4)), axis=1)
     # Convert N - 1 poses relative to first pose into N poses relative to world frame.
-    world_from_cameras = \
-        torch.cat((world_from_camera1.unsqueeze(0),
-                   world_from_camera1.matmul(camera1_from_cameras)))
+    world_from_cameras = torch.cat((world_from_camera1.unsqueeze(0),
+                                    world_from_camera1.matmul(camera1_from_cameras)))
 
     return world_from_cameras
 
@@ -1154,17 +1181,15 @@ def render_and_compute_loss(rays, intrinsics_matrix, render_kwargs_train, img_he
     t_batching = perf_counter() - t_batching_start
 
     t_rendering_start = perf_counter()
-    rendered_rgbs, rendered_disps, _, extras = \
-        render(img_height, img_width, intrinsics_matrix, gpu_if_available, chunk=chunk, rays=batch_rays,
-               verbose=train_iter_idx < 10, retraw=True, **render_kwargs_train)
+    rendered_rgbs, rendered_disps, _, extras = render(img_height, img_width, intrinsics_matrix, gpu_if_available, chunk=chunk, rays=batch_rays,
+                                                      verbose=train_iter_idx < 10, retraw=True, **render_kwargs_train)
     t_rendering = perf_counter() - t_rendering_start
 
     t_loss_start = perf_counter()
     optimizer.zero_grad()
 
-    sw_loss, t_loss = \
-        get_sw_loss(rendered_rgbs, gt_rgbs, sw_n_newly_sampled, sampled_sw_idxs_tuple, extras,
-                    dims_kf_sw, cpu)
+    sw_loss, t_loss = get_sw_loss(rendered_rgbs, gt_rgbs, sw_n_newly_sampled, sampled_sw_idxs_tuple, extras,
+                                  dims_kf_sw, cpu)
 
     loss = torch.mean(sw_loss)
     psnr = mse2psnr(loss)
@@ -1205,13 +1230,14 @@ def select_keyframes(kf_rgb_imgs, kf_poses, kf_idxs, sw_kf_loss, img_height, img
             with torch.no_grad():
                 sw_kf_rays, _ = \
                     get_sw_rays(kf_rgb_imgs, img_height, img_width, intrinsics_matrix, kf_poses,
-                                n_kfs,
-                                grid_size, section_height, section_width, gpu_if_available)
+                                n_kfs, grid_size, section_height, section_width, gpu_if_available)
             (sampled_rays, sampled_pw_idxs, sw_n_newly_sampled, t_uniform_sampling) = \
                 sample_sw_rays(sw_kf_rays, sw_unif_sampling_prob_dist,
-                               n_total_rays_to_uniformly_sample, img_height, img_width, dims_kf_pw,
-                               tensorboard, 'train/uniform_sampling/sampled_pixels', train_iter_idx,
-                               log_sampling_vis=True, verbose=verbose, enforce_min_samples=True)
+                               n_total_rays_to_uniformly_sample, kf_rgb_imgs, img_height, img_width,
+                               dims_kf_pw, dims_kf_pw, torch.arange(
+                                   dims_kf_pw[0]), tensorboard, 'train/uniform_sampling/sampled_pixels',
+                               train_iter_idx, log_sampling_vis=True, verbose=verbose,
+                               enforce_min_samples=True)
             sampled_sw_idxs_tuple = get_idxs_tuple(sampled_pw_idxs[:, :3])
             _, _, _, sw_kf_loss, _, _, _, _, _ = \
                 render_and_compute_loss(sampled_rays, intrinsics_matrix, render_kwargs_train,
@@ -1222,18 +1248,17 @@ def select_keyframes(kf_rgb_imgs, kf_poses, kf_idxs, sw_kf_loss, img_height, img
         kf_losses = torch.sum(sw_kf_loss, dim=(1, 2))
         idxs_descending_loss = torch.argsort(kf_losses, descending=True)
         idxs_exploit = idxs_descending_loss[:n_exploit]
-        idxs_remaining = \
-            torch.tensor(list(set(range(len(kf_idxs))) - set(idxs_exploit.tolist())),
-                         dtype=torch.int64)
-        idxs_explore = \
-            idxs_remaining[torch.randperm(idxs_remaining.shape[0])[:n_explore]]
+        idxs_remaining = torch.tensor(list(set(range(len(kf_idxs))) - set(idxs_exploit.tolist())),
+                                      dtype=torch.int64)
+        idxs_explore = idxs_remaining[torch.randperm(idxs_remaining.shape[0])[:n_explore]]
         skf_from_kf_idxs, _ = torch.sort(torch.cat((idxs_explore, idxs_exploit)))
 
         skf_rgb_imgs = kf_rgb_imgs[skf_from_kf_idxs]
         skf_poses = kf_poses[skf_from_kf_idxs]
         skf_idxs = kf_idxs[skf_from_kf_idxs]
         n_skfs = skf_idxs.shape[0]
-        sw_skf_loss = sw_kf_loss[skf_from_kf_idxs]
+        sw_skf_loss = torch.zeros_like(sw_kf_loss)
+        sw_skf_loss[skf_from_kf_idxs] = sw_kf_loss[skf_from_kf_idxs]
 
     else:
         raise RuntimeError(

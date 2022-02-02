@@ -21,9 +21,9 @@ from tqdm import tqdm, trange
 from run_nerf_helpers import (add_1d_imgs_to_tensorboard, create_keyframes, get_coordinate_frames,
                               get_idxs_tuple, get_kf_poses, get_sw_n_sampled, get_sw_rays,
                               get_embedder, get_rays, get_sw_loss, img2mse, load_data, mse2psnr,
-                              NeRF, ndc_rays, pad_imgs, render, render_and_compute_loss, sample_pdf,
-                              sample_sw_rays, select_keyframes, to8b, tfmats_from_minreps,
-                              minreps_from_tfmats)
+                              NeRF, ndc_rays, pad_imgs, pad_sections, render,
+                              render_and_compute_loss, sample_pdf, sample_sw_rays, select_keyframes,
+                              to8b, tfmats_from_minreps, minreps_from_tfmats, white_rgb)
 
 
 cpu = torch.device('cpu')
@@ -35,8 +35,6 @@ else:
     print('GPU not available!')
 np.random.seed(0)
 DEBUG = False
-
-white_rgb = torch.tensor([1.0]).expand(3)
 
 
 def batchify(fn, chunk):
@@ -484,6 +482,9 @@ def train() -> None:
 
     sw_total_n_sampled = torch.zeros(dims_kf_sw, dtype=torch.int64)
 
+    tensorboard.add_images('train/keyframes', pad_sections(kf_rgb_imgs, dims_kf_pw, white_rgb,
+                                                           padding_width=2), global_step=1, dataformats='NHWC')
+
     open3d_vis_count = 1
     start_iter_idx += 1
     n_training_iters = args.n_training_iters + 1
@@ -555,9 +556,9 @@ def train() -> None:
             # Active ray sampling.
             sw_active_sampling_prob_dist = sw_skf_loss / torch.sum(sw_skf_loss)
             (sampled_rays, sampled_skf_sw_idxs, sw_n_newly_sampled, t_active_sampling) = \
-                sample_sw_rays(sw_skf_rays, sw_active_sampling_prob_dist,
+                sample_sw_rays(sw_skf_rays, sw_active_sampling_prob_dist[skf_from_kf_idxs],
                                n_total_rays_to_actively_sample,
-                               H, W, dims_skf_pw,
+                               kf_rgb_imgs, H, W, dims_kf_pw, dims_skf_pw, skf_from_kf_idxs,
                                tensorboard, 'train/active_sampling/sampled_pixels',
                                train_iter_idx, log_sampling_vis=log_sampling_vis,
                                verbose=verbose)
