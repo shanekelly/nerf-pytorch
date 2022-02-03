@@ -20,8 +20,8 @@ from tqdm import tqdm, trange
 
 from run_nerf_helpers import (add_1d_imgs_to_tensorboard, create_keyframes, get_coordinate_frames,
                               get_idxs_tuple, get_kf_poses, get_sw_n_sampled, get_sw_rays,
-                              get_embedder, get_rays, get_sw_loss, img2mse, load_data, mse2psnr,
-                              NeRF, ndc_rays, pad_imgs, pad_sections, render,
+                              get_embedder, get_rays, get_sw_loss, img2mse, initialize_sw_kf_loss,
+                              load_data, mse2psnr, NeRF, ndc_rays, pad_imgs, pad_sections, render,
                               render_and_compute_loss, sample_pdf, sample_sw_rays, select_keyframes,
                               to8b, tfmats_from_minreps, minreps_from_tfmats, white_rgb)
 
@@ -68,15 +68,15 @@ def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     return outputs
 
 
-def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedir=None,
+def render_path(render_poses, hwf, intrinsics_matrix, chunk, render_kwargs, gt_imgs=None, savedir=None,
                 render_factor=0):
 
-    H, W, focal = hwf
+    img_height, img_width, focal = hwf
 
     if render_factor != 0:
         # Render downsampled for speed
-        H = H//render_factor
-        W = W//render_factor
+        img_height = img_height//render_factor
+        img_width = img_width//render_factor
         focal = focal/render_factor
 
     rgbs = []
@@ -87,7 +87,7 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
     for i, c2w in enumerate(tqdm(render_poses)):
         # print(i, time() - t)
         t = time()
-        rgb, disp, acc, _ = render(H, W, K, gpu_if_available, chunk=chunk,
+        rgb, disp, acc, _ = render(img_height, img_width, intrinsics_matrix, gpu_if_available, chunk=chunk,
                                    c2w=c2w[:3, :4], **render_kwargs)
         rgbs.append(rgb.cpu().numpy())
         disps.append(disp.cpu().numpy())
@@ -134,7 +134,7 @@ def create_nerf(args, initial_poses: torch.Tensor):
         embeddirs_fn, input_ch_views = get_embedder(args.multires_views, args.i_embed)
     output_ch = 5 if args.N_importance > 0 else 4
     skips = [4]
-    model = NeRF(D=args.netdepth, W=args.netwidth,
+    model = NeRF(D=args.netdepth, img_width=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
                  input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(gpu_if_available)
     grad_vars = list(model.parameters())
@@ -142,7 +142,7 @@ def create_nerf(args, initial_poses: torch.Tensor):
     model_fine = None
 
     if args.N_importance > 0:
-        model_fine = NeRF(D=args.netdepth_fine, W=args.netwidth_fine,
+        model_fine = NeRF(D=args.netdepth_fine, img_width=args.netwidth_fine,
                           input_ch=input_ch, output_ch=output_ch, skips=skips,
                           input_ch_views=input_ch_views,
                           use_viewdirs=args.use_viewdirs).to(gpu_if_available)
@@ -353,7 +353,7 @@ def config_parser():
     parser.add_argument('--verbose', action='store_true', help='True to print additional info.')
     parser.add_argument('--no_active_sampling', action='store_true', help='Set to disable active '
                         'sampling.')
-    parser.add_argument('--uniformly_sample_every_iteration', action='store_true', help='Set to '
+    parser.add_argument('--no_lazy_sw_loss', action='store_true', help='Set to '
                         'uniformly sampled over every image on every iteration in order to '
                         'maintain the estimated probability distribution of loss over image. If '
                         'not set, then all images will be uniformly sampled once at the start, '
@@ -389,7 +389,7 @@ def train() -> None:
     tensorboard = SummaryWriter(Path(args.basedir) / args.expname, flush_secs=10)
 
     # Load data from specified dataset.
-    (rgb_imgs, depth_imgs, hwf, H, W, focal, K, poses, render_poses, train_idxs, test_idxs,
+    (rgb_imgs, depth_imgs, hwf, img_height, img_width, focal, intrinsics_matrix, poses, render_poses, train_idxs, test_idxs,
      val_idxs, near, far) = load_data(args, gpu_if_available)
     test_rgb_imgs = rgb_imgs[test_idxs]
     test_poses = poses[test_idxs]
@@ -443,7 +443,7 @@ def train() -> None:
             print('test poses shape', render_poses.shape)
 
             rgbs, _ = \
-                render_path(render_poses, hwf, K, args.chunk, render_kwargs_test, gt_imgs=rgb_imgs,
+                render_path(render_poses, hwf, intrinsics_matrix, args.chunk, render_kwargs_test, gt_imgs=rgb_imgs,
                             savedir=testsavedir, render_factor=args.render_factor)
             print('Done rendering', testsavedir)
             imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
@@ -457,29 +457,33 @@ def train() -> None:
     verbose = args.verbose
     grid_size = args.img_grid_side_len
     do_active_sampling = not args.no_active_sampling
-    do_uniform_sampling_every_iter = args.uniformly_sample_every_iteration
+    do_lazy_sw_loss = not args.no_lazy_sw_loss
     do_pose_optimization = not args.no_pose_optimization
 
-    assert H % grid_size == 0
-    assert W % grid_size == 0
-    section_height = H // grid_size
-    section_width = W // grid_size
+    assert img_height % grid_size == 0
+    assert img_width % grid_size == 0
+    section_height = img_height // grid_size
+    section_width = img_width // grid_size
 
     n_sections_per_img = grid_size ** 2
     n_total_sections = n_kfs * n_sections_per_img
     dims_kf_pw = (n_kfs, grid_size, grid_size, section_height, section_width)
     dims_kf_sw = dims_kf_pw[:3]
     if do_active_sampling:
-        n_rays_to_uniformly_sample_per_img = 200
-        n_total_rays_to_uniformly_sample = n_rays_to_uniformly_sample_per_img * n_kfs
+        n_rays_to_unif_sample_per_img = 200
+        n_total_rays_to_unif_sample = n_rays_to_unif_sample_per_img * n_kfs
         sw_unif_sampling_prob_dist = torch.tensor(1 / n_total_sections).repeat(dims_kf_sw)
-        sw_kf_loss = torch.zeros(dims_kf_sw)
         n_total_rays_to_actively_sample = N_rand
     else:
         n_total_rays_to_sample = N_rand
         sw_sampling_prob_dist = \
             torch.tensor(1 / n_total_sections).expand(dims_kf_sw)
 
+    sw_kf_loss = \
+        initialize_sw_kf_loss(kf_rgb_imgs, kf_initial_poses, sw_unif_sampling_prob_dist, dims_kf_pw,
+                              intrinsics_matrix, n_total_rays_to_unif_sample, render_kwargs_train,
+                              args.chunk, optimizer, do_active_sampling, tensorboard,
+                              cpu, gpu_if_available, verbose=verbose)
     sw_total_n_sampled = torch.zeros(dims_kf_sw, dtype=torch.int64)
 
     tensorboard.add_images('train/keyframes', pad_sections(kf_rgb_imgs, dims_kf_pw, white_rgb,
@@ -494,16 +498,16 @@ def train() -> None:
 
         log_sampling_vis = train_iter_idx % args.i_sampling_vis == 0
         log_pose_vis = train_iter_idx % args.i_pose_vis == 0
-        is_first_iter = train_iter_idx == start_iter_idx
+        is_start_iter = train_iter_idx == start_iter_idx
 
         # Get the keyframe poses.
         kf_poses = get_kf_poses(kf_initial_poses, kf_poses_params, do_pose_optimization)
 
         # Select a subset of the keyframes to actually use in this training iteration.
-        (skf_rgb_imgs, skf_poses, skf_idxs, n_skfs, dims_skf_pw, sw_kf_loss, sw_skf_loss,
-         skf_from_kf_idxs) = \
-            select_keyframes(kf_rgb_imgs, kf_poses, kf_idxs, sw_kf_loss, H, W, K, is_first_iter,
-                             n_total_rays_to_uniformly_sample, dims_kf_pw,
+        skf_rgb_imgs, skf_poses, skf_idxs, n_skfs, dims_skf_pw, sw_skf_loss, skf_from_kf_idxs = \
+            select_keyframes(kf_rgb_imgs, kf_poses, kf_idxs, sw_kf_loss, img_height, img_width,
+                             intrinsics_matrix, is_start_iter,
+                             n_total_rays_to_unif_sample, dims_kf_pw,
                              args.keyframe_selection_strategy, args.n_explore, args.n_exploit,
                              sw_unif_sampling_prob_dist, tensorboard, verbose, train_iter_idx,
                              optimizer, args.chunk, render_kwargs_train, cpu, gpu_if_available)
@@ -511,7 +515,7 @@ def train() -> None:
 
         # Compute the rays from the selected keyframe images and poses.
         sw_skf_rays, t_get_rays = \
-            get_sw_rays(skf_rgb_imgs, H, W, K, skf_poses, n_skfs,
+            get_sw_rays(skf_rgb_imgs, img_height, img_width, intrinsics_matrix, skf_poses, n_skfs,
                         grid_size, section_height, section_width, gpu_if_available)
 
         if do_active_sampling:
@@ -521,27 +525,27 @@ def train() -> None:
             t_uniform_batching = 0.0
             t_uniform_loss = 0.0
             t_uniform_rendering = 0.0
-            if do_uniform_sampling_every_iter:
+            if not do_lazy_sw_loss:
                 # Uniform ray sampling.
                 enforce_min_samples = False
                 with torch.no_grad():
-                    (uniformly_sampled_rays, uniformly_sampled_pw_idxs, sw_n_newly_sampled, t_uniform_sampling) = \
+                    (unif_sampled_rays, unif_sampled_pw_idxs, sw_n_newly_sampled, t_uniform_sampling) = \
                         sample_sw_rays(sw_skf_rays, sw_unif_sampling_prob_dist,
-                                       n_total_rays_to_uniformly_sample,
-                                       H, W, dims_kf_pw,
+                                       n_total_rays_to_unif_sample,
+                                       img_height, img_width, dims_kf_pw,
                                        tensorboard, 'train/uniform_sampling/sampled_pixels', train_iter_idx,
                                        log_sampling_vis=log_sampling_vis, verbose=verbose,
                                        enforce_min_samples=enforce_min_samples)
 
                 # Render the uniformly sampled rays.
                 t_uniform_batching_start = perf_counter()
-                batch = torch.transpose(uniformly_sampled_rays, 0, 1).to(gpu_if_available)
+                batch = torch.transpose(unif_sampled_rays, 0, 1).to(gpu_if_available)
                 batch_rays, unif_gt_rgbs = batch[:2], batch[2]
                 t_uniform_batching = perf_counter() - t_uniform_batching_start
 
                 t_uniform_rendering_start = perf_counter()
                 with torch.no_grad():
-                    unif_rendered_rgbs, _, _, _ = render(H, W, K, gpu_if_available, chunk=args.chunk, rays=batch_rays,
+                    unif_rendered_rgbs, _, _, _ = render(img_height, img_width, intrinsics_matrix, gpu_if_available, chunk=args.chunk, rays=batch_rays,
                                                          verbose=train_iter_idx < 10, retraw=True,
                                                          **render_kwargs_train)
                 t_uniform_rendering = perf_counter() - t_uniform_rendering_start
@@ -558,7 +562,7 @@ def train() -> None:
             (sampled_rays, sampled_skf_sw_idxs, sw_n_newly_sampled, t_active_sampling) = \
                 sample_sw_rays(sw_skf_rays, sw_active_sampling_prob_dist[skf_from_kf_idxs],
                                n_total_rays_to_actively_sample,
-                               kf_rgb_imgs, H, W, dims_kf_pw, dims_skf_pw, skf_from_kf_idxs,
+                               kf_rgb_imgs, img_height, img_width, dims_kf_pw, dims_skf_pw, skf_from_kf_idxs,
                                tensorboard, 'train/active_sampling/sampled_pixels',
                                train_iter_idx, log_sampling_vis=log_sampling_vis,
                                verbose=verbose)
@@ -566,7 +570,7 @@ def train() -> None:
             # Active sampling is disabled, so simply sample uniformly over all sections.
             (sampled_rays, sampled_skf_sw_idxs, sw_n_newly_sampled, t_sampling) = \
                 sample_sw_rays(sw_skf_rays, sw_sampling_prob_dist, n_total_rays_to_sample,
-                               H, W, dims_kf_pw,
+                               img_height, img_width, dims_kf_pw,
                                tensorboard, 'train/sampling/sampled_pixels', train_iter_idx,
                                log_sampling_vis=log_sampling_vis, verbose=verbose)
 
@@ -577,7 +581,7 @@ def train() -> None:
         sampled_skf_sw_idxs_tuple = get_idxs_tuple(sampled_skf_sw_idxs[:, :3])
         (train_rendered_rgbs, train_gt_rgbs, _, new_sw_skf_loss, train_loss, train_psnr, t_batching,
          t_rendering, t_loss) = \
-            render_and_compute_loss(sampled_rays, K, render_kwargs_train, H, W, dims_skf_sw, args.chunk,
+            render_and_compute_loss(sampled_rays, intrinsics_matrix, render_kwargs_train, img_height, img_width, dims_skf_sw, args.chunk,
                                     sampled_skf_sw_idxs_tuple, sw_n_newly_sampled, optimizer,
                                     train_iter_idx, cpu, gpu_if_available)
 
@@ -587,7 +591,7 @@ def train() -> None:
 #         t_batching = perf_counter() - t_batching_start
 
 #         t_rendering_start = perf_counter()
-#         train_rendered_rgbs, _, _, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
+#         train_rendered_rgbs, _, _, extras = render(img_height, img_width, intrinsics_matrix, chunk=args.chunk, rays=batch_rays,
 #                                                    verbose=train_iter_idx < 10, retraw=True,
 #                                                    **render_kwargs_train)
 #         t_rendering = perf_counter() - t_rendering_start
@@ -631,7 +635,8 @@ def train() -> None:
         if train_iter_idx % args.i_video == 0 and train_iter_idx > 0:
             # Turn on testing mode
             with torch.no_grad():
-                rgbs, disps = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test)
+                rgbs, disps = render_path(render_poses, hwf, intrinsics_matrix,
+                                          args.chunk, render_kwargs_test)
             print('Done, saving', rgbs.shape, disps.shape)
             moviebase = os.path.join(basedir, expname, '{}_spiral_{:06d}_'.format(expname,
                                                                                   train_iter_idx))
@@ -643,7 +648,7 @@ def train() -> None:
             os.makedirs(testsavedir, exist_ok=True)
             with torch.no_grad():
                 test_rendered_rgbs_np, _ = render_path(
-                    test_poses.to(gpu_if_available), hwf, K, args.chunk,
+                    test_poses.to(gpu_if_available), hwf, intrinsics_matrix, args.chunk,
                     render_kwargs_test,
                     gt_imgs=test_rgb_imgs, savedir=testsavedir)
             test_rendered_rgbs = torch.from_numpy(test_rendered_rgbs_np)
@@ -675,7 +680,7 @@ def train() -> None:
             c2w = poses[img_i, :3, :4].to(gpu_if_available)
             with torch.no_grad():
                 val_rendered_rgb, val_rendered_disp, _, extras = \
-                    render(H, W, K, gpu_if_available, chunk=args.chunk,
+                    render(img_height, img_width, intrinsics_matrix, gpu_if_available, chunk=args.chunk,
                            c2w=c2w, **render_kwargs_test)
 
             val_loss = img2mse(val_rendered_rgb, val_gt_rgbs)
@@ -710,7 +715,7 @@ def train() -> None:
 
             open3d_vis_count += 1
 
-        if do_active_sampling and not do_uniform_sampling_every_iter:
+        if do_active_sampling and do_lazy_sw_loss:
             # Update the estimated section-wise loss probability distribution using the loss from
             # the rays that were just actively sampled.
             with torch.no_grad():

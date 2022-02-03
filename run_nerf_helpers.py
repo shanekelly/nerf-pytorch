@@ -86,37 +86,38 @@ def get_embedder(multires, i=0):
 
 # Model
 class NeRF(nn.Module):
-    def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4],
+    def __init__(self, D=8, img_width=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4],
                  use_viewdirs=False):
         """
         """
         super(NeRF, self).__init__()
         self.D = D
-        self.W = W
+        self.img_width = img_width
         self.input_ch = input_ch
         self.input_ch_views = input_ch_views
         self.skips = skips  # sk: layers to skip
         self.use_viewdirs = use_viewdirs
 
         self.pts_linears = nn.ModuleList(
-            [nn.Linear(input_ch, W)] +
-            [nn.Linear(W, W) if i not in self.skips
-             else nn.Linear(W + input_ch, W) for i in range(D-1)])
+            [nn.Linear(input_ch, img_width)] +
+            [nn.Linear(img_width, img_width) if i not in self.skips
+             else nn.Linear(img_width + input_ch, img_width) for i in range(D-1)])
 
         # Implementation according to the official code release
         # https://github.com/bmild/nerf/blob/master/run_nerf_helpers.py#L104-L105
-        self.views_linears = nn.ModuleList([nn.Linear(input_ch_views + W, W//2)])
+        self.views_linears = nn.ModuleList([nn.Linear(input_ch_views + img_width, img_width//2)])
 
         # Implementation according to the paper
         # self.views_linears = nn.ModuleList(
-        #     [nn.Linear(input_ch_views + W, W//2)] + [nn.Linear(W//2, W//2) for i in range(D//2)])
+        #     [nn.Linear(input_ch_views + img_width, img_width//2)] + [nn.Linear(img_width//2,
+        #     img_width//2) for i in range(D//2)])
 
         if use_viewdirs:
-            self.feature_linear = nn.Linear(W, W)
-            self.alpha_linear = nn.Linear(W, 1)
-            self.rgb_linear = nn.Linear(W//2, 3)
+            self.feature_linear = nn.Linear(img_width, img_width)
+            self.alpha_linear = nn.Linear(img_width, 1)
+            self.rgb_linear = nn.Linear(img_width//2, 3)
         else:
-            self.output_linear = nn.Linear(W, output_ch)
+            self.output_linear = nn.Linear(img_width, output_ch)
 
     def forward(self, x):
         input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
@@ -183,11 +184,13 @@ class NeRF(nn.Module):
 
 
 # Ray helpers
-def get_rays(H: int, W: int, K: torch.Tensor, c2w: torch.Tensor, gpu_if_available: torch.device):
-    i, j = torch.meshgrid(torch.linspace(0, W-1, W), torch.linspace(0, H-1, H), indexing='ij')
+def get_rays(img_height: int, img_width: int, intrinsics_matrix: torch.Tensor, c2w: torch.Tensor, gpu_if_available: torch.device):
+    i, j = torch.meshgrid(torch.linspace(0, img_width-1, img_width),
+                          torch.linspace(0, img_height-1, img_height), indexing='ij')
     i = i.t()
     j = j.t()
-    dirs = torch.stack([(i-K[0][2])/K[0][0], -(j-K[1][2])/K[1][1], -torch.ones_like(i)],
+    dirs = torch.stack([(i-intrinsics_matrix[0][2])/intrinsics_matrix[0][0],
+                        -(j-intrinsics_matrix[1][2])/intrinsics_matrix[1][1], -torch.ones_like(i)],
                        -1).to(gpu_if_available)
     # Rotate ray directions from camera frame to the world frame
     # dot product, equals to: [c2w.dot(dir) for dir in dirs]
@@ -198,10 +201,11 @@ def get_rays(H: int, W: int, K: torch.Tensor, c2w: torch.Tensor, gpu_if_availabl
     return rays_o, rays_d
 
 
-def get_rays_np(H, W, K, c2w):
-    i, j = np.meshgrid(np.arange(W, dtype=np.float32),
-                       np.arange(H, dtype=np.float32), indexing='xy')
-    dirs = np.stack([(i-K[0][2])/K[0][0], -(j-K[1][2])/K[1][1], -np.ones_like(i)], -1)
+def get_rays_np(img_height, img_width, intrinsics_matrix, c2w):
+    i, j = np.meshgrid(np.arange(img_width, dtype=np.float32),
+                       np.arange(img_height, dtype=np.float32), indexing='xy')
+    dirs = np.stack([(i-intrinsics_matrix[0][2])/intrinsics_matrix[0][0],
+                     -(j-intrinsics_matrix[1][2])/intrinsics_matrix[1][1], -np.ones_like(i)], -1)
     # Rotate ray directions from camera frame to the world frame
     # dot product, equals to: [c2w.dot(dir) for dir in dirs]
     rays_d = np.sum(dirs[..., np.newaxis, :] * c2w[:3, :3], -1)
@@ -211,18 +215,20 @@ def get_rays_np(H, W, K, c2w):
     return rays_o, rays_d
 
 
-def ndc_rays(H, W, focal, near, rays_o, rays_d):
+def ndc_rays(img_height, img_width, focal, near, rays_o, rays_d):
     # Shift ray origins to near plane
     t = -(near + rays_o[..., 2]) / rays_d[..., 2]
     rays_o = rays_o + t[..., None] * rays_d
 
     # Projection
-    o0 = -1./(W/(2.*focal)) * rays_o[..., 0] / rays_o[..., 2]
-    o1 = -1./(H/(2.*focal)) * rays_o[..., 1] / rays_o[..., 2]
+    o0 = -1./(img_width/(2.*focal)) * rays_o[..., 0] / rays_o[..., 2]
+    o1 = -1./(img_height/(2.*focal)) * rays_o[..., 1] / rays_o[..., 2]
     o2 = 1. + 2. * near / rays_o[..., 2]
 
-    d0 = -1./(W/(2.*focal)) * (rays_d[..., 0]/rays_d[..., 2] - rays_o[..., 0]/rays_o[..., 2])
-    d1 = -1./(H/(2.*focal)) * (rays_d[..., 1]/rays_d[..., 2] - rays_o[..., 1]/rays_o[..., 2])
+    d0 = -1./(img_width/(2.*focal)) * (rays_d[..., 0] /
+                                       rays_d[..., 2] - rays_o[..., 0]/rays_o[..., 2])
+    d1 = -1./(img_height/(2.*focal)) * (rays_d[..., 1] /
+                                        rays_d[..., 2] - rays_o[..., 1]/rays_o[..., 2])
     d2 = -2. * near / rays_o[..., 2]
 
     rays_o = torch.stack([o0, o1, o2], -1)
@@ -281,16 +287,16 @@ def sample_pdf(bins, weights, N_samples, gpu_if_available: torch.device, det=Fal
     return samples
 
 
-def render(H: int, W: int, K: torch.Tensor, gpu_if_available, chunk: int = 1024*32,
+def render(img_height: int, img_width: int, intrinsics_matrix: torch.Tensor, gpu_if_available, chunk: int = 1024*32,
            rays: Optional[torch.Tensor] = None, c2w: Optional[torch.Tensor] = None,
            ndc: bool = True, near: float = 0., far: float = 1.,
            use_viewdirs: bool = False, c2w_staticcam: Optional[torch.Tensor] = None,
            **kwargs):
     """Render rays
     Args:
-      H: int. Height of image in pixels.
-      W: int. Width of image in pixels.
-      K: array of shape [3, 3]. Camera intrinsics matrix.
+      img_height: int. Height of image in pixels.
+      img_width: int. Width of image in pixels.
+      intrinsics_matrix: array of shape [3, 3]. Camera intrinsics matrix.
       chunk: int. Maximum number of rays to process simultaneously. Used to
         control maximum memory usage. Does not affect final results.
       rays: array of shape [2, batch_size, 3]. Ray origin and direction for
@@ -310,7 +316,7 @@ def render(H: int, W: int, K: torch.Tensor, gpu_if_available, chunk: int = 1024*
     """
     if c2w is not None:
         # special case to render full image
-        rays_o, rays_d = get_rays(H, W, K, c2w, gpu_if_available)
+        rays_o, rays_d = get_rays(img_height, img_width, intrinsics_matrix, c2w, gpu_if_available)
     else:
         # use provided ray batch
         rays_o, rays_d = rays
@@ -321,7 +327,8 @@ def render(H: int, W: int, K: torch.Tensor, gpu_if_available, chunk: int = 1024*
 
         if c2w_staticcam is not None:
             # special case to visualize effect of viewdirs
-            rays_o, rays_d = get_rays(H, W, K, c2w_staticcam, gpu_if_available)
+            rays_o, rays_d = get_rays(img_height, img_width,
+                                      intrinsics_matrix, c2w_staticcam, gpu_if_available)
         viewdirs = viewdirs / torch.norm(viewdirs, dim=-1, keepdim=True)
         viewdirs = torch.reshape(viewdirs, [-1, 3]).float()
 
@@ -329,7 +336,8 @@ def render(H: int, W: int, K: torch.Tensor, gpu_if_available, chunk: int = 1024*
 
     if ndc:
         # for forward facing scenes
-        rays_o, rays_d = ndc_rays(H, W, K[0][0], 1., rays_o, rays_d)
+        rays_o, rays_d = ndc_rays(img_height, img_width,
+                                  intrinsics_matrix[0][0], 1., rays_o, rays_d)
 
     # Create ray batch
     rays_o = torch.reshape(rays_o, [-1, 3]).float()
@@ -548,7 +556,7 @@ def load_data(args: Namespace, gpu_if_available: torch.device
               ) -> Tuple[torch.Tensor, torch.Tensor, List[int], int, int, float, torch.Tensor,
                          torch.Tensor, torch.Tensor, List[int], List[int], List[int], float, float]:
     # Load data
-    K = None
+    intrinsics_matrix = None
 
     if args.dataset_type == 'llff':
         rgb_imgs, poses, bds, render_poses, test_idxs = load_llff_data(args.datadir, args.factor,
@@ -595,9 +603,10 @@ def load_data(args: Namespace, gpu_if_available: torch.device
             rgb_imgs = rgb_imgs[..., :3]
 
     elif args.dataset_type == 'LINEMOD':
-        rgb_imgs, poses, render_poses, hwf, K, i_split, near, far = load_LINEMOD_data(
+        rgb_imgs, poses, render_poses, hwf, intrinsics_matrix, i_split, near, far = load_LINEMOD_data(
             args.datadir, args.half_res, args.testskip)
-        print(f'Loaded LINEMOD, rgb_imgs shape: {rgb_imgs.shape}, hwf: {hwf}, K: {K}')
+        print(f'Loaded LINEMOD, rgb_imgs shape: {rgb_imgs.shape}, hwf: {hwf}, intrinsics_matrix: '
+              f'{intrinsics_matrix}')
         print(f'[CHECK HERE] near: {near}, far: {far}.')
         train_idxs, val_idxs, test_idxs = i_split
 
@@ -631,21 +640,21 @@ def load_data(args: Namespace, gpu_if_available: torch.device
         raise RuntimeError(f'Unknown dataset type {args.dataset_type}. Exiting.')
 
     # Cast intrinsics to right types
-    H, W, focal = hwf
-    H, W = int(H), int(W)
-    hwf = [H, W, focal]
+    img_height, img_width, focal = hwf
+    img_height, img_width = int(img_height), int(img_width)
+    hwf = [img_height, img_width, focal]
 
-    if K is None:
-        K = np.array([
-            [focal, 0, 0.5*W],
-            [0, focal, 0.5*H],
+    if intrinsics_matrix is None:
+        intrinsics_matrix = np.array([
+            [focal, 0, 0.5*img_width],
+            [0, focal, 0.5*img_height],
             [0, 0, 1]
         ])
 
     if args.render_test:
         render_poses = np.array(poses[test_idxs])
 
-    K = torch.tensor(K)
+    intrinsics_matrix = torch.tensor(intrinsics_matrix)
 
     # Attempt to move data to the GPU.
     rgb_imgs = torch.tensor(rgb_imgs, device=gpu_if_available, dtype=torch.float32)
@@ -660,11 +669,11 @@ def load_data(args: Namespace, gpu_if_available: torch.device
     test_idxs = torch.tensor(test_idxs)
     val_idxs = torch.tensor(val_idxs)
 
-    return (rgb_imgs, depth_imgs, hwf, H, W, focal, K, poses, render_poses, train_idxs, test_idxs,
+    return (rgb_imgs, depth_imgs, hwf, img_height, img_width, focal, intrinsics_matrix, poses, render_poses, train_idxs, test_idxs,
             val_idxs, near, far)
 
 
-def get_sw_rays(images: torch.Tensor, H: int, W: int, K: torch.Tensor, poses: torch.Tensor,
+def get_sw_rays(images: torch.Tensor, img_height: int, img_width: int, intrinsics_matrix: torch.Tensor, poses: torch.Tensor,
                 n_kfs: int,  grid_size: int, section_height: int,
                 section_width: int, gpu_if_available: torch.device, verbose=False
                 ) -> Tuple[torch.Tensor, float]:
@@ -677,12 +686,12 @@ def get_sw_rays(images: torch.Tensor, H: int, W: int, K: torch.Tensor, poses: to
 
     t_start = perf_counter()
 
-    # sk: A ray for every pixel of every camera image. Shape (N, ro+rd, H, W, 3).
-    rays = torch.stack([torch.stack(get_rays(H, W, K, p, gpu_if_available))
+    # sk: A ray for every pixel of every camera image. Shape (N, ro+rd, img_height, img_width, 3).
+    rays = torch.stack([torch.stack(get_rays(img_height, img_width, intrinsics_matrix, p, gpu_if_available))
                        for p in poses[:, :3, :4]])
 
-    rays = torch.cat([rays, images[:, None]], 1)  # (N, ro+rd+rgb, H, W, 3)
-    rays = torch.permute(rays, (0, 2, 3, 1, 4))  # (N, H, W, ro+rd+rgb, 3)
+    rays = torch.cat([rays, images[:, None]], 1)  # (N, ro+rd+rgb, img_height, img_width, 3)
+    rays = torch.permute(rays, (0, 2, 3, 1, 4))  # (N, img_height, img_width, ro+rd+rgb, 3)
 
     sw_rays = torch.empty((n_kfs, grid_size, grid_size,
                            section_height, section_width, 3, 3))
@@ -756,7 +765,7 @@ def nd_idxs_from_1d_idxs(flat_idxs: torch.Tensor, n_elems_per_chunks: torch.Tens
 
 def pad_imgs(imgs: torch.Tensor, padding_rgb: torch.Tensor, padding_width: int
              ) -> torch.Tensor:
-    assert imgs.dim() == 4  # Shape (N, H, W, C).
+    assert imgs.dim() == 4  # Shape (N, img_height, img_width, C).
     assert imgs.shape[-1] == 3  # C is RGB.
 
     padded_imgs = imgs.clone()
@@ -1200,14 +1209,53 @@ def render_and_compute_loss(rays, intrinsics_matrix, render_kwargs_train, img_he
             t_loss)
 
 
+def initialize_sw_kf_loss(kf_rgb_imgs, kf_poses, sw_unif_sampling_prob_dist, dims_kf_pw,
+                          intrinsics_matrix, n_total_rays_to_unif_sample, render_kwargs_train,
+                          chunk, optimizer, do_active_sampling, tensorboard, cpu, gpu_if_available,
+                          verbose=False):
+    """
+    @brief - If not doing active sampling, then initialize sw_kf_loss to zeros. Otherwise,
+    initialize the section-wise loss over all keyframes via uniform sampling over all keyframes.
+    """
+    n_kfs, img_height, img_width, _ = kf_rgb_imgs.shape
+    _, grid_size, _, section_height, section_width = dims_kf_pw
+    dims_kf_sw = dims_kf_pw[:3]
+
+    if not do_active_sampling:
+        # If we are not doing active sampling, then sw_kf_loss just needs to be initialized to zero.
+        return torch.zeros(dims_kf_sw)
+
+    with torch.no_grad():
+        # Get all rays from all keyframes.
+        sw_kf_rays, _ = \
+            get_sw_rays(kf_rgb_imgs, img_height, img_width, intrinsics_matrix, kf_poses,
+                        n_kfs, grid_size, section_height, section_width, gpu_if_available)
+    # Uniformly sample rays across all keyframes.
+    (sampled_rays, sampled_pw_idxs, sw_n_newly_sampled, _) = \
+        sample_sw_rays(sw_kf_rays, sw_unif_sampling_prob_dist,
+                       n_total_rays_to_unif_sample, kf_rgb_imgs, img_height, img_width,
+                       dims_kf_pw, dims_kf_pw, torch.arange(
+                           dims_kf_pw[0]), tensorboard, 'train/uniform_sampling/sampled_pixels',
+                       1, log_sampling_vis=True, verbose=verbose,
+                       enforce_min_samples=True)
+    # Render the sampled rays and compute section-wise loss.
+    sampled_sw_idxs_tuple = get_idxs_tuple(sampled_pw_idxs[:, :3])
+    _, _, _, sw_kf_loss, _, _, _, _, _ = \
+        render_and_compute_loss(sampled_rays, intrinsics_matrix, render_kwargs_train,
+                                img_height, img_width, dims_kf_sw, chunk,
+                                sampled_sw_idxs_tuple, sw_n_newly_sampled, optimizer,
+                                1, cpu, gpu_if_available)
+
+    return sw_kf_loss
+
+
 def select_keyframes(kf_rgb_imgs, kf_poses, kf_idxs, sw_kf_loss, img_height, img_width,
                      intrinsics_matrix, is_first_iter,
-                     n_total_rays_to_uniformly_sample, dims_kf_pw,
+                     n_total_rays_to_unif_sample, dims_kf_pw,
                      keyframe_selection_strategy, n_explore, n_exploit,
                      sw_unif_sampling_prob_dist, tensorboard, verbose, train_iter_idx, optimizer,
                      chunk, render_kwargs_train, cpu, gpu_if_available):
     n_kfs, grid_size, _, section_height, section_width = dims_kf_pw
-    dims_kf_sw = dims_kf_pw[:3]
 
     if keyframe_selection_strategy == 'all':
         skf_rgb_imgs = kf_rgb_imgs
@@ -1223,34 +1271,18 @@ def select_keyframes(kf_rgb_imgs, kf_poses, kf_idxs, sw_kf_loss, img_height, img
         assert n_exploit is not None, ('If --keyframe_selection_strategy is set to '
                                        '"explore_exploit", then --n_exploit must also be defined.')
         assert n_explore + n_exploit <= n_kfs
-        if is_first_iter:
-            # This is the first training iteration, so the section-wise loss estimate over the
-            # keyframes will need to be initialized via uniform sampling over all keyframes.
 
-            with torch.no_grad():
-                sw_kf_rays, _ = \
-                    get_sw_rays(kf_rgb_imgs, img_height, img_width, intrinsics_matrix, kf_poses,
-                                n_kfs, grid_size, section_height, section_width, gpu_if_available)
-            (sampled_rays, sampled_pw_idxs, sw_n_newly_sampled, t_uniform_sampling) = \
-                sample_sw_rays(sw_kf_rays, sw_unif_sampling_prob_dist,
-                               n_total_rays_to_uniformly_sample, kf_rgb_imgs, img_height, img_width,
-                               dims_kf_pw, dims_kf_pw, torch.arange(
-                                   dims_kf_pw[0]), tensorboard, 'train/uniform_sampling/sampled_pixels',
-                               train_iter_idx, log_sampling_vis=True, verbose=verbose,
-                               enforce_min_samples=True)
-            sampled_sw_idxs_tuple = get_idxs_tuple(sampled_pw_idxs[:, :3])
-            _, _, _, sw_kf_loss, _, _, _, _, _ = \
-                render_and_compute_loss(sampled_rays, intrinsics_matrix, render_kwargs_train,
-                                        img_height, img_width, dims_kf_sw, chunk,
-                                        sampled_sw_idxs_tuple, sw_n_newly_sampled, optimizer,
-                                        train_iter_idx, cpu, gpu_if_available)
-
+        # Compute the total loss for each keyframe by summing over the loss of all of each
+        # keyframe's sections.
         kf_losses = torch.sum(sw_kf_loss, dim=(1, 2))
         idxs_descending_loss = torch.argsort(kf_losses, descending=True)
         idxs_exploit = idxs_descending_loss[:n_exploit]
         idxs_remaining = torch.tensor(list(set(range(len(kf_idxs))) - set(idxs_exploit.tolist())),
                                       dtype=torch.int64)
         idxs_explore = idxs_remaining[torch.randperm(idxs_remaining.shape[0])[:n_explore]]
+        # Indices that index into the keyframe datastructures that result in the selected keyframe
+        # datastructures. E.g., if the first three keyframes were selected then sk_from_kf_idxs
+        # would be [0, 1, 2].
         skf_from_kf_idxs, _ = torch.sort(torch.cat((idxs_explore, idxs_exploit)))
 
         skf_rgb_imgs = kf_rgb_imgs[skf_from_kf_idxs]
@@ -1266,5 +1298,4 @@ def select_keyframes(kf_rgb_imgs, kf_poses, kf_idxs, sw_kf_loss, img_height, img
 
     dims_skf_pw = tuple([n_skfs] + list(dims_kf_pw[1:]))
 
-    return (skf_rgb_imgs, skf_poses, skf_idxs, n_skfs, dims_skf_pw, sw_kf_loss, sw_skf_loss,
-            skf_from_kf_idxs)
+    return skf_rgb_imgs, skf_poses, skf_idxs, n_skfs, dims_skf_pw, sw_skf_loss, skf_from_kf_idxs
