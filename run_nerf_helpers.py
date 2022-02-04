@@ -1167,12 +1167,12 @@ def create_keyframes(rgb_imgs: torch.Tensor, initial_poses: torch.Tensor,
 
 
 def get_kf_poses(kf_initial_poses: torch.Tensor, kf_poses_params: torch.nn.Parameter,
-                 do_pose_optimization: bool
+                 do_pose_optimization: bool, gpu_if_available
                  ) -> torch.Tensor:
     if do_pose_optimization:
         # Unpack the minimal representations of the poses from the optimizer's parameters, then
         # convert them into 4x4 transformation matrices.
-        kf_poses = tfmats_from_minreps(kf_poses_params, kf_initial_poses[0])
+        kf_poses = tfmats_from_minreps(kf_poses_params, kf_initial_poses[0], gpu_if_available)
     else:
         kf_poses = kf_initial_poses
 

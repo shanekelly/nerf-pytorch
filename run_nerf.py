@@ -501,7 +501,8 @@ def train() -> None:
         is_start_iter = train_iter_idx == start_iter_idx
 
         # Get the keyframe poses.
-        kf_poses = get_kf_poses(kf_initial_poses, kf_poses_params, do_pose_optimization)
+        kf_poses = \
+            get_kf_poses(kf_initial_poses, kf_poses_params, do_pose_optimization, gpu_if_available)
 
         # Select a subset of the keyframes to actually use in this training iteration.
         skf_rgb_imgs, skf_poses, skf_idxs, n_skfs, dims_skf_pw, sw_skf_loss, skf_from_kf_idxs = \
