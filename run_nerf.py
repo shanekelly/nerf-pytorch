@@ -22,8 +22,9 @@ from run_nerf_helpers import (add_1d_imgs_to_tensorboard, create_keyframes, get_
                               get_idxs_tuple, get_kf_poses, get_sw_n_sampled, get_sw_rays,
                               get_embedder, get_rays, get_sw_loss, img2mse, initialize_sw_kf_loss,
                               load_data, mse2psnr, NeRF, ndc_rays, pad_imgs, pad_sections, render,
-                              render_and_compute_loss, sample_pdf, sample_sw_rays, select_keyframes,
-                              to8b, tfmats_from_minreps, minreps_from_tfmats, white_rgb)
+                              render_and_compute_loss, sample_pdf, sample_skf_rays, sample_sw_rays,
+                              select_keyframes, to8b, tfmats_from_minreps, minreps_from_tfmats,
+                              white_rgb)
 
 
 cpu = torch.device('cpu')
@@ -361,11 +362,12 @@ def config_parser():
                         'distribution of loss over images.')
     parser.add_argument('--no_pose_optimization', action='store_true', help='Set to make initial '
                         'poses static and disable learning refined poses.')
-    parser.add_argument('--keyframe_creation_strategy', choices=['all', 'every_Nth'], default='all',
+    parser.add_argument('--keyframe_creation_strategy', choices=['all', 'every_Nth'],
+                        default='every_Nth',
                         help='The keyframe creation strategy to use. Choose between using every '
                         'frame as a keyframe or using every Nth frame as a keyframe, where N is '
                         'defined by --every_Nth.')
-    parser.add_argument('--every_Nth', type=int, help='Only used if '
+    parser.add_argument('--every_Nth', type=int, default=10, help='Only used if '
                         '--keyframe_creation_strategy is "every_Nth". The value of N to use when '
                         'choosing every Nth frame as a keyframe.')
     parser.add_argument('--keyframe_selection_strategy', choices=['all', 'explore_exploit'],
@@ -393,6 +395,10 @@ def train() -> None:
      val_idxs, near, far) = load_data(args, gpu_if_available)
     test_rgb_imgs = rgb_imgs[test_idxs]
     test_poses = poses[test_idxs]
+
+    tensorboard.add_images('test/rgb/groundtruth',
+                           pad_imgs(test_rgb_imgs, white_rgb, padding_width=2),
+                           global_step=1, dataformats='NHWC')
 
     kf_rgb_imgs, kf_initial_poses, kf_idxs, n_kfs = \
         create_keyframes(rgb_imgs, poses, train_idxs, args.keyframe_creation_strategy,
@@ -469,15 +475,17 @@ def train() -> None:
     n_total_sections = n_kfs * n_sections_per_img
     dims_kf_pw = (n_kfs, grid_size, grid_size, section_height, section_width)
     dims_kf_sw = dims_kf_pw[:3]
-    if do_active_sampling:
-        n_rays_to_unif_sample_per_img = 200
-        n_total_rays_to_unif_sample = n_rays_to_unif_sample_per_img * n_kfs
-        sw_unif_sampling_prob_dist = torch.tensor(1 / n_total_sections).repeat(dims_kf_sw)
-        n_total_rays_to_actively_sample = N_rand
-    else:
-        n_total_rays_to_sample = N_rand
-        sw_sampling_prob_dist = \
-            torch.tensor(1 / n_total_sections).expand(dims_kf_sw)
+
+    # For active sampling.
+    n_rays_to_unif_sample_per_img = 200
+    n_total_rays_to_unif_sample = n_rays_to_unif_sample_per_img * n_kfs
+    sw_unif_sampling_prob_dist = torch.tensor(1 / n_total_sections).repeat(dims_kf_sw)
+    n_total_rays_to_actively_sample = N_rand
+
+    # For uniform sampling.
+    n_total_rays_to_sample = N_rand
+    sw_sampling_prob_dist = \
+        torch.tensor(1 / n_total_sections).expand(dims_kf_sw)
 
     sw_kf_loss = \
         initialize_sw_kf_loss(kf_rgb_imgs, kf_initial_poses, sw_unif_sampling_prob_dist, dims_kf_pw,
@@ -486,8 +494,9 @@ def train() -> None:
                               cpu, gpu_if_available, verbose=verbose)
     sw_total_n_sampled = torch.zeros(dims_kf_sw, dtype=torch.int64)
 
-    tensorboard.add_images('train/keyframes', pad_sections(kf_rgb_imgs, dims_kf_pw, white_rgb,
-                                                           padding_width=2), global_step=1, dataformats='NHWC')
+    tensorboard.add_images('train/keyframes',
+                           pad_sections(kf_rgb_imgs, dims_kf_pw, white_rgb, padding_width=2),
+                           global_step=1, dataformats='NHWC')
 
     open3d_vis_count = 1
     start_iter_idx += 1
@@ -501,11 +510,12 @@ def train() -> None:
         is_start_iter = train_iter_idx == start_iter_idx
 
         # Get the keyframe poses.
-        kf_poses = \
+        kf_poses, t_get_poses = \
             get_kf_poses(kf_initial_poses, kf_poses_params, do_pose_optimization, gpu_if_available)
 
         # Select a subset of the keyframes to actually use in this training iteration.
-        skf_rgb_imgs, skf_poses, skf_idxs, n_skfs, dims_skf_pw, sw_skf_loss, skf_from_kf_idxs = \
+        (skf_rgb_imgs, skf_poses, skf_idxs, n_skfs, dims_skf_pw, sw_skf_loss, skf_from_kf_idxs,
+         t_select_keyframes) = \
             select_keyframes(kf_rgb_imgs, kf_poses, kf_idxs, sw_kf_loss, img_height, img_width,
                              intrinsics_matrix, is_start_iter,
                              n_total_rays_to_unif_sample, dims_kf_pw,
@@ -519,100 +529,35 @@ def train() -> None:
             get_sw_rays(skf_rgb_imgs, img_height, img_width, intrinsics_matrix, skf_poses, n_skfs,
                         grid_size, section_height, section_width, gpu_if_available)
 
-        if do_active_sampling:
-            # If we aren't uniformly sampling on every iteration, then we should only uniformly
-            # sample on the first iteration of this run.
-            t_uniform_sampling = 0.0
-            t_uniform_batching = 0.0
-            t_uniform_loss = 0.0
-            t_uniform_rendering = 0.0
-            if not do_lazy_sw_loss:
-                # Uniform ray sampling.
-                enforce_min_samples = False
-                with torch.no_grad():
-                    (unif_sampled_rays, unif_sampled_pw_idxs, sw_n_newly_sampled, t_uniform_sampling) = \
-                        sample_sw_rays(sw_skf_rays, sw_unif_sampling_prob_dist,
-                                       n_total_rays_to_unif_sample,
-                                       img_height, img_width, dims_kf_pw,
-                                       tensorboard, 'train/uniform_sampling/sampled_pixels', train_iter_idx,
-                                       log_sampling_vis=log_sampling_vis, verbose=verbose,
-                                       enforce_min_samples=enforce_min_samples)
-
-                # Render the uniformly sampled rays.
-                t_uniform_batching_start = perf_counter()
-                batch = torch.transpose(unif_sampled_rays, 0, 1).to(gpu_if_available)
-                batch_rays, unif_gt_rgbs = batch[:2], batch[2]
-                t_uniform_batching = perf_counter() - t_uniform_batching_start
-
-                t_uniform_rendering_start = perf_counter()
-                with torch.no_grad():
-                    unif_rendered_rgbs, _, _, _ = render(img_height, img_width, intrinsics_matrix, gpu_if_available, chunk=args.chunk, rays=batch_rays,
-                                                         verbose=train_iter_idx < 10, retraw=True,
-                                                         **render_kwargs_train)
-                t_uniform_rendering = perf_counter() - t_uniform_rendering_start
-
-                # Computing section-wise loss for uniformly sampled rays.
-                # TODO: should this not be sw_kf_loss?
-                sw_kf_loss, t_uniform_loss = \
-                    get_sw_loss(unif_rendered_rgbs, unif_gt_rgbs, sw_n_newly_sampled,
-                                sampled_skf_sw_idxs_tuple,
-                                dims_kf_sw, cpu)
-
-            # Active ray sampling.
-            sw_active_sampling_prob_dist = sw_skf_loss / torch.sum(sw_skf_loss)
-            (sampled_rays, sampled_skf_sw_idxs, sw_n_newly_sampled, t_active_sampling) = \
-                sample_sw_rays(sw_skf_rays, sw_active_sampling_prob_dist[skf_from_kf_idxs],
-                               n_total_rays_to_actively_sample,
-                               kf_rgb_imgs, img_height, img_width, dims_kf_pw, dims_skf_pw, skf_from_kf_idxs,
-                               tensorboard, 'train/active_sampling/sampled_pixels',
-                               train_iter_idx, log_sampling_vis=log_sampling_vis,
-                               verbose=verbose)
-        else:
-            # Active sampling is disabled, so simply sample uniformly over all sections.
-            (sampled_rays, sampled_skf_sw_idxs, sw_n_newly_sampled, t_sampling) = \
-                sample_sw_rays(sw_skf_rays, sw_sampling_prob_dist, n_total_rays_to_sample,
-                               img_height, img_width, dims_kf_pw,
-                               tensorboard, 'train/sampling/sampled_pixels', train_iter_idx,
-                               log_sampling_vis=log_sampling_vis, verbose=verbose)
+        # Sample rays to use for training.
+        sampled_rays, sampled_skf_sw_idxs, sw_n_newly_sampled, t_sample_rays = \
+            sample_skf_rays(sw_skf_rays, kf_rgb_imgs, intrinsics_matrix, sw_unif_sampling_prob_dist,
+                            n_total_rays_to_unif_sample, sw_sampling_prob_dist,
+                            n_total_rays_to_actively_sample, sw_skf_loss, dims_kf_pw, dims_skf_pw,
+                            skf_from_kf_idxs, args.chunk, render_kwargs_train, train_iter_idx,
+                            do_active_sampling, do_lazy_sw_loss, tensorboard, log_sampling_vis, verbose,
+                            cpu, gpu_if_available)
 
         # Accumulate the total number of times each section has been sampled from so that it can be
         # visualized when log_sampling_vis is True.
         sw_total_n_sampled[skf_from_kf_idxs] += sw_n_newly_sampled
 
+        # Render the sampled rays and compute the loss.
         sampled_skf_sw_idxs_tuple = get_idxs_tuple(sampled_skf_sw_idxs[:, :3])
         (train_rendered_rgbs, train_gt_rgbs, _, new_sw_skf_loss, train_loss, train_psnr, t_batching,
          t_rendering, t_loss) = \
-            render_and_compute_loss(sampled_rays, intrinsics_matrix, render_kwargs_train, img_height, img_width, dims_skf_sw, args.chunk,
+            render_and_compute_loss(sampled_rays, intrinsics_matrix, render_kwargs_train,
+                                    img_height, img_width, dims_skf_sw, args.chunk,
                                     sampled_skf_sw_idxs_tuple, sw_n_newly_sampled, optimizer,
                                     train_iter_idx, cpu, gpu_if_available)
 
-#         t_batching_start = perf_counter()
-#         batch = torch.transpose(sampled_rays.to(gpu_if_available), 0, 1)
-#         batch_rays, train_gt_rgbs = batch[:2], batch[2]
-#         t_batching = perf_counter() - t_batching_start
-
-#         t_rendering_start = perf_counter()
-#         train_rendered_rgbs, _, _, extras = render(img_height, img_width, intrinsics_matrix, chunk=args.chunk, rays=batch_rays,
-#                                                    verbose=train_iter_idx < 10, retraw=True,
-#                                                    **render_kwargs_train)
-#         t_rendering = perf_counter() - t_rendering_start
-
-#         t_loss_start = perf_counter()
-#         optimizer.zero_grad()
-#         train_loss = img2mse(train_rendered_rgbs, train_gt_rgbs)
-#         train_psnr = mse2psnr(train_loss)
-#         if 'rgb0' in extras:
-#             img_loss0 = img2mse(extras['rgb0'], train_gt_rgbs)
-#             train_loss += img_loss0
-#             # psnr0 = mse2psnr(img_loss0)
-#         t_loss = perf_counter() - t_loss_start
-
+        # Compute gradients for parameters via backpropagation and use them to update parameter
+        # values.
         t_backprop_start = perf_counter()
         train_loss.backward()
         optimizer.step()
         t_backprop = perf_counter() - t_backprop_start
 
-        # NOTE: IMPORTANT!
         # Update learning rate.
         decay_rate = 0.1
         decay_steps = args.lrate_decay * 1000
@@ -656,7 +601,7 @@ def train() -> None:
             test_loss = img2mse(test_rendered_rgbs, test_rgb_imgs.to(cpu))
             test_psnr = mse2psnr(test_loss)
 
-            tensorboard.add_images('test/rgb', pad_imgs(test_rendered_rgbs, white_rgb, 5),
+            tensorboard.add_images('test/rgb/estimate', pad_imgs(test_rendered_rgbs, white_rgb, 5),
                                    train_iter_idx, dataformats='NHWC')
             tensorboard.add_scalar('test/loss', test_loss, train_iter_idx)
             tensorboard.add_scalar('test/psnr', test_psnr, train_iter_idx)
@@ -731,17 +676,10 @@ def train() -> None:
 
         t_train_iter = perf_counter() - t_train_iter_start
 
-        if do_active_sampling:
-            tqdm_bar.set_postfix_str(
-                f't{t_train_iter:.3f},gr{t_get_rays:.3f},'
-                f'u:(s{t_uniform_sampling:.3f},b{t_uniform_batching:.3f},'
-                f'l{t_uniform_loss:.3f},r{t_uniform_rendering:.3f}),'
-                f'a:(s{t_active_sampling:.3f},b{t_batching:.3f},r{t_rendering:.3f}),'
-                f'b{t_backprop:.3f}')
-        else:
-            tqdm_bar.set_postfix_str(
-                f't{t_train_iter:.3f},gr{t_get_ray:.3f},s{t_sampling:.3f},b{t_batching:.3f},'
-                f'r{t_rendering:.3f},b{t_backprop:.3f}')
+        tqdm_bar.set_postfix_str(
+            f't{t_train_iter:.3f},gp{t_get_poses:.3f},sk{t_select_keyframes:.3f},'
+            f'gr{t_get_rays:.3f},sr{t_sample_rays:.3f},ba{t_batching:.3f},r{t_rendering:.3f},'
+            f'l{t_loss:.3f},bp{t_backprop:.3f}')
 
         global_step += 1
 
