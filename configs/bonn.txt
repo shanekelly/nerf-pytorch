@@ -15,4 +15,4 @@ N_importance = 64
 use_viewdirs = False
 raw_noise_std = 1e0
 
-render_test = True  # Render the test images instead of a custom render path.
+img_type_to_render = test  # Render the test images instead of a custom render path.

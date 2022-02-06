@@ -8,10 +8,12 @@ import open3d as o3d
 import torch
 import torch.nn as nn
 
-from cv2 import circle, FILLED
+from cv2 import circle, COLOR_RGB2HSV, cvtColor, FILLED
 from ipdb import set_trace
 from torch.nn.functional import relu
 from torch.utils.tensorboard import SummaryWriter
+
+from point_cloud.rgbd import point_cloud_from_rgb_imgs_and_depth_imgs
 
 from load_llff import load_llff_data
 from load_deepvoxels import load_dv_data
@@ -651,8 +653,8 @@ def load_data(args: Namespace, gpu_if_available: torch.device
             [0, 0, 1]
         ])
 
-    if args.render_test:
-        render_poses = np.array(poses[test_idxs])
+    # if args.img_type_to_render == 'test':
+    #     render_poses = np.array(poses[test_idxs])
 
     intrinsics_matrix = torch.tensor(intrinsics_matrix)
 
@@ -671,6 +673,26 @@ def load_data(args: Namespace, gpu_if_available: torch.device
 
     return (rgb_imgs, depth_imgs, hwf, img_height, img_width, focal, intrinsics_matrix, poses, render_poses, train_idxs, test_idxs,
             val_idxs, near, far)
+
+
+def split_into_sections(mats, grid_size):
+    height = mats.shape[1]
+    width = mats.shape[2]
+
+    assert height % grid_size == 0
+    assert width % grid_size == 0
+    rps = height // grid_size  # Rows per section.
+    cps = width // grid_size  # Columns per section.
+
+    sw_mats = mats.clone()
+    sw_mats = sw_mats.unfold(1, rps, rps).unfold(2, cps, cps)
+    # set_trace()
+    # sw_mats = sw_mats.contiguous().view(patches
+    dim_order = tuple([0, 1, 2] + [sw_mats.dim() - 2] + [sw_mats.dim() - 1] +
+                      list(range(3, sw_mats.dim() - 2)))
+    sw_mats = torch.permute(sw_mats, dim_order)
+
+    return sw_mats
 
 
 def get_sw_rays(images: torch.Tensor, img_height: int, img_width: int, intrinsics_matrix: torch.Tensor, poses: torch.Tensor,
@@ -1018,7 +1040,7 @@ def add_1d_imgs_to_tensorboard(imgs: torch.Tensor, img_rgb: torch.Tensor,
                                padding_rgb: torch.Tensor = torch.tensor([0.6]).expand(3),
                                padding_width: int = 1
                                ) -> torch.Tensor:
-    assert imgs.dim() == 3
+    assert imgs.dim() == 3  # N, H, W
 
     # Scale all pixels between 0 and 1.
     imgs_scaled = imgs / torch.max(imgs)
@@ -1310,10 +1332,12 @@ def select_keyframes(kf_rgb_imgs, kf_poses, kf_idxs, sw_kf_loss, img_height, img
             t_delta)
 
 
-def sample_skf_rays(sw_skf_rays, kf_rgb_imgs, intrinsics_matrix, sw_unif_sampling_prob_dist,
-                    n_total_rays_to_unif_sample, sw_sampling_prob_dist, n_total_rays_to_actively_sample, sw_skf_loss, dims_kf_pw, dims_skf_pw,
-                    skf_from_kf_idxs, chunk, render_kwargs_train, train_iter_idx, do_active_sampling,
-                    do_lazy_sw_loss, tensorboard, log_sampling_vis, verbose, cpu, gpu_if_available):
+def sample_skf_rays(sw_skf_rays, kf_rgb_imgs, intrinsics_matrix, n_total_rays_to_sample, sw_unif_sampling_prob_dist,
+                    n_total_rays_to_unif_sample, sw_sampling_prob_dist,
+                    n_total_rays_to_actively_sample, sw_sampling_prob_dist_modifier, sw_skf_loss,
+                    dims_kf_pw, dims_skf_pw, skf_from_kf_idxs, chunk, render_kwargs_train,
+                    train_iter_idx, do_active_sampling, do_lazy_sw_loss, tensorboard,
+                    log_sampling_vis, verbose, cpu, gpu_if_available):
 
     t_start = perf_counter()
 
@@ -1358,7 +1382,9 @@ def sample_skf_rays(sw_skf_rays, kf_rgb_imgs, intrinsics_matrix, sw_unif_samplin
         # Active ray sampling.
         sw_active_sampling_prob_dist = sw_skf_loss / torch.sum(sw_skf_loss)
         sampled_rays, sampled_skf_sw_idxs, sw_n_newly_sampled, _ = \
-            sample_sw_rays(sw_skf_rays, sw_active_sampling_prob_dist[skf_from_kf_idxs],
+            sample_sw_rays(sw_skf_rays,
+                           sw_active_sampling_prob_dist[skf_from_kf_idxs] *
+                           sw_sampling_prob_dist_modifier[skf_from_kf_idxs],
                            n_total_rays_to_actively_sample,
                            kf_rgb_imgs, img_height, img_width, dims_kf_pw, dims_skf_pw, skf_from_kf_idxs,
                            tensorboard, 'train/active_sampling/sampled_pixels',
@@ -1367,7 +1393,8 @@ def sample_skf_rays(sw_skf_rays, kf_rgb_imgs, intrinsics_matrix, sw_unif_samplin
     else:
         # Active sampling is disabled, so simply sample uniformly over all sections.
         sampled_rays, sampled_skf_sw_idxs, sw_n_newly_sampled, _ = \
-            sample_sw_rays(sw_skf_rays, sw_sampling_prob_dist, n_total_rays_to_sample,
+            sample_sw_rays(sw_skf_rays, sw_sampling_prob_dist * sw_sampling_prob_dist_modifier,
+                           n_total_rays_to_sample,
                            kf_rgb_imgs, img_height, img_width, dims_kf_pw, dims_skf_pw,
                            skf_from_kf_idxs,
                            tensorboard, 'train/sampling/sampled_pixels', train_iter_idx,
@@ -1376,3 +1403,44 @@ def sample_skf_rays(sw_skf_rays, kf_rgb_imgs, intrinsics_matrix, sw_unif_samplin
     t_delta = perf_counter() - t_start
 
     return sampled_rays, sampled_skf_sw_idxs, sw_n_newly_sampled, t_delta
+
+
+def get_sw_sampling_prob_dist_modifier(kf_rgb_imgs, grid_size, sw_sampling_prob_dist_modifier_strategy, tensorboard):
+
+    if sw_sampling_prob_dist_modifier_strategy == 'avg_saturation':
+        # Compute the mean saturation of each section.
+
+        # Convert RGB images to HSV.
+        kf_hsv_imgs = torch.tensor(np.array([cvtColor(rgb_img, COLOR_RGB2HSV)
+                                             for rgb_img in kf_rgb_imgs.numpy()]))
+        # Extract the saturation value of each pixel.
+        kf_s_imgs = kf_hsv_imgs[:, :, :, 1]
+        # Split into sections.
+        sw_kf_s_imgs = split_into_sections(kf_s_imgs, grid_size)
+        # Compute the mean saturation of each section.
+        sw_avg_s = torch.mean(sw_kf_s_imgs, dim=(3, 4))
+
+        sw_sampling_prob_dist_modifier = sw_avg_s
+
+    elif sw_sampling_prob_dist_modifier_strategy == 'uniform':
+        # Construct a uniform modifier in the section-wise shape (just a 1 at each section).
+
+        n_imgs, _, _, _ = kf_rgb_imgs.shape
+
+        sw_sampling_prob_dist_modifier = torch.ones((n_imgs, grid_size, grid_size))
+
+    else:
+        raise RuntimeError('Unknown section-wise sampling probability distribution modifier '
+                           f'strategy "{sw_sampling_prob_dist_modifier_strategy}". Exiting.')
+
+    add_1d_imgs_to_tensorboard(sw_sampling_prob_dist_modifier, torch.tensor([0, 0, 1]), tensorboard,
+                               'train/sampling_probability_distribution_modifier', 1, white_rgb)
+
+    return sw_sampling_prob_dist_modifier
+
+
+def save_point_cloud_from_rgb_imgs_and_depth_imgs(point_cloud_fpath, rgb_imgs, depth_imgs,
+                                                  world_from_cameras, intrinsics_matrix):
+    point_cloud = point_cloud_from_rgb_imgs_and_depth_imgs(rgb_imgs, depth_imgs, world_from_cameras,
+                                                           intrinsics_matrix, z_forwards=False)
+    o3d.io.write_point_cloud(point_cloud_fpath, point_cloud)
