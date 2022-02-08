@@ -24,7 +24,7 @@ from run_nerf_helpers import (add_1d_imgs_to_tensorboard, create_keyframes, get_
                               get_sw_sampling_prob_dist_modifier, img2mse, initialize_sw_kf_loss,
                               load_data, mse2psnr, NeRF, ndc_rays, pad_imgs, pad_sections, render,
                               render_and_compute_loss, sample_pdf, sample_skf_rays, sample_sw_rays,
-                              point_cloud_from_rgb_imgs_and_depth_imgs, select_keyframes,
+                              save_point_cloud_from_rgb_imgs_and_depth_imgs, select_keyframes,
                               split_into_sections, to8b, tfmats_from_minreps, minreps_from_tfmats,
                               white_rgb)
 
@@ -251,16 +251,16 @@ def config_parser():
                         help='layers in fine network')
     parser.add_argument("--netwidth_fine", type=int, default=256,
                         help='channels per layer in fine network')
-    parser.add_argument("--N_rand", type=int, default=32*32*4,
+    parser.add_argument("--N_rand", type=int, default=2048,
                         help='batch size (number of random rays per gradient step)')
     parser.add_argument("--lrate", type=float, default=5e-4,
                         help='learning rate')
     parser.add_argument("--lrate_decay", type=int, default=250,
                         help='exponential learning rate decay (in 1000 steps)')
-    parser.add_argument("--chunk", type=int, default=1024*32,
+    parser.add_argument("--chunk", type=int, default=8192,
                         help='number of rays processed in parallel, decrease if running out of '
                         'memory')
-    parser.add_argument("--netchunk", type=int, default=1024*64,
+    parser.add_argument("--netchunk", type=int, default=32768,
                         help='number of pts sent through network in parallel, decrease if running '
                         'out of memory')
     parser.add_argument("--no_batching", action='store_true',
@@ -273,7 +273,7 @@ def config_parser():
     # rendering options
     parser.add_argument("--N_samples", type=int, default=64,
                         help='number of coarse samples per ray')
-    parser.add_argument("--N_importance", type=int, default=0,
+    parser.add_argument("--N_importance", type=int, default=64,
                         help='number of additional fine samples per ray')
     parser.add_argument("--perturb", type=float, default=1.,
                         help='set to 0. for no jitter, 1. for jitter')
@@ -285,7 +285,7 @@ def config_parser():
                         help='log2 of max freq for positional encoding (3D location)')
     parser.add_argument("--multires_views", type=int, default=4,
                         help='log2 of max freq for positional encoding (2D direction)')
-    parser.add_argument("--raw_noise_std", type=float, default=0.,
+    parser.add_argument("--raw_noise_std", type=float, default=1e0,
                         help='std dev of noise added to regularize sigma_a output, 1e0 recommended')
 
     parser.add_argument("--render_only", action='store_true',
@@ -308,8 +308,8 @@ def config_parser():
                         default=.5, help='fraction of img taken for central crops')
 
     # dataset options
-    parser.add_argument("--dataset_type", type=str, default='llff',
-                        help='options: llff / blender / deepvoxels')
+    parser.add_argument("--dataset_type", type=str, default='bonn',
+                        help='options: llff / blender / deepvoxels / bonn')
     parser.add_argument("--testskip", type=int, default=8,
                         help='will load 1/N images from test/val sets, useful for large datasets '
                         'like deepvoxels')
@@ -341,11 +341,11 @@ def config_parser():
     # logging/saving options
     parser.add_argument("--i_train_scalars",   type=int, default=100,
                         help='frequency of console printout and metric loggin')
-    parser.add_argument("--i_val",     type=int, default=500,
+    parser.add_argument("--i_val",     type=int, default=1000,
                         help='frequency of tensorboard image logging')
     parser.add_argument("--i_weights", type=int, default=10000,
                         help='frequency of weight ckpt saving')
-    parser.add_argument("--i_test", type=int, default=5000,
+    parser.add_argument("--i_test", type=int, default=10000,
                         help='frequency of testset saving')
     parser.add_argument("--i_video",   type=int, default=50000,
                         help='frequency of render_poses video saving')
@@ -357,9 +357,9 @@ def config_parser():
     parser.add_argument('--n_training_iters', type=int, default=50000, help='The number of '
                         'training iterations to run for.')
 
-    parser.add_argument('--i_sampling_vis', type=int, default=500, help='The frequency of '
+    parser.add_argument('--i_sampling_vis', type=int, default=1000, help='The frequency of '
                         'logging visualizations about ray sampling to tensorboard.')
-    parser.add_argument('--i_pose_vis', type=int, default=500, help='The frequency of '
+    parser.add_argument('--i_pose_vis', type=int, default=1000, help='The frequency of '
                         'logging visualizations about the camera frame poses to tensorboard.')
 
     parser.add_argument('--verbose', action='store_true', help='True to print additional info.')
@@ -382,13 +382,13 @@ def config_parser():
                         '--keyframe_creation_strategy is "every_Nth". The value of N to use when '
                         'choosing every Nth frame as a keyframe.')
     parser.add_argument('--keyframe_selection_strategy', choices=['all', 'explore_exploit'],
-                        default='all', help='The keyframe creation strategy to use. Choose between '
+                        default='explore_exploit', help='The keyframe creation strategy to use. Choose between '
                         'using every frame as a keyframe or using every Nth frame as a keyframe, '
                         'where N is defined by --every_Nth.')
-    parser.add_argument('--n_explore', type=int, help='Only used if '
+    parser.add_argument('--n_explore', type=int, default=1, help='Only used if '
                         '--keyframe_selection_strategy is "explore_exploit". The number of '
                         'keyframes to randomly select.')
-    parser.add_argument('--n_exploit', type=int, help='Only used if '
+    parser.add_argument('--n_exploit', type=int, default=4, help='Only used if '
                         '--keyframe_selection_strategy is "explore_exploit". The number of '
                         'keyframes with the highest loss to select.')
     parser.add_argument('--sw_sampling_prob_dist_modifier_strategy',
@@ -484,8 +484,10 @@ def train() -> None:
                             gt_imgs=render_gt_rgb_imgs, savedir=log_dpath,
                             render_factor=args.render_factor)
             rendered_depth_imgs = 1 / rendered_disp_imgs
-            save_point_cloud(log_dpath / 'rendered-point-cloud.ply', rendered_rgb_imgs, 1 /
-                             rendered_depth_imgs, poses_to_render, intrinsics_matrix)
+            save_point_cloud_from_rgb_imgs_and_depth_imgs(log_dpath / 'rendered-point-cloud.ply',
+                                                          rendered_rgb_imgs,
+                                                          rendered_depth_imgs, poses_to_render,
+                                                          intrinsics_matrix)
             print('Done rendering', testsavedir)
             # imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
 
@@ -521,17 +523,19 @@ def train() -> None:
     n_total_rays_to_sample = N_rand
     sw_sampling_prob_dist = torch.tensor(1 / n_total_sections).expand(dims_kf_sw)
 
-    sw_kf_loss = initialize_sw_kf_loss(kf_rgb_imgs, kf_initial_poses, sw_unif_sampling_prob_dist, dims_kf_pw,
-                                       intrinsics_matrix, n_total_rays_to_unif_sample, render_kwargs_train,
-                                       args.chunk, optimizer, do_active_sampling, tensorboard,
-                                       cpu, gpu_if_available, verbose=verbose)
+    sw_kf_loss = \
+        initialize_sw_kf_loss(kf_rgb_imgs, kf_initial_poses, sw_unif_sampling_prob_dist, dims_kf_pw,
+                              intrinsics_matrix, n_total_rays_to_unif_sample, render_kwargs_train,
+                              args.chunk, optimizer, do_active_sampling, tensorboard,
+                              cpu, gpu_if_available, verbose=verbose)
     sw_total_n_sampled = torch.zeros(dims_kf_sw, dtype=torch.int64)
     tensorboard.add_images('train/keyframes',
                            pad_sections(kf_rgb_imgs, dims_kf_pw, white_rgb, padding_width=2),
                            global_step=1, dataformats='NHWC')
-    sw_sampling_prob_dist_modifier = get_sw_sampling_prob_dist_modifier(kf_rgb_imgs, grid_size,
-                                                                        args.sw_sampling_prob_dist_modifier_strategy,
-                                                                        tensorboard)
+    sw_sampling_prob_dist_modifier = \
+        get_sw_sampling_prob_dist_modifier(kf_rgb_imgs, grid_size,
+                                           args.sw_sampling_prob_dist_modifier_strategy,
+                                           tensorboard)
 
     open3d_vis_count = 1
     start_iter_idx += 1
@@ -550,26 +554,29 @@ def train() -> None:
 
         # Select a subset of the keyframes to actually use in this training iteration.
         (skf_rgb_imgs, skf_poses, skf_idxs, n_skfs, dims_skf_pw, sw_skf_loss, skf_from_kf_idxs,
-         t_select_keyframes) = select_keyframes(kf_rgb_imgs, kf_poses, kf_idxs, sw_kf_loss, img_height, img_width,
-                                                intrinsics_matrix, is_start_iter,
-                                                n_total_rays_to_unif_sample, dims_kf_pw,
-                                                args.keyframe_selection_strategy, args.n_explore, args.n_exploit,
-                                                sw_unif_sampling_prob_dist, tensorboard, verbose, train_iter_idx,
-                                                optimizer, args.chunk, render_kwargs_train, cpu, gpu_if_available)
+         t_select_keyframes) = \
+            select_keyframes(kf_rgb_imgs, kf_poses, kf_idxs, sw_kf_loss, img_height, img_width,
+                             intrinsics_matrix, is_start_iter,
+                             n_total_rays_to_unif_sample, dims_kf_pw,
+                             args.keyframe_selection_strategy, args.n_explore, args.n_exploit,
+                             sw_unif_sampling_prob_dist, tensorboard, verbose, train_iter_idx,
+                             optimizer, args.chunk, render_kwargs_train, cpu, gpu_if_available)
         dims_skf_sw = dims_skf_pw[:3]
 
         # Compute the rays from the selected keyframe images and poses.
-        sw_skf_rays, t_get_rays = get_sw_rays(skf_rgb_imgs, img_height, img_width, intrinsics_matrix, skf_poses, n_skfs,
-                                              grid_size, section_height, section_width, gpu_if_available)
+        sw_skf_rays, t_get_rays = \
+            get_sw_rays(skf_rgb_imgs, img_height, img_width, intrinsics_matrix, skf_poses, n_skfs,
+                        grid_size, section_height, section_width, gpu_if_available)
 
         # Sample rays to use for training.
-        sampled_rays, sampled_skf_sw_idxs, sw_n_newly_sampled, t_sample_rays = sample_skf_rays(sw_skf_rays, kf_rgb_imgs, intrinsics_matrix, n_total_rays_to_sample, sw_unif_sampling_prob_dist,
-                                                                                               n_total_rays_to_unif_sample, sw_sampling_prob_dist,
-                                                                                               n_total_rays_to_actively_sample, sw_sampling_prob_dist_modifier,
-                                                                                               sw_skf_loss, dims_kf_pw, dims_skf_pw,
-                                                                                               skf_from_kf_idxs, args.chunk, render_kwargs_train, train_iter_idx,
-                                                                                               do_active_sampling, do_lazy_sw_loss, tensorboard, log_sampling_vis,
-                                                                                               verbose, cpu, gpu_if_available)
+        sampled_rays, sampled_skf_sw_idxs, sw_n_newly_sampled, t_sample_rays = \
+            sample_skf_rays(sw_skf_rays, kf_rgb_imgs, intrinsics_matrix, n_total_rays_to_sample, sw_unif_sampling_prob_dist,
+                            n_total_rays_to_unif_sample, sw_sampling_prob_dist,
+                            n_total_rays_to_actively_sample, sw_sampling_prob_dist_modifier,
+                            sw_skf_loss, dims_kf_pw, dims_skf_pw,
+                            skf_from_kf_idxs, args.chunk, render_kwargs_train, train_iter_idx,
+                            do_active_sampling, do_lazy_sw_loss, tensorboard, log_sampling_vis,
+                            verbose, cpu, gpu_if_available)
 
         # Accumulate the total number of times each section has been sampled from so that it can be
         # visualized when log_sampling_vis is True.
@@ -578,10 +585,11 @@ def train() -> None:
         # Render the sampled rays and compute the loss.
         sampled_skf_sw_idxs_tuple = get_idxs_tuple(sampled_skf_sw_idxs[:, :3])
         (train_rendered_rgbs, train_gt_rgbs, _, new_sw_skf_loss, train_loss, train_psnr, t_batching,
-         t_rendering, t_loss) = render_and_compute_loss(sampled_rays, intrinsics_matrix, render_kwargs_train,
-                                                        img_height, img_width, dims_skf_sw, args.chunk,
-                                                        sampled_skf_sw_idxs_tuple, sw_n_newly_sampled, optimizer,
-                                                        train_iter_idx, cpu, gpu_if_available)
+         t_rendering, t_loss) = \
+            render_and_compute_loss(sampled_rays, intrinsics_matrix, render_kwargs_train,
+                                    img_height, img_width, dims_skf_sw, args.chunk,
+                                    sampled_skf_sw_idxs_tuple, sw_n_newly_sampled, optimizer,
+                                    train_iter_idx, cpu, gpu_if_available)
 
         # Compute gradients for parameters via backpropagation and use them to update parameter
         # values.
@@ -658,8 +666,9 @@ def train() -> None:
             val_gt_rgbs = rgb_imgs[val_idx]
             c2w = initial_poses[val_idx, :3, :4].to(gpu_if_available)
             with torch.no_grad():
-                val_rendered_rgb, val_rendered_disp, _, _ = render(img_height, img_width, intrinsics_matrix, gpu_if_available,
-                                                                   chunk=args.chunk, c2w=c2w, **render_kwargs_test)
+                val_rendered_rgb, val_rendered_disp, _, _ = \
+                    render(img_height, img_width, intrinsics_matrix, gpu_if_available,
+                           chunk=args.chunk, c2w=c2w, **render_kwargs_test)
 
             val_loss = img2mse(val_rendered_rgb, val_gt_rgbs)
             val_psnr = mse2psnr(val_loss)
@@ -698,9 +707,10 @@ def train() -> None:
             # the rays that were just actively sampled.
             with torch.no_grad():
                 # Only update the loss of sections that were sampled from.
-                sampled_kf_sw_idxs_tuple = tuple([torch.tensor([skf_from_kf_idxs[idx] for
-                                                                idx in sampled_skf_sw_idxs_tuple[0]]),
-                                                  sampled_skf_sw_idxs_tuple[1], sampled_skf_sw_idxs_tuple[2]])
+                sampled_kf_sw_idxs_tuple = \
+                    tuple([torch.tensor([skf_from_kf_idxs[idx] for
+                                         idx in sampled_skf_sw_idxs_tuple[0]]),
+                           sampled_skf_sw_idxs_tuple[1], sampled_skf_sw_idxs_tuple[2]])
                 sw_kf_loss[sampled_kf_sw_idxs_tuple] = new_sw_skf_loss[sampled_skf_sw_idxs_tuple]
 
         t_train_iter = perf_counter() - t_train_iter_start

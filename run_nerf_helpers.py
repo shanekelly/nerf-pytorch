@@ -497,8 +497,16 @@ def render_rays(ray_batch: torch.Tensor, network_fn: NeRF, network_query_fn: Cal
         ret['z_std'] = torch.std(z_samples, dim=-1, unbiased=False)  # [N_rays]
 
     for k in ret:
-        if (torch.isnan(ret[k]).any() or torch.isinf(ret[k]).any()) and DEBUG:
-            print(f"! [Numerical Error] {k} contains nan or inf.")
+        is_nan = torch.isnan(ret[k])
+        if is_nan.any():
+            n_nan = torch.sum(is_nan)
+            print(f'Found {n_nan} NaN values in {k}. Replacing with zeros.')
+            torch.nan_to_num_(ret[k], nan=0)
+        is_inf = torch.isinf(ret[k])
+        if is_inf.any():
+            n_inf = torch.sum(is_inf)
+            print(f'Found {n_inf} inf values in {k}. Replacing with zeros.')
+            torch.nan_to_num_(ret[k], posinf=0, neginf=0)
 
     return ret
 
@@ -710,7 +718,7 @@ def get_sw_rays(images: torch.Tensor, img_height: int, img_width: int, intrinsic
 
     # sk: A ray for every pixel of every camera image. Shape (N, ro+rd, img_height, img_width, 3).
     rays = torch.stack([torch.stack(get_rays(img_height, img_width, intrinsics_matrix, p, gpu_if_available))
-                       for p in poses[:, :3, :4]])
+                        for p in poses[:, :3, :4]])
 
     rays = torch.cat([rays, images[:, None]], 1)  # (N, ro+rd+rgb, img_height, img_width, 3)
     rays = torch.permute(rays, (0, 2, 3, 1, 4))  # (N, img_height, img_width, ro+rd+rgb, 3)
@@ -757,8 +765,8 @@ def get_initial_section_rand_pixel_idxs(num_train_imgs: int, grid_size: int, sec
     num_pixels_per_section = section_height * section_width
     single_section_pixel_idxs = torch.tensor(list(product(range(section_height),
                                                           range(section_width))))
-    section_rand_pixel_idxs = \
-        single_section_pixel_idxs.repeat((num_train_imgs, grid_size, grid_size, 1, 1))
+    section_rand_pixel_idxs = single_section_pixel_idxs.repeat(
+        (num_train_imgs, grid_size, grid_size, 1, 1))
     for img_idx, grid_row_idx, grid_col_idx in product(range(num_train_imgs),
                                                        range(grid_size),
                                                        range(grid_size)):
@@ -790,12 +798,12 @@ def pad_imgs(imgs: torch.Tensor, padding_rgb: torch.Tensor, padding_width: int
     assert imgs.dim() == 4  # Shape (N, img_height, img_width, C).
     assert imgs.shape[-1] == 3  # C is RGB.
 
-    padded_imgs = imgs.clone()
+    padded_imgs = imgs.clone().cpu()
 
     padding_top_bottom = padding_rgb.expand(imgs.shape[0], padding_width, imgs.shape[2], 3)
     padded_imgs = torch.cat((padding_top_bottom, padded_imgs, padding_top_bottom), dim=1)
-    padding_left_right = \
-        padding_rgb.expand(imgs.shape[0], imgs.shape[1] + 2 * padding_width, padding_width, 3)
+    padding_left_right = padding_rgb.expand(
+        imgs.shape[0], imgs.shape[1] + 2 * padding_width, padding_width, 3)
     padded_imgs = torch.cat((padding_left_right, padded_imgs, padding_left_right), dim=2)
 
     return padded_imgs
@@ -873,8 +881,8 @@ def sample_sw_rays(sw_rays: torch.Tensor, sw_sampling_prob_dist: torch.Tensor,
 
     if enforce_min_samples:
         sampled_flat_idxs = torch.empty((n_total_rays_to_sample), dtype=torch.int64)
-        sw_min_n_to_sample = \
-            torch.floor(n_total_rays_to_sample * sw_sampling_prob_dist).to(torch.int64)
+        sw_min_n_to_sample = torch.floor(n_total_rays_to_sample *
+                                         sw_sampling_prob_dist).to(torch.int64)
         n_remaining_samples = n_total_rays_to_sample - torch.sum(sw_min_n_to_sample)
         sw_additional_n_to_sample, _ = get_n_to_sample(sw_sampling_prob_dist,
                                                        n_remaining_samples.item())
@@ -887,8 +895,8 @@ def sample_sw_rays(sw_rays: torch.Tensor, sw_sampling_prob_dist: torch.Tensor,
                                  grid_col_idx * n_pixels_per_grid_col_in_grid_row)
             sampling_prob_dist = pw_sampling_prob_dist[img_idx, grid_row_idx, grid_col_idx, :, :]
             n_to_sample = sw_n_to_sample[img_idx, grid_row_idx, grid_col_idx]
-            new_sampled_flat_idxs = \
-                torch.multinomial(sampling_prob_dist.view(-1), n_to_sample) + start_sampled_idx
+            new_sampled_flat_idxs = torch.multinomial(
+                sampling_prob_dist.view(-1), n_to_sample) + start_sampled_idx
             stop_insert_idx = start_insert_idx + n_to_sample
             sampled_flat_idxs[start_insert_idx:stop_insert_idx] = new_sampled_flat_idxs
 
@@ -898,8 +906,8 @@ def sample_sw_rays(sw_rays: torch.Tensor, sw_sampling_prob_dist: torch.Tensor,
         # value is 0 and the maximum index value is (n_kfs * grid_size * grid_size *
         # section_height * section_width - 1). Each index refers to a pixel that should be sampled.
         # Shape (n_total_rays_to_sample, ).
-        sampled_flat_idxs = \
-            torch.multinomial(pw_sampling_prob_dist.view(-1), n_total_rays_to_sample)
+        sampled_flat_idxs = torch.multinomial(
+            pw_sampling_prob_dist.view(-1), n_total_rays_to_sample)
 
     # Use sampled_flat_idxs to index into the rays. Now have obtained the sampled rays. Shape
     # (n_total_rays_to_sample, 3, 3).
@@ -1253,9 +1261,8 @@ def initialize_sw_kf_loss(kf_rgb_imgs, kf_poses, sw_unif_sampling_prob_dist, dim
 
     with torch.no_grad():
         # Get all rays from all keyframes.
-        sw_kf_rays, _ = \
-            get_sw_rays(kf_rgb_imgs, img_height, img_width, intrinsics_matrix, kf_poses,
-                        n_kfs, grid_size, section_height, section_width, gpu_if_available)
+        sw_kf_rays, _ = get_sw_rays(kf_rgb_imgs, img_height, img_width, intrinsics_matrix, kf_poses,
+                                    n_kfs, grid_size, section_height, section_width, gpu_if_available)
     # Uniformly sample rays across all keyframes.
     (sampled_rays, sampled_pw_idxs, sw_n_newly_sampled, _) = \
         sample_sw_rays(sw_kf_rays, sw_unif_sampling_prob_dist,
@@ -1351,7 +1358,8 @@ def sample_skf_rays(sw_skf_rays, kf_rgb_imgs, intrinsics_matrix, n_total_rays_to
             # Uniformly sample rays across selected keyframes to update the section-wise loss
             # estimate.
             with torch.no_grad():
-                (unif_sampled_rays, unif_sampled_pw_idxs, sw_n_newly_sampled, t_uniform_sampling) = \
+                (unif_sampled_rays, unif_sampled_pw_idxs, sw_n_newly_sampled,
+                 t_uniform_sampling) = \
                     sample_sw_rays(sw_skf_rays, sw_unif_sampling_prob_dist,
                                    n_total_rays_to_unif_sample,
                                    kf_rgb_imgs, img_height, img_width, dims_kf_pw, dims_skf_pw,
@@ -1374,10 +1382,9 @@ def sample_skf_rays(sw_skf_rays, kf_rgb_imgs, intrinsics_matrix, n_total_rays_to
             # Computing section-wise loss for uniformly sampled rays.
             # TODO: should this not be sw_kf_loss?
             unif_sampled_skf_sw_idxs_tuple = get_idxs_tuple(unif_sampled_pw_idxs[:, :3])
-            sw_kf_loss, _ = \
-                get_sw_loss(unif_rendered_rgbs, unif_gt_rgbs, sw_n_newly_sampled,
-                            unif_sampled_skf_sw_idxs_tuple,
-                            extras, dims_kf_sw, cpu)
+            sw_kf_loss, _ = get_sw_loss(unif_rendered_rgbs, unif_gt_rgbs, sw_n_newly_sampled,
+                                        unif_sampled_skf_sw_idxs_tuple,
+                                        extras, dims_kf_sw, cpu)
 
         # Active ray sampling.
         sw_active_sampling_prob_dist = sw_skf_loss / torch.sum(sw_skf_loss)
@@ -1412,7 +1419,7 @@ def get_sw_sampling_prob_dist_modifier(kf_rgb_imgs, grid_size, sw_sampling_prob_
 
         # Convert RGB images to HSV.
         kf_hsv_imgs = torch.tensor(np.array([cvtColor(rgb_img, COLOR_RGB2HSV)
-                                             for rgb_img in kf_rgb_imgs.numpy()]))
+                                             for rgb_img in kf_rgb_imgs.cpu().numpy()]))
         # Extract the saturation value of each pixel.
         kf_s_imgs = kf_hsv_imgs[:, :, :, 1]
         # Split into sections.
@@ -1443,4 +1450,4 @@ def save_point_cloud_from_rgb_imgs_and_depth_imgs(point_cloud_fpath, rgb_imgs, d
                                                   world_from_cameras, intrinsics_matrix):
     point_cloud = point_cloud_from_rgb_imgs_and_depth_imgs(rgb_imgs, depth_imgs, world_from_cameras,
                                                            intrinsics_matrix, z_forwards=False)
-    o3d.io.write_point_cloud(point_cloud_fpath, point_cloud)
+    o3d.io.write_point_cloud(point_cloud_fpath.as_posix(), point_cloud)

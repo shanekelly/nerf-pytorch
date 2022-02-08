@@ -1,0 +1,5 @@
+datadir = ~/eth/implicit-mapping/datasets/strawberry/0/5-to-10-sec/orbslam/front-camera/right-camera/all-frames
+
+expname = strawberry
+
+factor = 2  # Downsampling factor.
