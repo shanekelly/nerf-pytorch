@@ -9,6 +9,7 @@ from ipdb import set_trace
 from im_util.transforms import (rotmat_from_euler_zyx,
                                 tfmat_from_rotmat_and_translation,
                                 tfmat_from_quat_and_translation)
+from image.align import align_depth_to_rgb
 
 
 def load_bonn_data(base_dir, downsample_factor):
@@ -37,11 +38,12 @@ def load_bonn_data(base_dir, downsample_factor):
     assert camera_info_fpath.exists()
     camera_info_file = open(camera_info_fpath.as_posix(), 'r')
     camera_info = load(camera_info_file)
-    height = int(camera_info['height'] * scale_factor)
-    width = int(camera_info['width'] * scale_factor)
-    focal_length = camera_info['focal_length'] * scale_factor
-    depth_scale = camera_info['depth_scale']
+    height = int(camera_info['rgb']['height'] * scale_factor)
+    width = int(camera_info['rgb']['width'] * scale_factor)
+    focal_length = camera_info['rgb']['focal_length'] * scale_factor
+    depth_scale = camera_info['depth']['scale']
     hwf = [height, width, focal_length]
+    rgb_camera_info = camera_info['rgb']
     camera_info_file.close()
 
     # Read images and poses.
@@ -78,7 +80,9 @@ def load_bonn_data(base_dir, downsample_factor):
     trajectory_file.close()
 
     rgb_imgs = np.array(rgb_imgs) / 255.
-    depth_imgs = np.array(depth_imgs) * depth_scale  # Convert to units of meters.
+    # Convert to units of meters.
+    depth_imgs = np.array(depth_imgs) / np.iinfo(np.in16).max * np.iinfo(np.int8)
+    set_trace()
     poses = np.array(poses)
     assert rgb_imgs.shape[0] == depth_imgs.shape[0] == poses.shape[0]
 
@@ -119,6 +123,35 @@ def load_bonn_data(base_dir, downsample_factor):
     else:
         test_idxs = all_idxs[::8]
     train_idxs = [idx for idx in all_idxs if idx not in test_idxs]
+
+#     from pickle import dump
+#     rgbs_file = open('rgb_imgs.pickle', 'wb')
+#     dump(rgb_imgs, rgbs_file)
+#     rgbs_file.close()
+
+#     depth_file = open('depth_imgs.pickle', 'wb')
+#     dump(depth_imgs, depth_file)
+#     depth_file.close()
+
+    # print('saved')
+
+    rgb_intrinsics_matrix = np.array(camera_info['rgb']['intrinsics_matrix'])
+    depth_intrinsics_matrix = np.array(camera_info['depth']['intrinsics_matrix'])
+    rgb_from_depth = np.array(camera_info['depth']['rgb_from_depth'])
+    aligned_depth_imgs = \
+        align_depth_to_rgb(depth_imgs, depth_intrinsics_matrix, rgb_intrinsics_matrix, rgb_from_depth,
+                           z_forwards=True)
+
+    for img_idx, (rgb_img, deptH_img, aligned_depth_img) in enumerate(zip(rgb_imgs, depth_imgs,
+                                                                          aligned_depth_imgs)):
+        fig = plt.figure()
+        subplot = fig.add_subplot(1, 3, 1)
+        subplot.imshow(rgb_img)
+        subplot = fig.add_subplot(1, 3, 2)
+        subplot.imshow(depth_img)
+        subplot = fig.add_subplot(1, 3, 3)
+        subplot.imshow(aligned_depth_img)
+        plt.show()
 
     return rgb_imgs, depth_imgs, hwf, poses, render_poses, train_idxs, test_idxs
 

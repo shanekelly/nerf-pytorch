@@ -419,7 +419,7 @@ def train() -> None:
                            pad_imgs(test_rgb_imgs, white_rgb, padding_width=2),
                            global_step=1, dataformats='NHWC')
 
-    kf_rgb_imgs, kf_initial_poses, kf_idxs, n_kfs = \
+    kf_rgb_imgs, kf_depth_imgs, kf_initial_poses, kf_idxs, n_kfs = \
         create_keyframes(rgb_imgs, initial_poses, train_idxs, args.keyframe_creation_strategy,
                          args.every_Nth)
 

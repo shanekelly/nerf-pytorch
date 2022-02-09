@@ -703,12 +703,13 @@ def split_into_sections(mats, grid_size):
     return sw_mats
 
 
-def get_sw_rays(images: torch.Tensor, img_height: int, img_width: int, intrinsics_matrix: torch.Tensor, poses: torch.Tensor,
+def get_sw_rays(imgs: torch.Tensor, img_height: int, img_width: int, intrinsics_matrix: torch.Tensor,
+                poses: torch.Tensor,
                 n_kfs: int,  grid_size: int, section_height: int,
                 section_width: int, gpu_if_available: torch.device, verbose=False
                 ) -> Tuple[torch.Tensor, float]:
     """
-    @param images - Training images.
+    @param imgs - Training images.
     @param poses - Pose for each training image.
     """
     if verbose:
@@ -720,7 +721,7 @@ def get_sw_rays(images: torch.Tensor, img_height: int, img_width: int, intrinsic
     rays = torch.stack([torch.stack(get_rays(img_height, img_width, intrinsics_matrix, p, gpu_if_available))
                         for p in poses[:, :3, :4]])
 
-    rays = torch.cat([rays, images[:, None]], 1)  # (N, ro+rd+rgb, img_height, img_width, 3)
+    rays = torch.cat([rays, imgs[:, None]], 1)  # (N, ro+rd+rgb, img_height, img_width, 3)
     rays = torch.permute(rays, (0, 2, 3, 1, 4))  # (N, img_height, img_width, ro+rd+rgb, 3)
 
     sw_rays = torch.empty((n_kfs, grid_size, grid_size,
@@ -1174,7 +1175,7 @@ def get_coordinate_frames(poses, coordinate_frame_size: float = 0.05, gray_out: 
     return coordinate_frames
 
 
-def create_keyframes(rgb_imgs: torch.Tensor, initial_poses: torch.Tensor,
+def create_keyframes(rgb_imgs: torch.Tensor, depth_imgs: torch.Tensor, initial_poses: torch.Tensor,
                      train_idxs: List[int], keyframe_creation_strategy, every_Nth
                      ) -> Tuple[torch.Tensor, torch.Tensor, List[int], int]:
     if keyframe_creation_strategy == 'all':
@@ -1188,12 +1189,13 @@ def create_keyframes(rgb_imgs: torch.Tensor, initial_poses: torch.Tensor,
             f'Unknown keyframe creation strategy "{keyframe_creation_strategy}". Exiting.')
 
     kf_rgb_imgs = rgb_imgs[kf_idxs]
+    kf_depth_imgs = depth_imgs[kf_idxs]
     kf_initial_poses = initial_poses[kf_idxs]
     n_kfs = len(kf_idxs)
 
     print('Keyframe views are ', kf_idxs)
 
-    return kf_rgb_imgs, kf_initial_poses, kf_idxs, n_kfs
+    return kf_rgb_imgs, kf_depth_imgs, kf_initial_poses, kf_idxs, n_kfs
 
 
 def get_kf_poses(kf_initial_poses: torch.Tensor, kf_poses_params: torch.nn.Parameter,
