@@ -55,10 +55,16 @@ class Embedder:
         else:
             freq_bands = torch.linspace(2.**0., 2.**max_freq, steps=N_freqs)
 
-        for freq in freq_bands:
-            for p_fn in self.kwargs['periodic_fns']:  # sk: hard-coded to [torch.sin, torch.cos]
-                embed_fns.append(lambda x, p_fn=p_fn, freq=freq: p_fn(x * freq))
-                out_dim += d
+        out_dim = 63
+        scale = 8
+        bvals = torch.normal(0, 1, (d, 30)) * scale
+        embed_fns.append(lambda pts_flat: torch.sin(pts_flat @ bvals))
+        embed_fns.append(lambda pts_flat: torch.cos(pts_flat @ bvals))
+
+        # for freq in freq_bands:
+        #     for p_fn in self.kwargs['periodic_fns']:  # sk: hard-coded to [torch.sin, torch.cos]
+        #         embed_fns.append(lambda x, p_fn=p_fn, freq=freq: p_fn(x * freq))
+        #         out_dim += d
 
         self.embed_fns = embed_fns
         self.out_dim = out_dim
@@ -730,8 +736,8 @@ def get_sw_rays(images: torch.Tensor, img_height: int, img_width: int, intrinsic
         img_stop_row_idx = (grid_row_idx + 1) * section_height
         img_start_col_idx = grid_col_idx * section_width
         img_stop_col_idx = (grid_col_idx + 1) * section_width
-        sw_rays[:, grid_row_idx, grid_col_idx, :, :, :] = \
-            rays[:, img_start_row_idx:img_stop_row_idx, img_start_col_idx:img_stop_col_idx, :, :]
+        sw_rays[:, grid_row_idx, grid_col_idx, :, :, :] = rays[:,
+                                                               img_start_row_idx:img_stop_row_idx, img_start_col_idx:img_stop_col_idx, :, :]
 
     t_delta = perf_counter() - t_start
 
@@ -771,8 +777,8 @@ def get_initial_section_rand_pixel_idxs(num_train_imgs: int, grid_size: int, sec
                                                        range(grid_size),
                                                        range(grid_size)):
         rand_pixel_idxs = torch.randperm(num_pixels_per_section)
-        section_rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, :, :] = \
-            section_rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, rand_pixel_idxs, :]
+        section_rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, :,
+                                :] = section_rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, rand_pixel_idxs, :]
 
     t_delta = perf_counter() - t_start
 
@@ -833,9 +839,8 @@ def pad_sections(imgs: torch.Tensor, dims_pw: Tuple[int, int, int, int, int],
         padded_section_col_stop_idx = padded_section_col_start_idx + section_width
 
         padded_imgs[:, padded_section_row_start_idx:padded_section_row_stop_idx,
-                    padded_section_col_start_idx:padded_section_col_stop_idx] = \
-            imgs[:, section_row_start_idx:section_row_stop_idx,
-                 section_col_start_idx:section_col_stop_idx, :]
+                    padded_section_col_start_idx:padded_section_col_stop_idx] = imgs[:, section_row_start_idx:section_row_stop_idx,
+                                                                                     section_col_start_idx:section_col_stop_idx, :]
 
     return padded_imgs
 
@@ -1264,20 +1269,18 @@ def initialize_sw_kf_loss(kf_rgb_imgs, kf_poses, sw_unif_sampling_prob_dist, dim
         sw_kf_rays, _ = get_sw_rays(kf_rgb_imgs, img_height, img_width, intrinsics_matrix, kf_poses,
                                     n_kfs, grid_size, section_height, section_width, gpu_if_available)
     # Uniformly sample rays across all keyframes.
-    (sampled_rays, sampled_pw_idxs, sw_n_newly_sampled, _) = \
-        sample_sw_rays(sw_kf_rays, sw_unif_sampling_prob_dist,
-                       n_total_rays_to_unif_sample, kf_rgb_imgs, img_height, img_width,
-                       dims_kf_pw, dims_kf_pw, torch.arange(
-                           dims_kf_pw[0]), tensorboard, 'train/uniform_sampling/sampled_pixels',
-                       1, log_sampling_vis=True, verbose=verbose,
-                       enforce_min_samples=True)
+    (sampled_rays, sampled_pw_idxs, sw_n_newly_sampled, _) = sample_sw_rays(sw_kf_rays, sw_unif_sampling_prob_dist,
+                                                                            n_total_rays_to_unif_sample, kf_rgb_imgs, img_height, img_width,
+                                                                            dims_kf_pw, dims_kf_pw, torch.arange(
+                                                                                dims_kf_pw[0]), tensorboard, 'train/uniform_sampling/sampled_pixels',
+                                                                            1, log_sampling_vis=True, verbose=verbose,
+                                                                            enforce_min_samples=True)
     # Render the sampled rays and compute section-wise loss.
     sampled_sw_idxs_tuple = get_idxs_tuple(sampled_pw_idxs[:, :3])
-    _, _, _, sw_kf_loss, _, _, _, _, _ = \
-        render_and_compute_loss(sampled_rays, intrinsics_matrix, render_kwargs_train,
-                                img_height, img_width, dims_kf_sw, chunk,
-                                sampled_sw_idxs_tuple, sw_n_newly_sampled, optimizer,
-                                1, cpu, gpu_if_available)
+    _, _, _, sw_kf_loss, _, _, _, _, _ = render_and_compute_loss(sampled_rays, intrinsics_matrix, render_kwargs_train,
+                                                                 img_height, img_width, dims_kf_sw, chunk,
+                                                                 sampled_sw_idxs_tuple, sw_n_newly_sampled, optimizer,
+                                                                 1, cpu, gpu_if_available)
 
     return sw_kf_loss
 

@@ -542,6 +542,7 @@ def train() -> None:
     n_training_iters = args.n_training_iters + 1
     tqdm_bar = trange(start_iter_idx, n_training_iters)
     for train_iter_idx in tqdm_bar:
+        print('a')
         t_train_iter_start = perf_counter()
 
         log_sampling_vis = train_iter_idx % args.i_sampling_vis == 0
@@ -642,7 +643,7 @@ def train() -> None:
             test_loss = img2mse(test_rendered_rgbs, test_rgb_imgs.to(cpu))
             test_psnr = mse2psnr(test_loss)
 
-            tensorboard.add_images('test/rgb/estimate', pad_imgs(test_rendered_rgbs, white_rgb, 5),
+            tensorboard.add_images('test/rgb/estimate', pad_imgs(test_rendered_rgbs, white_rgb, 2),
                                    train_iter_idx, dataformats='NHWC')
             tensorboard.add_scalar('test/loss', test_loss, train_iter_idx)
             tensorboard.add_scalar('test/psnr', test_psnr, train_iter_idx)
