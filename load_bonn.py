@@ -37,10 +37,10 @@ def load_bonn_data(base_dir, downsample_factor):
     assert camera_info_fpath.exists()
     camera_info_file = open(camera_info_fpath.as_posix(), 'r')
     camera_info = load(camera_info_file)
-    height = int(camera_info['height'] * scale_factor)
-    width = int(camera_info['width'] * scale_factor)
-    focal_length = camera_info['focal_length'] * scale_factor
-    depth_scale = camera_info['depth_scale']
+    height = int(camera_info['rgb']['height'] * scale_factor)
+    width = int(camera_info['rgb']['width'] * scale_factor)
+    focal_length = camera_info['rgb']['focal_length'] * scale_factor
+    depth_scale = camera_info['depth']['scale']
     hwf = [height, width, focal_length]
     camera_info_file.close()
 

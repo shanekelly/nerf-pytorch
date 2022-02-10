@@ -9,7 +9,12 @@ import torch
 import torch.nn as nn
 
 from cv2 import circle, COLOR_RGB2HSV, cvtColor, FILLED
+from GPUtil import showUtilization
 from ipdb import set_trace
+from open3d.visualization.tensorboard_plugin import summary
+from open3d.visualization.tensorboard_plugin.util import to_dict_batch
+from time import sleep
+from threading import Thread
 from torch.nn.functional import relu
 from torch.utils.tensorboard import SummaryWriter
 
@@ -22,6 +27,7 @@ from load_LINEMOD import load_LINEMOD_data
 from load_bonn import load_bonn_data
 
 
+purple_rgb = torch.tensor([1.0, 0.0, 1.0])
 white_rgb = torch.tensor([1.0]).expand(3)
 
 
@@ -55,10 +61,18 @@ class Embedder:
         else:
             freq_bands = torch.linspace(2.**0., 2.**max_freq, steps=N_freqs)
 
-        for freq in freq_bands:
-            for p_fn in self.kwargs['periodic_fns']:  # sk: hard-coded to [torch.sin, torch.cos]
-                embed_fns.append(lambda x, p_fn=p_fn, freq=freq: p_fn(x * freq))
-                out_dim += d
+        if self.kwargs['B'] is not None:
+            B = self.kwargs['B']
+            embed_fns = []
+            out_dim = B.shape[1] * 2
+
+            embed_fns.append(lambda pts_flat, B=B: torch.sin(pts_flat @ B))
+            embed_fns.append(lambda pts_flat, B=B: torch.cos(pts_flat @ B))
+        else:
+            for freq in freq_bands:
+                for p_fn in self.kwargs['periodic_fns']:  # sk: hard-coded to [torch.sin, torch.cos]
+                    embed_fns.append(lambda x, p_fn=p_fn, freq=freq: p_fn(x * freq))
+                    out_dim += d
 
         self.embed_fns = embed_fns
         self.out_dim = out_dim
@@ -67,7 +81,7 @@ class Embedder:
         return torch.cat([fn(inputs) for fn in self.embed_fns], -1)
 
 
-def get_embedder(multires, i=0):
+def get_embedder(multires, i=0, B=None):
     if i == -1:
         return nn.Identity(), 3
 
@@ -78,6 +92,7 @@ def get_embedder(multires, i=0):
         'num_freqs': multires,
         'log_sampling': True,
         'periodic_fns': [torch.sin, torch.cos],
+        'B': B
     }
 
     embedder_obj = Embedder(**embed_kwargs)
@@ -89,7 +104,7 @@ def get_embedder(multires, i=0):
 # Model
 class NeRF(nn.Module):
     def __init__(self, D=8, img_width=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4],
-                 use_viewdirs=False):
+                 use_viewdirs=False, B=None):
         """
         """
         super(NeRF, self).__init__()
@@ -120,6 +135,8 @@ class NeRF(nn.Module):
             self.rgb_linear = nn.Linear(img_width//2, 3)
         else:
             self.output_linear = nn.Linear(img_width, output_ch)
+
+        self.B = B
 
     def forward(self, x):
         input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
@@ -373,8 +390,8 @@ def batchify_rays(rays_flat: torch.Tensor, gpu_if_available, chunk: int = 1024*3
     """
     all_ret = {}
 
+    kwargs['gpu_if_available'] = gpu_if_available
     for i in range(0, rays_flat.shape[0], chunk):
-        kwargs['gpu_if_available'] = gpu_if_available
         ret = render_rays(rays_flat[i:i+chunk], **kwargs)
 
         for k in ret:
@@ -694,8 +711,6 @@ def split_into_sections(mats, grid_size):
 
     sw_mats = mats.clone()
     sw_mats = sw_mats.unfold(1, rps, rps).unfold(2, cps, cps)
-    # set_trace()
-    # sw_mats = sw_mats.contiguous().view(patches
     dim_order = tuple([0, 1, 2] + [sw_mats.dim() - 2] + [sw_mats.dim() - 1] +
                       list(range(3, sw_mats.dim() - 2)))
     sw_mats = torch.permute(sw_mats, dim_order)
@@ -913,9 +928,10 @@ def sample_sw_rays(sw_rays: torch.Tensor, sw_sampling_prob_dist: torch.Tensor,
     # (n_total_rays_to_sample, 3, 3).
     sampled_rays = sw_rays.view(-1, 3, 3)[sampled_flat_idxs]
 
-    n_pixels_per_chunks = torch.tensor([n_pixels_per_img, n_pixels_per_grid_row_in_img,
-                                        n_pixels_per_grid_col_in_grid_row, n_pixels_per_pixel_row_in_grid_col,
-                                        n_pixels_per_pixel_col_in_pixel_row])
+    n_pixels_per_chunks = \
+        torch.tensor([n_pixels_per_img, n_pixels_per_grid_row_in_img,
+                      n_pixels_per_grid_col_in_grid_row, n_pixels_per_pixel_row_in_grid_col,
+                      n_pixels_per_pixel_col_in_pixel_row])
     sampled_pw_idxs = nd_idxs_from_1d_idxs(sampled_flat_idxs, n_pixels_per_chunks)
 
     sampled_sw_idxs_tuple = get_idxs_tuple(sampled_pw_idxs[:, :3])
@@ -1043,11 +1059,13 @@ def get_sw_loss(rendered_rgbs: torch.Tensor, gt_rgbs: torch.Tensor, sw_n_sampled
     return sw_loss, t_delta
 
 
-def add_1d_imgs_to_tensorboard(imgs: torch.Tensor, img_rgb: torch.Tensor,
-                               tensorboard: SummaryWriter, tag: str, iter_idx: int,
+def add_1d_imgs_to_tensorboard(imgs_: torch.Tensor, img_rgb: torch.Tensor,
+                               tensorboard: SummaryWriter, tag: str, iter_idx: int, cpu,
                                padding_rgb: torch.Tensor = torch.tensor([0.6]).expand(3),
                                padding_width: int = 1
                                ) -> torch.Tensor:
+    imgs = imgs_.to(cpu)
+
     assert imgs.dim() == 3  # N, H, W
 
     # Scale all pixels between 0 and 1.
@@ -1065,7 +1083,8 @@ def add_1d_imgs_to_tensorboard(imgs: torch.Tensor, img_rgb: torch.Tensor,
                    imgs_scaled.unsqueeze(-1).repeat(1, 1, 1, 3) * diff_rgb)
 
     # Add border around each image.
-    output_imgs = pad_imgs(output_imgs, padding_rgb, padding_width)
+    if padding_width > 0:
+        output_imgs = pad_imgs(output_imgs, padding_rgb, padding_width)
 
     tensorboard.add_images(tag, output_imgs, iter_idx, dataformats='NHWC')
 
@@ -1224,8 +1243,9 @@ def render_and_compute_loss(rays, intrinsics_matrix, render_kwargs_train, img_he
     t_batching = perf_counter() - t_batching_start
 
     t_rendering_start = perf_counter()
-    rendered_rgbs, rendered_disps, _, extras = render(img_height, img_width, intrinsics_matrix, gpu_if_available, chunk=chunk, rays=batch_rays,
-                                                      verbose=train_iter_idx < 10, retraw=True, **render_kwargs_train)
+    rendered_rgbs, rendered_disps, _, extras = \
+        render(img_height, img_width, intrinsics_matrix, gpu_if_available, chunk=chunk, rays=batch_rays,
+               verbose=train_iter_idx < 10, retraw=True, **render_kwargs_train)
     t_rendering = perf_counter() - t_rendering_start
 
     t_loss_start = perf_counter()
@@ -1264,13 +1284,12 @@ def initialize_sw_kf_loss(kf_rgb_imgs, kf_poses, sw_unif_sampling_prob_dist, dim
         sw_kf_rays, _ = get_sw_rays(kf_rgb_imgs, img_height, img_width, intrinsics_matrix, kf_poses,
                                     n_kfs, grid_size, section_height, section_width, gpu_if_available)
     # Uniformly sample rays across all keyframes.
-    (sampled_rays, sampled_pw_idxs, sw_n_newly_sampled, _) = \
-        sample_sw_rays(sw_kf_rays, sw_unif_sampling_prob_dist,
-                       n_total_rays_to_unif_sample, kf_rgb_imgs, img_height, img_width,
-                       dims_kf_pw, dims_kf_pw, torch.arange(
-                           dims_kf_pw[0]), tensorboard, 'train/uniform_sampling/sampled_pixels',
-                       1, log_sampling_vis=True, verbose=verbose,
-                       enforce_min_samples=True)
+    (sampled_rays, sampled_pw_idxs, sw_n_newly_sampled, _) = sample_sw_rays(sw_kf_rays, sw_unif_sampling_prob_dist,
+                                                                            n_total_rays_to_unif_sample, kf_rgb_imgs, img_height, img_width,
+                                                                            dims_kf_pw, dims_kf_pw, torch.arange(
+                                                                                dims_kf_pw[0]), tensorboard, 'train/uniform_sampling/sampled_pixels',
+                                                                            1, log_sampling_vis=True, verbose=verbose,
+                                                                            enforce_min_samples=True)
     # Render the sampled rays and compute section-wise loss.
     sampled_sw_idxs_tuple = get_idxs_tuple(sampled_pw_idxs[:, :3])
     _, _, _, sw_kf_loss, _, _, _, _, _ = \
@@ -1412,7 +1431,8 @@ def sample_skf_rays(sw_skf_rays, kf_rgb_imgs, intrinsics_matrix, n_total_rays_to
     return sampled_rays, sampled_skf_sw_idxs, sw_n_newly_sampled, t_delta
 
 
-def get_sw_sampling_prob_dist_modifier(kf_rgb_imgs, grid_size, sw_sampling_prob_dist_modifier_strategy, tensorboard):
+def get_sw_sampling_prob_dist_modifier(kf_rgb_imgs, grid_size,
+                                       sw_sampling_prob_dist_modifier_strategy, tensorboard, cpu):
 
     if sw_sampling_prob_dist_modifier_strategy == 'avg_saturation':
         # Compute the mean saturation of each section.
@@ -1441,13 +1461,34 @@ def get_sw_sampling_prob_dist_modifier(kf_rgb_imgs, grid_size, sw_sampling_prob_
                            f'strategy "{sw_sampling_prob_dist_modifier_strategy}". Exiting.')
 
     add_1d_imgs_to_tensorboard(sw_sampling_prob_dist_modifier, torch.tensor([0, 0, 1]), tensorboard,
-                               'train/sampling_probability_distribution_modifier', 1, white_rgb)
+                               'train/sampling_probability_distribution_modifier', 1, cpu, white_rgb)
 
     return sw_sampling_prob_dist_modifier
 
 
 def save_point_cloud_from_rgb_imgs_and_depth_imgs(point_cloud_fpath, rgb_imgs, depth_imgs,
-                                                  world_from_cameras, intrinsics_matrix):
+                                                  world_from_cameras, intrinsics_matrix,
+                                                  tb_info=None):
     point_cloud = point_cloud_from_rgb_imgs_and_depth_imgs(rgb_imgs, depth_imgs, world_from_cameras,
                                                            intrinsics_matrix, z_forwards=False)
     o3d.io.write_point_cloud(point_cloud_fpath.as_posix(), point_cloud)
+
+    if tb_info is not None:
+        tensorboard, tb_tag, tb_iter = tb_info
+        tensorboard.add_3d(tb_tag, to_dict_batch([point_cloud]), step=tb_iter)
+
+
+class GpuMonitor(Thread):
+    def __init__(self, delay):
+        super(GpuMonitor, self).__init__()
+        self.stopped = False
+        self.delay = delay  # Time between calls to GPUtil
+        self.start()
+
+    def run(self):
+        while not self.stopped:
+            showUtilization()
+            sleep(self.delay)
+
+    def stop(self):
+        self.stopped = True

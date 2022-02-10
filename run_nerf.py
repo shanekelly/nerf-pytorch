@@ -10,6 +10,7 @@ import numpy as np
 import open3d as o3d
 import torch
 
+from GPUtil import showUtilization
 from ipdb import launch_ipdb_on_exception, set_trace
 from open3d.visualization.tensorboard_plugin import summary
 from open3d.visualization.tensorboard_plugin.util import to_dict_batch
@@ -26,7 +27,7 @@ from run_nerf_helpers import (add_1d_imgs_to_tensorboard, create_keyframes, get_
                               render_and_compute_loss, sample_pdf, sample_skf_rays, sample_sw_rays,
                               save_point_cloud_from_rgb_imgs_and_depth_imgs, select_keyframes,
                               split_into_sections, to8b, tfmats_from_minreps, minreps_from_tfmats,
-                              white_rgb)
+                              purple_rgb, white_rgb, GpuMonitor)
 
 
 cpu = torch.device('cpu')
@@ -130,7 +131,34 @@ def render_path(render_poses, hwf, intrinsics_matrix, chunk, render_kwargs, gt_i
 def create_nerf(args, initial_poses: torch.Tensor):
     """Instantiate NeRF's MLP model.
     """
-    embed_fn, input_ch = get_embedder(args.multires, args.i_embed)
+    # Load checkpoints
+    basedir = args.basedir
+    expname = args.expname
+
+    if args.ft_path is not None and args.ft_path != 'None':
+        ckpts = [args.ft_path]
+    else:
+        ckpts = [os.path.join(basedir, expname, f) for f in sorted(
+            os.listdir(os.path.join(basedir, expname))) if 'tar' in f]
+
+    print('Found ckpts', ckpts)
+
+    ckpt = None
+    if len(ckpts) > 0 and not args.no_reload:
+        ckpt_path = ckpts[-1]
+        print('Reloading from', ckpt_path)
+        ckpt = torch.load(ckpt_path, map_location=gpu_if_available)
+
+    if args.no_gaussian_positional_embedding:
+        B = None
+    else:
+        embedding_size = 256
+        scale = 8
+        B = Parameter(torch.normal(0, 1, (3, embedding_size), device=gpu_if_available) * scale)
+        if ckpt is not None:
+            B = ckpt['B']
+
+    embed_fn, input_ch = get_embedder(args.multires, args.i_embed, B=B)
 
     input_ch_views = 0
     embeddirs_fn = None
@@ -166,30 +194,19 @@ def create_nerf(args, initial_poses: torch.Tensor):
         with torch.no_grad():
             grad_vars.extend([kf_poses_params])
 
+    if not args.no_gaussian_positional_embedding:
+        with torch.no_grad():
+            grad_vars.append(B)
+
     # Create optimizer
     optimizer = torch.optim.Adam(params=grad_vars, lr=args.lrate, betas=(0.9, 0.999))
 
     start_iter_idx = 0
-    basedir = args.basedir
-    expname = args.expname
+    open3d_vis_count = 0
 
     ##########################
 
-    # Load checkpoints
-
-    if args.ft_path is not None and args.ft_path != 'None':
-        ckpts = [args.ft_path]
-    else:
-        ckpts = [os.path.join(basedir, expname, f) for f in sorted(
-            os.listdir(os.path.join(basedir, expname))) if 'tar' in f]
-
-    print('Found ckpts', ckpts)
-
-    if len(ckpts) > 0 and not args.no_reload:
-        ckpt_path = ckpts[-1]
-        print('Reloading from', ckpt_path)
-        ckpt = torch.load(ckpt_path, map_location=gpu_if_available)
-
+    if ckpt is not None:
         start_iter_idx = ckpt['global_step']
         optimizer.load_state_dict(ckpt['optimizer_state_dict'])
 
@@ -200,6 +217,7 @@ def create_nerf(args, initial_poses: torch.Tensor):
             model_fine.load_state_dict(ckpt['network_fine_state_dict'])
 
         kf_poses_params = ckpt['kf_poses_params']
+        open3d_vis_count = ckpt['open3d_vis_count']
 
     ##########################
 
@@ -226,7 +244,7 @@ def create_nerf(args, initial_poses: torch.Tensor):
     render_kwargs_test['raw_noise_std'] = 0.
 
     return (render_kwargs_train, render_kwargs_test, start_iter_idx, grad_vars, optimizer,
-            kf_poses_params)
+            kf_poses_params, open3d_vis_count, B)
 
 
 def config_parser():
@@ -273,7 +291,7 @@ def config_parser():
     # rendering options
     parser.add_argument("--N_samples", type=int, default=64,
                         help='number of coarse samples per ray')
-    parser.add_argument("--N_importance", type=int, default=64,
+    parser.add_argument("--N_importance", type=int, default=0,
                         help='number of additional fine samples per ray')
     parser.add_argument("--perturb", type=float, default=1.,
                         help='set to 0. for no jitter, 1. for jitter')
@@ -359,8 +377,12 @@ def config_parser():
 
     parser.add_argument('--i_sampling_vis', type=int, default=1000, help='The frequency of '
                         'logging visualizations about ray sampling to tensorboard.')
-    parser.add_argument('--i_pose_vis', type=int, default=1000, help='The frequency of '
-                        'logging visualizations about the camera frame poses to tensorboard.')
+    parser.add_argument("--i_3d_vis", type=int, default=5000,
+                        help='Frequency of visualizing keyframe poses and pointcloud rendered from '
+                        'keyframes.')
+    parser.add_argument("--i_B_vis", type=int, default=1000,
+                        help='Frequency of visualizing the gaussian positional encoding matrix, '
+                        'B.')
 
     parser.add_argument('--verbose', action='store_true', help='True to print additional info.')
     parser.add_argument('--no_active_sampling', action='store_true', help='Set to disable active '
@@ -398,11 +420,16 @@ def config_parser():
                         'allows for customizing that modifier. "uniform" effectively make this '
                         'modifier not exist / have no effect. "avg_saturation" modifies by the '
                         'average saturation of the pixels within each section.')
+    parser.add_argument('--no_gaussian_positional_embedding', action='store_true', help='Set to '
+                        'the standard NeRF positional embedding instead of the iMAP Gaussian '
+                        'positional embedding with learned B matrix.')
 
     return parser
 
 
 def train() -> None:
+    # gpu_monitor = GpuMonitor(0.1)
+
     parser = config_parser()
     args = parser.parse_args()
 
@@ -410,7 +437,7 @@ def train() -> None:
     tensorboard = SummaryWriter(log_dpath, flush_secs=10)
 
     # Load data from specified dataset.
-    (rgb_imgs, depth_imgs, hwf, img_height, img_width, focal, intrinsics_matrix, initial_poses,
+    (rgb_imgs, _, hwf, img_height, img_width, focal, intrinsics_matrix, initial_poses,
      render_poses, train_idxs, test_idxs, val_idxs, near, far) = load_data(args, gpu_if_available)
     test_rgb_imgs = rgb_imgs[test_idxs]
     test_poses = initial_poses[test_idxs]
@@ -418,6 +445,9 @@ def train() -> None:
     tensorboard.add_images('test/rgb/groundtruth',
                            pad_imgs(test_rgb_imgs, white_rgb, padding_width=2),
                            global_step=1, dataformats='NHWC')
+    val_idx = val_idxs[-2] if len(val_idxs) > 1 else val_idxs[0]
+    val_rgb_img = rgb_imgs[val_idx]
+    val_pose = initial_poses[val_idx, :3, :4].to(gpu_if_available)
 
     kf_rgb_imgs, kf_initial_poses, kf_idxs, n_kfs = \
         create_keyframes(rgb_imgs, initial_poses, train_idxs, args.keyframe_creation_strategy,
@@ -440,7 +470,7 @@ def train() -> None:
 
     # Create nerf model
     (render_kwargs_train, render_kwargs_test, start_iter_idx, grad_vars, optimizer,
-     kf_poses_params) = create_nerf(args, kf_initial_poses)
+     kf_poses_params, open3d_vis_count, B) = create_nerf(args, kf_initial_poses)
     global_step = start_iter_idx
 
     bds_dict = {
@@ -454,7 +484,6 @@ def train() -> None:
 
     if args.render_only:
         print('RENDER ONLY')
-        # set_trace()
         with torch.no_grad():
             if args.img_type_to_render == 'test':
                 # render_test switches to test poses
@@ -535,17 +564,18 @@ def train() -> None:
     sw_sampling_prob_dist_modifier = \
         get_sw_sampling_prob_dist_modifier(kf_rgb_imgs, grid_size,
                                            args.sw_sampling_prob_dist_modifier_strategy,
-                                           tensorboard)
+                                           tensorboard, cpu)
 
-    open3d_vis_count = 1
     start_iter_idx += 1
+    open3d_vis_count += 1
     n_training_iters = args.n_training_iters + 1
     tqdm_bar = trange(start_iter_idx, n_training_iters)
     for train_iter_idx in tqdm_bar:
         t_train_iter_start = perf_counter()
 
         log_sampling_vis = train_iter_idx % args.i_sampling_vis == 0
-        log_pose_vis = train_iter_idx % args.i_pose_vis == 0
+        log_3d_vis = train_iter_idx % args.i_3d_vis == 0
+        log_B_vis = train_iter_idx % args.i_B_vis == 0
         is_start_iter = train_iter_idx == start_iter_idx
 
         # Get the keyframe poses.
@@ -610,13 +640,18 @@ def train() -> None:
 
         if train_iter_idx % args.i_weights == 0:
             path = os.path.join(basedir, expname, '{:06d}.tar'.format(train_iter_idx))
-            torch.save({
+            save_dict = {
                 'global_step': global_step,
                 'network_fn_state_dict': render_kwargs_train['network_fn'].state_dict(),
-                'network_fine_state_dict': render_kwargs_train['network_fine'].state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'kf_poses_params': kf_poses_params
-            }, path)
+                'kf_poses_params': kf_poses_params,
+                'open3d_vis_count': open3d_vis_count,
+                'B': B
+            }
+            if render_kwargs_train['network_fine'] is not None:
+                save_dict['network_fine_state_dict'] = \
+                    render_kwargs_train['network_fine'].state_dict(),
+            torch.save(save_dict, path)
             print('Saved checkpoints at', path)
 
         if train_iter_idx % args.i_video == 0 and train_iter_idx > 0:
@@ -638,11 +673,11 @@ def train() -> None:
                     test_poses.to(gpu_if_available), hwf, intrinsics_matrix, args.chunk,
                     render_kwargs_test,
                     gt_imgs=test_rgb_imgs, savedir=testsavedir)
-            test_rendered_rgbs = torch.from_numpy(test_rendered_rgbs_np)
-            test_loss = img2mse(test_rendered_rgbs, test_rgb_imgs.to(cpu))
-            test_psnr = mse2psnr(test_loss)
+                test_rendered_rgbs = torch.from_numpy(test_rendered_rgbs_np)
+                test_loss = img2mse(test_rendered_rgbs, test_rgb_imgs.to(cpu))
+                test_psnr = mse2psnr(test_loss)
 
-            tensorboard.add_images('test/rgb/estimate', pad_imgs(test_rendered_rgbs, white_rgb, 5),
+            tensorboard.add_images('test/rgb/estimate', pad_imgs(test_rendered_rgbs, white_rgb, 2),
                                    train_iter_idx, dataformats='NHWC')
             tensorboard.add_scalar('test/loss', test_loss, train_iter_idx)
             tensorboard.add_scalar('test/psnr', test_psnr, train_iter_idx)
@@ -653,37 +688,35 @@ def train() -> None:
 
         if log_sampling_vis:
             sampling_name = 'active_sampling' if do_active_sampling else 'sampling'
-            add_1d_imgs_to_tensorboard(sw_total_n_sampled, torch.Tensor([1, 0, 0]), tensorboard,
-                                       f'train/{sampling_name}/cumulative_samples_per_section',
-                                       train_iter_idx)
+            with torch.no_grad():
+                add_1d_imgs_to_tensorboard(sw_total_n_sampled, torch.Tensor([1, 0, 0]), tensorboard,
+                                           f'train/{sampling_name}/cumulative_samples_per_section',
+                                           train_iter_idx, cpu)
 
-            add_1d_imgs_to_tensorboard(sw_kf_loss, torch.Tensor([0, 0.8, 0]), tensorboard,
-                                       'train/estimated_loss_distribution', train_iter_idx)
+                add_1d_imgs_to_tensorboard(sw_kf_loss, torch.Tensor([0, 0.8, 0]), tensorboard,
+                                           'train/estimated_loss_distribution', train_iter_idx, cpu)
 
         if train_iter_idx % args.i_val == 0:
             # Log a rendered validation view to Tensorboard.
-            val_idx = val_idxs[-2] if len(val_idxs) > 1 else val_idxs[0]
-            val_gt_rgbs = rgb_imgs[val_idx]
-            c2w = initial_poses[val_idx, :3, :4].to(gpu_if_available)
             with torch.no_grad():
                 val_rendered_rgb, val_rendered_disp, _, _ = \
                     render(img_height, img_width, intrinsics_matrix, gpu_if_available,
-                           chunk=args.chunk, c2w=c2w, **render_kwargs_test)
+                           chunk=args.chunk, c2w=val_pose, **render_kwargs_test)
 
-            val_loss = img2mse(val_rendered_rgb, val_gt_rgbs)
-            val_psnr = mse2psnr(val_loss)
+                val_loss = img2mse(val_rendered_rgb, val_rgb_img)
+                val_psnr = mse2psnr(val_loss)
 
             tensorboard.add_image('validation/rgb/estimate', val_rendered_rgb,
                                   train_iter_idx, dataformats='HWC')
             if train_iter_idx == args.i_val:
-                tensorboard.add_image('validation/rgb/groundtruth', val_gt_rgbs,
+                tensorboard.add_image('validation/rgb/groundtruth', val_rgb_img,
                                       train_iter_idx, dataformats='HWC')
             tensorboard.add_image('validation/depth/estimate', 1 / val_rendered_disp,
                                   train_iter_idx, dataformats='HW')
             tensorboard.add_scalar('validation/loss', val_loss, train_iter_idx)
             tensorboard.add_scalar('validation/psnr', val_psnr, train_iter_idx)
 
-        if log_pose_vis:
+        if log_3d_vis:
             # Create a set of Open3D XYZ coordinate axes at the location of every initial pose and
             # optimized pose, then log them to tensorboard for visualization.
             kf_initial_poses_np = kf_initial_poses.cpu().numpy()
@@ -699,8 +732,25 @@ def train() -> None:
                 tensorboard.add_3d(f'train/pose{idx:03d}-optimized',
                                    to_dict_batch([optimized_coordinate_frames[idx]]),
                                    step=open3d_vis_count)
+            with torch.no_grad():
+                rendered_rgb_imgs, rendered_disp_imgs = \
+                    render_path(kf_poses, hwf, intrinsics_matrix, args.chunk, render_kwargs_test,
+                                gt_imgs=kf_rgb_imgs, savedir=None,
+                                render_factor=args.render_factor)
+                rendered_depth_imgs = 1 / rendered_disp_imgs
+                tb_info = (tensorboard, 'train/point-cloud', open3d_vis_count)
+                save_point_cloud_from_rgb_imgs_and_depth_imgs(
+                    log_dpath /
+                    'rendered-kf-point-cloud-{train_iter_idx:06d}.ply', rendered_rgb_imgs,
+                    rendered_depth_imgs, kf_poses, intrinsics_matrix, tb_info)
 
-            open3d_vis_count += 1
+                open3d_vis_count += 1
+
+        if log_B_vis:
+            with torch.no_grad():
+                add_1d_imgs_to_tensorboard(B.unsqueeze(0), purple_rgb, tensorboard,
+                                           'train/gaussian_positional_encoding_matrix',
+                                           train_iter_idx, cpu, padding_width=0)
 
         if do_active_sampling and do_lazy_sw_loss:
             # Update the estimated section-wise loss probability distribution using the loss from
