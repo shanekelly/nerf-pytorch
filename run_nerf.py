@@ -2,7 +2,7 @@ import os
 import imageio
 
 from pathlib import Path
-from pickle import dump
+from pickle import dump, load
 from time import time, perf_counter
 from typing import Dict, Optional
 
@@ -19,13 +19,14 @@ from torch.nn.functional import relu
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm, trange
 
-from run_nerf_helpers import (add_1d_imgs_to_tensorboard, create_keyframes, get_coordinate_frames,
-                              get_idxs_tuple, get_kf_poses, get_sw_n_sampled, get_sw_rays,
+from run_nerf_helpers import (add_1d_imgs_to_tensorboard, append_to_log_file, create_keyframes, get_coordinate_frames,
+                              get_idxs_tuple, get_kf_poses, get_log_fpath, get_sw_n_sampled, get_sw_rays,
                               get_embedder, get_rays, get_sw_loss,
                               get_sw_sampling_prob_dist_modifier, img2mse, initialize_sw_kf_loss,
                               load_data, mse2psnr, NeRF, ndc_rays, pad_imgs, pad_sections, render,
                               render_and_compute_loss, sample_pdf, sample_skf_rays, sample_sw_rays,
                               save_point_cloud_from_rgb_imgs_and_depth_imgs, select_keyframes,
+                              should_trigger,
                               split_into_sections, to8b, tfmats_from_minreps, minreps_from_tfmats,
                               purple_rgb, white_rgb, GpuMonitor)
 
@@ -357,16 +358,48 @@ def config_parser():
                         help='will take every 1/N images as LLFF test set, paper uses 8')
 
     # logging/saving options
-    parser.add_argument("--i_train_scalars",   type=int, default=100,
+    parser.add_argument('--save_logs_to_file', action='store_true', help='Set to save '
+                        'some tensorboard visualizations to file in addition to logging them to '
+                        'tensorboard.')
+    parser.add_argument("--i_train_scalars",   type=int, default=0,
                         help='frequency of console printout and metric loggin')
-    parser.add_argument("--i_val",     type=int, default=1000,
+    parser.add_argument("--s_train_scalars",   type=int, default=-1,
+                        help='frequency of console printout and metric loggin')
+    parser.add_argument("--i_val",     type=int, default=0,
                         help='frequency of tensorboard image logging')
-    parser.add_argument("--i_weights", type=int, default=10000,
+    parser.add_argument("--s_val",     type=int, default=-1,
+                        help='frequency of tensorboard image logging')
+    parser.add_argument("--i_weights", type=int, default=0,
                         help='frequency of weight ckpt saving')
-    parser.add_argument("--i_test", type=int, default=10000,
+    parser.add_argument("--s_weights", type=int, default=-1,
+                        help='frequency of weight ckpt saving')
+    parser.add_argument("--i_test", type=int, default=0,
                         help='frequency of testset saving')
-    parser.add_argument("--i_video",   type=int, default=50000,
+    parser.add_argument("--i_video",   type=int, default=0,
                         help='frequency of render_poses video saving')
+    parser.add_argument('--i_sampling_vis', type=int, default=0, help='The frequency of '
+                        'logging visualizations about ray sampling to tensorboard.')
+    parser.add_argument('--s_sampling_vis', type=int, default=-1, help='The frequency of '
+                        'logging visualizations about ray sampling to tensorboard.')
+    parser.add_argument("--i_poses_vis", type=int, default=0,
+                        help='Frequency of visualizing keyframe poses.')
+    parser.add_argument("--s_poses_vis", type=int, default=-1,
+                        help='Frequency of visualizing keyframe poses.')
+    parser.add_argument("--i_kf_renders_vis", type=int, default=0,
+                        help='Frequency of visualizing RGBD results of rendering at keyframe poses.')
+    parser.add_argument("--s_kf_renders_vis", type=int, default=-1,
+                        help='Frequency of visualizing RGBD results of rendering at keyframe poses.')
+    parser.add_argument("--i_point_cloud_vis", type=int, default=0,
+                        help='Frequency of visualizing point cloud rendered from '
+                        'keyframes.')
+    parser.add_argument("--s_point_cloud_vis", type=int, default=-1,
+                        help='Frequency of visualizing point cloud rendered from '
+                        'keyframes.')
+    parser.add_argument("--i_B_vis", type=int, default=0,
+                        help='Frequency of visualizing the gaussian positional encoding matrix, '
+                        'B.')
+    parser.add_argument('--s_stop', type=int, default=-1,
+                        help='When to stop training, in seconds.')
 
     # sk: My options.
     parser.add_argument('--img_grid_side_len',   type=int, default=8,
@@ -374,15 +407,6 @@ def config_parser():
                         'image active sampling.')
     parser.add_argument('--n_training_iters', type=int, default=50000, help='The number of '
                         'training iterations to run for.')
-
-    parser.add_argument('--i_sampling_vis', type=int, default=1000, help='The frequency of '
-                        'logging visualizations about ray sampling to tensorboard.')
-    parser.add_argument("--i_3d_vis", type=int, default=5000,
-                        help='Frequency of visualizing keyframe poses and pointcloud rendered from '
-                        'keyframes.')
-    parser.add_argument("--i_B_vis", type=int, default=1000,
-                        help='Frequency of visualizing the gaussian positional encoding matrix, '
-                        'B.')
 
     parser.add_argument('--verbose', action='store_true', help='True to print additional info.')
     parser.add_argument('--no_active_sampling', action='store_true', help='Set to disable active '
@@ -434,6 +458,8 @@ def train() -> None:
     args = parser.parse_args()
 
     log_dpath = Path(args.basedir) / args.expname
+    vis_dpath = log_dpath / 'vis'
+    vis_dpath.mkdir(parents=True, exist_ok=True)
     tensorboard = SummaryWriter(log_dpath, flush_secs=10)
 
     # Load data from specified dataset.
@@ -552,11 +578,12 @@ def train() -> None:
     n_total_rays_to_sample = N_rand
     sw_sampling_prob_dist = torch.tensor(1 / n_total_sections).expand(dims_kf_sw)
 
-    sw_kf_loss = \
-        initialize_sw_kf_loss(kf_rgb_imgs, kf_initial_poses, sw_unif_sampling_prob_dist, dims_kf_pw,
-                              intrinsics_matrix, n_total_rays_to_unif_sample, render_kwargs_train,
-                              args.chunk, optimizer, do_active_sampling, tensorboard,
-                              cpu, gpu_if_available, verbose=verbose)
+    with torch.no_grad():
+        sw_kf_loss = \
+            initialize_sw_kf_loss(kf_rgb_imgs, kf_initial_poses, sw_unif_sampling_prob_dist, dims_kf_pw,
+                                  intrinsics_matrix, n_total_rays_to_unif_sample, render_kwargs_train,
+                                  args.chunk, optimizer, do_active_sampling, tensorboard,
+                                  cpu, gpu_if_available, verbose=verbose)
     sw_total_n_sampled = torch.zeros(dims_kf_sw, dtype=torch.int64)
     tensorboard.add_images('train/keyframes',
                            pad_sections(kf_rgb_imgs, dims_kf_pw, white_rgb, padding_width=2),
@@ -566,6 +593,15 @@ def train() -> None:
                                            args.sw_sampling_prob_dist_modifier_strategy,
                                            tensorboard, cpu)
 
+    t_prev_train_scalars_log = 0.0
+    t_prev_val_log = 0.0
+    t_prev_sampling_vis_log = 0.0
+    t_prev_poses_vis_log = 0.0
+    t_prev_point_cloud_vis_log = 0.0
+    t_prev_weights_log = 0.0
+    t_prev_kf_renders_log = 0.0
+    t_training_start = perf_counter()
+
     start_iter_idx += 1
     open3d_vis_count += 1
     n_training_iters = args.n_training_iters + 1
@@ -573,10 +609,26 @@ def train() -> None:
     for train_iter_idx in tqdm_bar:
         t_train_iter_start = perf_counter()
 
-        log_sampling_vis = train_iter_idx % args.i_sampling_vis == 0
-        log_3d_vis = train_iter_idx % args.i_3d_vis == 0
-        log_B_vis = train_iter_idx % args.i_B_vis == 0
+        is_first_iter = train_iter_idx == 1
         is_start_iter = train_iter_idx == start_iter_idx
+
+        log_train_scalars = should_trigger(train_iter_idx, args.i_train_scalars,
+                                           t_prev_train_scalars_log, args.s_train_scalars)
+        log_sampling_vis = should_trigger(train_iter_idx, args.i_sampling_vis, t_prev_sampling_vis_log,
+                                          args.s_sampling_vis)
+        log_val_vis = should_trigger(train_iter_idx, args.i_val, t_prev_val_log, args.s_val)
+        log_poses_vis = should_trigger(train_iter_idx, args.i_poses_vis, t_prev_poses_vis_log,
+                                       args.s_poses_vis)
+        log_point_cloud_vis = should_trigger(train_iter_idx, args.i_point_cloud_vis,
+                                             t_prev_point_cloud_vis_log, args.s_point_cloud_vis)
+        log_B_vis = should_trigger(train_iter_idx, args.i_B_vis)
+        log_weights = should_trigger(train_iter_idx, args.i_weights, t_prev_weights_log,
+                                     args.s_weights)
+        log_video = should_trigger(train_iter_idx, args.i_video) and train_iter_idx > 0
+        log_test = should_trigger(train_iter_idx, args.i_test) and train_iter_idx > 0
+        log_kf_renders_log = should_trigger(train_iter_idx, args.i_kf_renders_vis,
+                                            t_prev_kf_renders_log, args.s_kf_renders_vis)
+        should_stop = should_trigger(train_iter_idx, 0, t_training_start, args.s_stop)
 
         # Get the keyframe poses.
         kf_poses, t_get_poses = get_kf_poses(
@@ -594,9 +646,8 @@ def train() -> None:
         dims_skf_sw = dims_skf_pw[:3]
 
         # Compute the rays from the selected keyframe images and poses.
-        sw_skf_rays, t_get_rays = \
-            get_sw_rays(skf_rgb_imgs, img_height, img_width, intrinsics_matrix, skf_poses, n_skfs,
-                        grid_size, section_height, section_width, gpu_if_available)
+        sw_skf_rays, t_get_rays = get_sw_rays(skf_rgb_imgs, img_height, img_width, intrinsics_matrix, skf_poses, n_skfs,
+                                              grid_size, section_height, section_width, gpu_if_available)
 
         # Sample rays to use for training.
         sampled_rays, sampled_skf_sw_idxs, sw_n_newly_sampled, t_sample_rays = \
@@ -615,11 +666,10 @@ def train() -> None:
         # Render the sampled rays and compute the loss.
         sampled_skf_sw_idxs_tuple = get_idxs_tuple(sampled_skf_sw_idxs[:, :3])
         (train_rendered_rgbs, train_gt_rgbs, _, new_sw_skf_loss, train_loss, train_psnr, t_batching,
-         t_rendering, t_loss) = \
-            render_and_compute_loss(sampled_rays, intrinsics_matrix, render_kwargs_train,
-                                    img_height, img_width, dims_skf_sw, args.chunk,
-                                    sampled_skf_sw_idxs_tuple, sw_n_newly_sampled, optimizer,
-                                    train_iter_idx, cpu, gpu_if_available)
+         t_rendering, t_loss) = render_and_compute_loss(sampled_rays, intrinsics_matrix, render_kwargs_train,
+                                                        img_height, img_width, dims_skf_sw, args.chunk,
+                                                        sampled_skf_sw_idxs_tuple, sw_n_newly_sampled, optimizer,
+                                                        train_iter_idx, cpu, gpu_if_available)
 
         # Compute gradients for parameters via backpropagation and use them to update parameter
         # values.
@@ -638,7 +688,7 @@ def train() -> None:
 
             # Rest is logging.
 
-        if train_iter_idx % args.i_weights == 0:
+        if log_weights:
             path = os.path.join(basedir, expname, '{:06d}.tar'.format(train_iter_idx))
             save_dict = {
                 'global_step': global_step,
@@ -649,12 +699,12 @@ def train() -> None:
                 'B': B
             }
             if render_kwargs_train['network_fine'] is not None:
-                save_dict['network_fine_state_dict'] = \
-                    render_kwargs_train['network_fine'].state_dict(),
+                save_dict['network_fine_state_dict'] = render_kwargs_train['network_fine'].state_dict(),
             torch.save(save_dict, path)
             print('Saved checkpoints at', path)
+            t_prev_weights_log = t_train_iter_start
 
-        if train_iter_idx % args.i_video == 0 and train_iter_idx > 0:
+        if log_video:
             # Turn on testing mode
             with torch.no_grad():
                 rgbs, disps = render_path(render_poses, hwf, intrinsics_matrix,
@@ -665,7 +715,7 @@ def train() -> None:
             imageio.mimwrite(moviebase + 'rgb.mp4', to8b(rgbs), fps=30, quality=8)
             imageio.mimwrite(moviebase + 'disp.mp4', to8b(disps / np.max(disps)), fps=30, quality=8)
 
-        if train_iter_idx % args.i_test == 0 and train_iter_idx > 0:
+        if log_test:
             testsavedir = os.path.join(basedir, expname, f'testset_{train_iter_idx:06d}')
             os.makedirs(testsavedir, exist_ok=True)
             with torch.no_grad():
@@ -682,9 +732,14 @@ def train() -> None:
             tensorboard.add_scalar('test/loss', test_loss, train_iter_idx)
             tensorboard.add_scalar('test/psnr', test_psnr, train_iter_idx)
 
-        if train_iter_idx % args.i_train_scalars == 0:
-            tensorboard.add_scalar('train/loss', train_loss, train_iter_idx)
-            tensorboard.add_scalar('train/psnr', train_psnr, train_iter_idx)
+        if log_train_scalars:
+            with torch.no_grad():
+                tensorboard.add_scalar('train/loss', train_loss, train_iter_idx)
+                tensorboard.add_scalar('train/psnr', train_psnr, train_iter_idx)
+                if (args.save_logs_to_file):
+                    append_to_log_file(vis_dpath, 'loss', args.i_train_scalars, args.s_train_scalars,
+                                       train_loss)
+                t_prev_train_scalars_log = t_train_iter_start
 
         if log_sampling_vis:
             sampling_name = 'active_sampling' if do_active_sampling else 'sampling'
@@ -695,13 +750,15 @@ def train() -> None:
 
                 add_1d_imgs_to_tensorboard(sw_kf_loss, torch.Tensor([0, 0.8, 0]), tensorboard,
                                            'train/estimated_loss_distribution', train_iter_idx, cpu)
+            t_prev_sampling_vis_log = t_train_iter_start
 
-        if train_iter_idx % args.i_val == 0:
+        if log_val_vis:
             # Log a rendered validation view to Tensorboard.
             with torch.no_grad():
                 val_rendered_rgb, val_rendered_disp, _, _ = \
                     render(img_height, img_width, intrinsics_matrix, gpu_if_available,
                            chunk=args.chunk, c2w=val_pose, **render_kwargs_test)
+                val_rendered_depth = 1 / val_rendered_disp
 
                 val_loss = img2mse(val_rendered_rgb, val_rgb_img)
                 val_psnr = mse2psnr(val_loss)
@@ -711,27 +768,62 @@ def train() -> None:
             if train_iter_idx == args.i_val:
                 tensorboard.add_image('validation/rgb/groundtruth', val_rgb_img,
                                       train_iter_idx, dataformats='HWC')
-            tensorboard.add_image('validation/depth/estimate', 1 / val_rendered_disp,
+            tensorboard.add_image('validation/depth/estimate', val_rendered_depth,
                                   train_iter_idx, dataformats='HW')
             tensorboard.add_scalar('validation/loss', val_loss, train_iter_idx)
             tensorboard.add_scalar('validation/psnr', val_psnr, train_iter_idx)
+            if args.save_logs_to_file:
+                if is_first_iter:
+                    torch.save(intrinsics_matrix.cpu(), vis_dpath / 'intrinsics-matrix_rgb.pt')
+                    torch.save(torch.cat((val_pose.cpu(), torch.tensor(
+                        [[0.0, 0.0, 0.0, 1.0]])), 0), vis_dpath / 'val-pose.pt')
+                append_to_log_file(vis_dpath, 'val-rgbd', args.i_val, args.s_val,
+                                   torch.cat((val_rendered_rgb, val_rendered_depth.unsqueeze(-1)), -1))
+            t_prev_val_log = t_train_iter_start
 
-        if log_3d_vis:
-            # Create a set of Open3D XYZ coordinate axes at the location of every initial pose and
-            # optimized pose, then log them to tensorboard for visualization.
-            kf_initial_poses_np = kf_initial_poses.cpu().numpy()
-            kf_poses_np = kf_poses.detach().cpu().numpy()
-            initial_coordinate_frames = get_coordinate_frames(kf_initial_poses_np, gray_out=True)
-            optimized_coordinate_frames = get_coordinate_frames(kf_poses_np)
-            for idx in range(len(initial_coordinate_frames)):
-                # TODO: Efficiently store initial poses, since they are always the same at every
-                # iteration.
-                tensorboard.add_3d(f'train/pose{idx:03d}-initial',
-                                   to_dict_batch([initial_coordinate_frames[idx]]),
-                                   step=open3d_vis_count)
-                tensorboard.add_3d(f'train/pose{idx:03d}-optimized',
-                                   to_dict_batch([optimized_coordinate_frames[idx]]),
-                                   step=open3d_vis_count)
+        if log_kf_renders_log:
+            with torch.no_grad():
+                kf_rendered_rgbs_np, kf_rendered_disps_np = render_path(
+                    kf_poses.to(gpu_if_available), hwf, intrinsics_matrix, args.chunk,
+                    render_kwargs_test, gt_imgs=kf_rgb_imgs)
+            kf_rendered_rgbds = \
+                torch.cat((torch.from_numpy(kf_rendered_rgbs_np),
+                           (1 / torch.from_numpy(kf_rendered_disps_np)).unsqueeze(-1)), -1)
+            if args.save_logs_to_file:
+                if is_first_iter:
+                    torch.save(intrinsics_matrix, vis_dpath / 'rgb-intrinsics-matrix.pt')
+                append_to_log_file(vis_dpath, 'kfs-rgbd', args.i_kf_renders_vis,
+                                   args.s_kf_renders_vis, kf_rendered_rgbds)
+            t_prev_kf_renders_log = t_train_iter_start
+
+        if log_poses_vis:
+            with torch.no_grad():
+                # Create a set of Open3D XYZ coordinate axes at the location of every initial pose and
+                # optimized pose, then log them to tensorboard for visualization.
+                kf_initial_poses_np = kf_initial_poses.cpu().numpy()
+                kf_poses_np = kf_poses.detach().cpu().numpy()
+                initial_coordinate_frames = get_coordinate_frames(
+                    kf_initial_poses_np, gray_out=True)
+                optimized_coordinate_frames = get_coordinate_frames(kf_poses_np)
+                for idx in range(len(initial_coordinate_frames)):
+                    # TODO: Efficiently store initial poses, since they are always the same at every
+                    # iteration.
+                    tensorboard.add_3d(f'train/pose{idx:03d}-initial',
+                                       to_dict_batch([initial_coordinate_frames[idx]]),
+                                       step=open3d_vis_count)
+                    tensorboard.add_3d(f'train/pose{idx:03d}-optimized',
+                                       to_dict_batch([optimized_coordinate_frames[idx]]),
+                                       step=open3d_vis_count)
+                if args.save_logs_to_file:
+                    if is_first_iter:
+                        append_to_log_file(vis_dpath, 'poses', args.i_poses_vis, args.s_poses_vis,
+                                           kf_initial_poses)
+                    append_to_log_file(vis_dpath, 'poses', args.i_poses_vis, args.s_poses_vis,
+                                       kf_poses)
+            open3d_vis_count += 1
+            t_prev_poses_vis_log = t_train_iter_start
+
+        if log_point_cloud_vis:
             with torch.no_grad():
                 rendered_rgb_imgs, rendered_disp_imgs = \
                     render_path(kf_poses, hwf, intrinsics_matrix, args.chunk, render_kwargs_test,
@@ -740,11 +832,12 @@ def train() -> None:
                 rendered_depth_imgs = 1 / rendered_disp_imgs
                 tb_info = (tensorboard, 'train/point-cloud', open3d_vis_count)
                 save_point_cloud_from_rgb_imgs_and_depth_imgs(
-                    log_dpath /
-                    'rendered-kf-point-cloud-{train_iter_idx:06d}.ply', rendered_rgb_imgs,
+                    vis_dpath /
+                    f'rendered-kf-point-cloud-{train_iter_idx:06d}.ply', rendered_rgb_imgs,
                     rendered_depth_imgs, kf_poses, intrinsics_matrix, tb_info)
 
-                open3d_vis_count += 1
+            open3d_vis_count += 1
+            t_prev_point_cloud_vis_log = t_train_iter_start
 
         if log_B_vis:
             with torch.no_grad():
@@ -757,10 +850,9 @@ def train() -> None:
             # the rays that were just actively sampled.
             with torch.no_grad():
                 # Only update the loss of sections that were sampled from.
-                sampled_kf_sw_idxs_tuple = \
-                    tuple([torch.tensor([skf_from_kf_idxs[idx] for
-                                         idx in sampled_skf_sw_idxs_tuple[0]]),
-                           sampled_skf_sw_idxs_tuple[1], sampled_skf_sw_idxs_tuple[2]])
+                sampled_kf_sw_idxs_tuple = tuple([torch.tensor([skf_from_kf_idxs[idx] for
+                                                                idx in sampled_skf_sw_idxs_tuple[0]]),
+                                                  sampled_skf_sw_idxs_tuple[1], sampled_skf_sw_idxs_tuple[2]])
                 sw_kf_loss[sampled_kf_sw_idxs_tuple] = new_sw_skf_loss[sampled_skf_sw_idxs_tuple]
 
         t_train_iter = perf_counter() - t_train_iter_start
@@ -771,6 +863,9 @@ def train() -> None:
             f'l{t_loss:.3f},bp{t_backprop:.3f}')
 
         global_step += 1
+
+        if should_stop:
+            return
 
 
 if __name__ == '__main__':

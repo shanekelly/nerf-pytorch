@@ -1,5 +1,6 @@
 from argparse import Namespace
 from itertools import product
+from pickle import dump, load
 from time import perf_counter
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -1492,3 +1493,33 @@ class GpuMonitor(Thread):
 
     def stop(self):
         self.stopped = True
+
+
+def should_trigger(train_iter_idx, i_log, t_prev_log=None, s_log=None):
+    if i_log > 0 and train_iter_idx % i_log == 0:
+        return True
+    if t_prev_log is not None and s_log is not None:
+        if s_log >= 0 and perf_counter() - t_prev_log >= s_log:
+            return True
+    return False
+
+
+def get_log_fpath(base_dpath, base_fname, i_log, s_log=None):
+    fname = base_fname
+    if i_log > 0:
+        fname = f'{fname}_every-{i_log}-i'
+    if s_log is not None and s_log >= 0.0:
+        fname = f'{fname}_every-{s_log}-s'
+    return base_dpath / f'{fname}.pt'
+
+
+def append_to_log_file(base_dpath, base_fname, i_log, s_log, content_to_append_):
+
+    content_to_append = content_to_append_.clone().detach().cpu().unsqueeze(0)
+
+    log_fpath = get_log_fpath(base_dpath, base_fname, i_log, s_log)
+    if log_fpath.exists():
+        log_file_contents = torch.cat((torch.load(log_fpath), content_to_append))
+    else:
+        log_file_contents = content_to_append
+    torch.save(log_file_contents, log_fpath)
