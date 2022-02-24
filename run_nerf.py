@@ -613,6 +613,7 @@ def train() -> None:
     n_training_iters = args.n_training_iters + 1
     tqdm_bar = trange(start_iter_idx, n_training_iters)
     for train_iter_idx in tqdm_bar:
+        print('a')
         t_train_iter_start = perf_counter()
 
         is_first_iter = train_iter_idx == 1

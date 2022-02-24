@@ -19,6 +19,7 @@ from threading import Thread
 from torch.nn.functional import relu
 from torch.utils.tensorboard import SummaryWriter
 
+from image.util import color_1d_imgs
 from point_cloud.rgbd import point_cloud_from_rgb_imgs_and_depth_imgs
 
 from load_llff import load_llff_data
@@ -746,8 +747,8 @@ def get_sw_rays(images: torch.Tensor, img_height: int, img_width: int, intrinsic
         img_stop_row_idx = (grid_row_idx + 1) * section_height
         img_start_col_idx = grid_col_idx * section_width
         img_stop_col_idx = (grid_col_idx + 1) * section_width
-        sw_rays[:, grid_row_idx, grid_col_idx, :, :, :] = \
-            rays[:, img_start_row_idx:img_stop_row_idx, img_start_col_idx:img_stop_col_idx, :, :]
+        sw_rays[:, grid_row_idx, grid_col_idx, :, :, :] = rays[:,
+                                                               img_start_row_idx:img_stop_row_idx, img_start_col_idx:img_stop_col_idx, :, :]
 
     t_delta = perf_counter() - t_start
 
@@ -787,8 +788,8 @@ def get_initial_section_rand_pixel_idxs(num_train_imgs: int, grid_size: int, sec
                                                        range(grid_size),
                                                        range(grid_size)):
         rand_pixel_idxs = torch.randperm(num_pixels_per_section)
-        section_rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, :, :] = \
-            section_rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, rand_pixel_idxs, :]
+        section_rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, :,
+                                :] = section_rand_pixel_idxs[img_idx, grid_row_idx, grid_col_idx, rand_pixel_idxs, :]
 
     t_delta = perf_counter() - t_start
 
@@ -849,9 +850,8 @@ def pad_sections(imgs: torch.Tensor, dims_pw: Tuple[int, int, int, int, int],
         padded_section_col_stop_idx = padded_section_col_start_idx + section_width
 
         padded_imgs[:, padded_section_row_start_idx:padded_section_row_stop_idx,
-                    padded_section_col_start_idx:padded_section_col_stop_idx] = \
-            imgs[:, section_row_start_idx:section_row_stop_idx,
-                 section_col_start_idx:section_col_stop_idx, :]
+                    padded_section_col_start_idx:padded_section_col_stop_idx] = imgs[:, section_row_start_idx:section_row_stop_idx,
+                                                                                     section_col_start_idx:section_col_stop_idx, :]
 
     return padded_imgs
 
@@ -1069,19 +1069,8 @@ def add_1d_imgs_to_tensorboard(imgs_: torch.Tensor, img_rgb: torch.Tensor,
 
     assert imgs.dim() == 3  # N, H, W
 
-    # Scale all pixels between 0 and 1.
-    imgs_scaled = imgs / torch.max(imgs)
-
-    # If an element has the value 0, then it should receive the RGB value of zero_rgb.
-    zero_rgb = torch.Tensor([1]).expand(3)
-    # If an element has the value 1 (the max value after scaling), then it should receive the RGB
-    # value of max_rgb.
-    max_rgb = img_rgb
-    diff_rgb = max_rgb - zero_rgb
-
-    # Linear interpolation between zero_rgb and max_rgb based on the value of each pixel.
-    output_imgs = (zero_rgb.repeat(imgs.shape[0], imgs.shape[1], imgs.shape[2], 1) +
-                   imgs_scaled.unsqueeze(-1).repeat(1, 1, 1, 3) * diff_rgb)
+    # Color each pixel of each image according to its value.
+    output_imgs = color_1d_imgs(imgs)
 
     # Add border around each image.
     if padding_width > 0:
@@ -1293,11 +1282,10 @@ def initialize_sw_kf_loss(kf_rgb_imgs, kf_poses, sw_unif_sampling_prob_dist, dim
                                                                             enforce_min_samples=True)
     # Render the sampled rays and compute section-wise loss.
     sampled_sw_idxs_tuple = get_idxs_tuple(sampled_pw_idxs[:, :3])
-    _, _, _, sw_kf_loss, _, _, _, _, _ = \
-        render_and_compute_loss(sampled_rays, intrinsics_matrix, render_kwargs_train,
-                                img_height, img_width, dims_kf_sw, chunk,
-                                sampled_sw_idxs_tuple, sw_n_newly_sampled, optimizer,
-                                1, cpu, gpu_if_available)
+    _, _, _, sw_kf_loss, _, _, _, _, _ = render_and_compute_loss(sampled_rays, intrinsics_matrix, render_kwargs_train,
+                                                                 img_height, img_width, dims_kf_sw, chunk,
+                                                                 sampled_sw_idxs_tuple, sw_n_newly_sampled, optimizer,
+                                                                 1, cpu, gpu_if_available)
 
     return sw_kf_loss
 
