@@ -154,7 +154,7 @@ def create_nerf(args, initial_poses: torch.Tensor):
         B = None
     else:
         embedding_size = 256
-        scale = 8
+        scale = args.initial_gpe_scale
         B = Parameter(torch.normal(0, 1, (3, embedding_size), device=gpu_if_available) * scale)
         if ckpt is not None:
             B = ckpt['B']
@@ -398,6 +398,9 @@ def config_parser():
     parser.add_argument("--i_B_vis", type=int, default=0,
                         help='Frequency of visualizing the gaussian positional encoding matrix, '
                         'B.')
+    parser.add_argument("--s_B_vis", type=int, default=-1,
+                        help='Frequency of visualizing the gaussian positional encoding matrix, '
+                        'B.')
     parser.add_argument('--s_stop', type=int, default=-1,
                         help='When to stop training, in seconds.')
 
@@ -447,6 +450,8 @@ def config_parser():
     parser.add_argument('--no_gaussian_positional_embedding', action='store_true', help='Set to '
                         'the standard NeRF positional embedding instead of the iMAP Gaussian '
                         'positional embedding with learned B matrix.')
+    parser.add_argument('--initial_gpe_scale', type=float, default=8, help='The scale to use for '
+                        'initializing the Gaussian Positional Encoding matrix.')
 
     return parser
 
@@ -600,6 +605,7 @@ def train() -> None:
     t_prev_point_cloud_vis_log = 0.0
     t_prev_weights_log = 0.0
     t_prev_kf_renders_log = 0.0
+    t_prev_B_vis_log = 0.0
     t_training_start = perf_counter()
 
     start_iter_idx += 1
@@ -621,7 +627,7 @@ def train() -> None:
                                        args.s_poses_vis)
         log_point_cloud_vis = should_trigger(train_iter_idx, args.i_point_cloud_vis,
                                              t_prev_point_cloud_vis_log, args.s_point_cloud_vis)
-        log_B_vis = should_trigger(train_iter_idx, args.i_B_vis)
+        log_B_vis = should_trigger(train_iter_idx, args.i_B_vis, t_prev_B_vis_log, args.s_B_vis)
         log_weights = should_trigger(train_iter_idx, args.i_weights, t_prev_weights_log,
                                      args.s_weights)
         log_video = should_trigger(train_iter_idx, args.i_video) and train_iter_idx > 0
@@ -791,7 +797,7 @@ def train() -> None:
                            (1 / torch.from_numpy(kf_rendered_disps_np)).unsqueeze(-1)), -1)
             if args.save_logs_to_file:
                 if is_first_iter:
-                    torch.save(intrinsics_matrix, vis_dpath / 'rgb-intrinsics-matrix.pt')
+                    torch.save(intrinsics_matrix, vis_dpath / 'intrinsics-matrix_rgb.pt')
                 append_to_log_file(vis_dpath, 'kfs-rgbd', args.i_kf_renders_vis,
                                    args.s_kf_renders_vis, kf_rendered_rgbds)
             t_prev_kf_renders_log = t_train_iter_start
@@ -844,6 +850,9 @@ def train() -> None:
                 add_1d_imgs_to_tensorboard(B.unsqueeze(0), purple_rgb, tensorboard,
                                            'train/gaussian_positional_encoding_matrix',
                                            train_iter_idx, cpu, padding_width=0)
+            if args.save_logs_to_file:
+                append_to_log_file(vis_dpath, 'gpe-mat', args.i_B_vis, args.s_B_vis, B)
+            t_prev_B_vis_log = t_train_iter_start
 
         if do_active_sampling and do_lazy_sw_loss:
             # Update the estimated section-wise loss probability distribution using the loss from
