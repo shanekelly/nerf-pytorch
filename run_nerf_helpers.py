@@ -13,6 +13,7 @@ from ipdb import set_trace
 from torch.nn.functional import relu
 from torch.utils.tensorboard import SummaryWriter
 
+from image.util import color_1d_imgs
 from point_cloud.rgbd import point_cloud_from_rgb_imgs_and_depth_imgs
 
 from load_llff import load_llff_data
@@ -1055,19 +1056,8 @@ def add_1d_imgs_to_tensorboard(imgs: torch.Tensor, img_rgb: torch.Tensor,
                                ) -> torch.Tensor:
     assert imgs.dim() == 3  # N, H, W
 
-    # Scale all pixels between 0 and 1.
-    imgs_scaled = imgs / torch.max(imgs)
-
-    # If an element has the value 0, then it should receive the RGB value of zero_rgb.
-    zero_rgb = torch.Tensor([1]).expand(3)
-    # If an element has the value 1 (the max value after scaling), then it should receive the RGB
-    # value of max_rgb.
-    max_rgb = img_rgb
-    diff_rgb = max_rgb - zero_rgb
-
-    # Linear interpolation between zero_rgb and max_rgb based on the value of each pixel.
-    output_imgs = (zero_rgb.repeat(imgs.shape[0], imgs.shape[1], imgs.shape[2], 1) +
-                   imgs_scaled.unsqueeze(-1).repeat(1, 1, 1, 3) * diff_rgb)
+    # Color each pixel of each image according to its value.
+    output_imgs = color_1d_imgs(imgs)
 
     # Add border around each image.
     output_imgs = pad_imgs(output_imgs, padding_rgb, padding_width)
