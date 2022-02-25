@@ -1070,7 +1070,7 @@ def add_1d_imgs_to_tensorboard(imgs_: torch.Tensor, img_rgb: torch.Tensor,
     assert imgs.dim() == 3  # N, H, W
 
     # Color each pixel of each image according to its value.
-    output_imgs = color_1d_imgs(imgs)
+    output_imgs = color_1d_imgs(imgs, img_rgb)
 
     # Add border around each image.
     if padding_width > 0:

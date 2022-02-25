@@ -155,7 +155,9 @@ def create_nerf(args, initial_poses: torch.Tensor):
     else:
         embedding_size = 256
         scale = args.initial_gpe_scale
-        B = Parameter(torch.normal(0, 1, (3, embedding_size), device=gpu_if_available) * scale)
+        B = torch.normal(0, 1, (3, embedding_size), device=gpu_if_available) * scale
+        if not args.no_B_opt:
+            B = Parameter(B)
         if ckpt is not None:
             B = ckpt['B']
 
@@ -195,7 +197,7 @@ def create_nerf(args, initial_poses: torch.Tensor):
         with torch.no_grad():
             grad_vars.extend([kf_poses_params])
 
-    if not args.no_gaussian_positional_embedding:
+    if not args.no_gaussian_positional_embedding and not args.no_B_opt:
         with torch.no_grad():
             grad_vars.append(B)
 
@@ -448,10 +450,12 @@ def config_parser():
                         'modifier not exist / have no effect. "avg_saturation" modifies by the '
                         'average saturation of the pixels within each section.')
     parser.add_argument('--no_gaussian_positional_embedding', action='store_true', help='Set to '
-                        'the standard NeRF positional embedding instead of the iMAP Gaussian '
+                        'use the standard NeRF positional embedding instead of the iMAP Gaussian '
                         'positional embedding with learned B matrix.')
     parser.add_argument('--initial_gpe_scale', type=float, default=8, help='The scale to use for '
                         'initializing the Gaussian Positional Encoding matrix.')
+    parser.add_argument('--no_B_opt', action='store_true', help='Set to disable learning of the '
+                        'gaussian positional encoding matrix, B.')
 
     return parser
 
@@ -613,7 +617,6 @@ def train() -> None:
     n_training_iters = args.n_training_iters + 1
     tqdm_bar = trange(start_iter_idx, n_training_iters)
     for train_iter_idx in tqdm_bar:
-        print('a')
         t_train_iter_start = perf_counter()
 
         is_first_iter = train_iter_idx == 1
