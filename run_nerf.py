@@ -156,7 +156,7 @@ def create_nerf(args, initial_poses: torch.Tensor):
         embedding_size = 256
         scale = args.initial_gpe_scale
         B = torch.normal(0, 1, (3, embedding_size), device=gpu_if_available) * scale
-        if not args.no_B_opt:
+        if args.B_opt:
             B = Parameter(B)
         if ckpt is not None:
             B = ckpt['B']
@@ -197,7 +197,7 @@ def create_nerf(args, initial_poses: torch.Tensor):
         with torch.no_grad():
             grad_vars.extend([kf_poses_params])
 
-    if not args.no_gaussian_positional_embedding and not args.no_B_opt:
+    if not args.no_gaussian_positional_embedding and args.B_opt:
         with torch.no_grad():
             grad_vars.append(B)
 
@@ -452,9 +452,9 @@ def config_parser():
     parser.add_argument('--no_gaussian_positional_embedding', action='store_true', help='Set to '
                         'use the standard NeRF positional embedding instead of the iMAP Gaussian '
                         'positional embedding with learned B matrix.')
-    parser.add_argument('--initial_gpe_scale', type=float, default=8, help='The scale to use for '
+    parser.add_argument('--initial_gpe_scale', type=float, default=12, help='The scale to use for '
                         'initializing the Gaussian Positional Encoding matrix.')
-    parser.add_argument('--no_B_opt', action='store_true', help='Set to disable learning of the '
+    parser.add_argument('--B_opt', action='store_true', help='Set to enable learning of the '
                         'gaussian positional encoding matrix, B.')
 
     return parser
