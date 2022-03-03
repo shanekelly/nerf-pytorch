@@ -4,8 +4,8 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 from cv2 import COLOR_BGR2RGB, cvtColor, imread, resize, IMREAD_ANYDEPTH
-from ipdb import set_trace
 
+from axes.util import o3d_axes_from_poses
 from im_util.transforms import (rotmat_from_euler_zyx,
                                 tfmat_from_rotmat_and_translation,
                                 tfmat_from_quat_and_translation)
@@ -33,16 +33,16 @@ def load_bonn_data(base_dir, downsample_factor):
     assert base_dirpath.exists()
 
     # Get height, width, and focal length.
-    camera_info_fpath = base_dirpath / 'camera_info.json'
+    camera_info_fpath = base_dirpath / 'camera-info.json'
     assert camera_info_fpath.exists()
     camera_info_file = open(camera_info_fpath.as_posix(), 'r')
     camera_info = load(camera_info_file)
+    camera_info_file.close()
     height = int(camera_info['rgb']['height'] * scale_factor)
     width = int(camera_info['rgb']['width'] * scale_factor)
     focal_length = camera_info['rgb']['focal_length'] * scale_factor
     depth_scale = camera_info['depth']['scale']
     hwf = [height, width, focal_length]
-    camera_info_file.close()
 
     # Read images and poses.
     trajectory_fpath = base_dirpath / 'traj_z-backwards.txt'
@@ -64,7 +64,7 @@ def load_bonn_data(base_dir, downsample_factor):
                          (width, height))
         rgb_imgs.append(rgb_img)
 
-        depth_img_fpath = base_dirpath / 'images' / f'depth_{timestamp}.png'
+        depth_img_fpath = base_dirpath / 'images' / f'registered-depth_{timestamp}.png'
         assert depth_img_fpath.exists()
         # IMREAD_ANYDEPTH allows the depth image to be read in a 16 bit format if the image is saved
         # with such information.
@@ -103,11 +103,6 @@ def load_bonn_data(base_dir, downsample_factor):
         rotmat = rotmat_from_euler_zyx(start_rotation + pct * rotation_motion)
 
         render_pose = tfmat_from_rotmat_and_translation(rotmat, translation)
-        # render_pose = np.array([
-        #     [ 0.0005171 ,  0.01598652,  0.99987207,  0.11357104],
-        #     [-0.02391396,  0.99958646, -0.01596959, -0.01041086],
-        #     [-0.99971389, -0.02390265,  0.00089919,  0.69796815],
-        #     [ 0.        ,  0.        ,  0.        ,  1.        ]])
         render_poses.append(render_pose)
 
     render_poses = np.array(render_poses)

@@ -19,16 +19,17 @@ from torch.nn.functional import relu
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm, trange
 
-from run_nerf_helpers import (add_1d_imgs_to_tensorboard, append_to_log_file, create_keyframes, get_coordinate_frames,
-                              get_idxs_tuple, get_kf_poses, get_log_fpath, get_sw_n_sampled, get_sw_rays,
-                              get_embedder, get_rays, get_sw_loss,
+from axes.util import o3d_axes_from_poses
+
+from run_nerf_helpers import (add_1d_imgs_to_tensorboard, append_to_log_file, create_keyframes,
+                              get_idxs_tuple, get_kf_poses, get_log_fpath,
+                              get_sw_n_sampled, get_sw_rays, get_embedder, get_rays, get_sw_loss,
                               get_sw_sampling_prob_dist_modifier, img2mse, initialize_sw_kf_loss,
                               load_data, mse2psnr, NeRF, ndc_rays, pad_imgs, pad_sections, render,
                               render_and_compute_loss, sample_pdf, sample_skf_rays, sample_sw_rays,
                               save_point_cloud_from_rgb_imgs_and_depth_imgs, select_keyframes,
-                              should_trigger,
-                              split_into_sections, to8b, tfmats_from_minreps, minreps_from_tfmats,
-                              purple_rgb, white_rgb, GpuMonitor)
+                              should_trigger, split_into_sections, to8b, tfmats_from_minreps,
+                              minreps_from_tfmats, purple_rgb, white_rgb, GpuMonitor)
 
 
 cpu = torch.device('cpu')
@@ -812,9 +813,9 @@ def train() -> None:
                 # optimized pose, then log them to tensorboard for visualization.
                 kf_initial_poses_np = kf_initial_poses.cpu().numpy()
                 kf_poses_np = kf_poses.detach().cpu().numpy()
-                initial_coordinate_frames = get_coordinate_frames(
+                initial_coordinate_frames = o3d_axes_from_poses(
                     kf_initial_poses_np, gray_out=True)
-                optimized_coordinate_frames = get_coordinate_frames(kf_poses_np)
+                optimized_coordinate_frames = o3d_axes_from_poses(kf_poses_np)
                 for idx in range(len(initial_coordinate_frames)):
                     # TODO: Efficiently store initial poses, since they are always the same at every
                     # iteration.

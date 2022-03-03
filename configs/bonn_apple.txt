@@ -1,4 +1,4 @@
-datadir = ~/eth/implicit-mapping/datasets/apple/0/40-to-45-sec/orbslam/front-camera/right-camera/all-frames
+datadir = ~/eth/implicit-mapping/datasets/apple/0/3-frames/orbslam/front-camera/right-camera/all-frames
 
 expname = apple
 

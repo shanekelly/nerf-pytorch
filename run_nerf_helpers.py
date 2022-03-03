@@ -19,7 +19,7 @@ from threading import Thread
 from torch.nn.functional import relu
 from torch.utils.tensorboard import SummaryWriter
 
-from image.util import color_1d_imgs
+from plot.image import color_1d_imgs
 from point_cloud.rgbd import point_cloud_from_rgb_imgs_and_depth_imgs
 
 from load_llff import load_llff_data
@@ -1070,7 +1070,7 @@ def add_1d_imgs_to_tensorboard(imgs_: torch.Tensor, img_rgb: torch.Tensor,
     assert imgs.dim() == 3  # N, H, W
 
     # Color each pixel of each image according to its value.
-    output_imgs = color_1d_imgs(imgs, img_rgb)
+    output_imgs = color_1d_imgs(imgs, torch.zeros((3)), img_rgb)
 
     # Add border around each image.
     if padding_width > 0:
@@ -1168,19 +1168,6 @@ def minreps_from_tfmats(Rt, gpu_if_available, eps=1e-8):  # [...,3,4]
     u = (invV@t)[..., 0]
     wu = torch.cat([w, u], dim=-1).to(gpu_if_available)
     return wu
-
-
-def get_coordinate_frames(poses, coordinate_frame_size: float = 0.05, gray_out: bool = False):
-    coordinate_frames = []
-    for pose in poses:
-        coordinate_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
-            coordinate_frame_size).transform(pose)
-        if gray_out:
-            coordinate_frame.vertex_colors = o3d.utility.Vector3dVector(
-                np.clip(np.asarray(coordinate_frame.vertex_colors) + 0.5, 0, 1))
-        coordinate_frames.append(coordinate_frame)
-
-    return coordinate_frames
 
 
 def create_keyframes(rgb_imgs: torch.Tensor, initial_poses: torch.Tensor,
