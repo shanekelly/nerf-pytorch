@@ -10,3 +10,6 @@ logs/*
 pointcloud
 experiments
 old-logs
+
+# Results.
+midterm-presentation
