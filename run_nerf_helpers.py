@@ -19,7 +19,7 @@ from threading import Thread
 from torch.nn.functional import relu
 from torch.utils.tensorboard import SummaryWriter
 
-from plot.image import color_1d_imgs
+from image.plot import color_1d_imgs
 from point_cloud.rgbd import point_cloud_from_rgb_imgs_and_depth_imgs
 
 from load_llff import load_llff_data
@@ -29,6 +29,8 @@ from load_LINEMOD import load_LINEMOD_data
 from load_bonn import load_bonn_data
 
 
+black_rgb = torch.tensor([0.0]).expand(3)
+gray_rgb = torch.tensor([0.5]).expand(3)
 purple_rgb = torch.tensor([1.0, 0.0, 1.0])
 white_rgb = torch.tensor([1.0]).expand(3)
 
@@ -516,11 +518,20 @@ def render_rays(ray_batch: torch.Tensor, network_fn: NeRF, network_query_fn: Cal
         ret['z_std'] = torch.std(z_samples, dim=-1, unbiased=False)  # [N_rays]
 
     for k in ret:
+        is_disp = k[:4] == 'disp'
         is_nan = torch.isnan(ret[k])
         if is_nan.any():
             n_nan = torch.sum(is_nan)
-            print(f'Found {n_nan} NaN values in {k}. Replacing with zeros.')
-            torch.nan_to_num_(ret[k], nan=0)
+            if is_disp:
+                print(f'Found {n_nan} NaN values in {k}. Replacing with inf.')
+                torch.nan_to_num_(ret[k], nan=torch.inf)
+            else:
+                print(f'Found {n_nan} NaN values in {k}. Replacing with zeros.')
+                torch.nan_to_num_(ret[k], nan=0)
+
+        if is_disp:
+            continue
+
         is_inf = torch.isinf(ret[k])
         if is_inf.any():
             n_inf = torch.sum(is_inf)
@@ -571,12 +582,21 @@ def raw2outputs(raw, z_vals, rays_d, gpu_if_available, raw_noise_std=0, white_bk
                       1.-alpha + 1e-10], -1), -1)[:, :-1]
     rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [N_rays, 3]
 
-    depth_map = torch.sum(weights * z_vals, -1)
-    disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1))
-    acc_map = torch.sum(weights, -1)
+    # Summing the weights along the last axis results in some zero values, which makes some elements
+    # of depth_map equal zero, which leads to zero divided by zero in the term
+    # depth_map / torch.sum(weights, -1), which results in NaN values. This happens when all alpha
+    # values in a row are zero, which happens when all raw values in a row are negative.
+    weights_sum = weights.sum(-1)
+    depth_map = (weights * z_vals).sum(-1)
+    # Is this nan_to_num still needed?
+    disp_map = (1 / (depth_map / weights_sum).clamp(min=1e-10)).nan_to_num(nan=torch.inf)
+    acc_map = weights_sum
 
     if white_bkgd:
         rgb_map = rgb_map + (1.-acc_map[..., None])
+
+    # if disp_map.isnan().any():
+    #     set_trace()
 
     return rgb_map, disp_map, acc_map, weights, depth_map
 
@@ -662,8 +682,9 @@ def load_data(args: Namespace, gpu_if_available: torch.device
             args.datadir, downsample_factor=args.factor)
 
         val_idxs = test_idxs
-        near = 0.
-        far = 1.
+        near = 0
+        far = depth_imgs.max() * 1.1
+        assert far < 66
 
     else:
         raise RuntimeError(f'Unknown dataset type {args.dataset_type}. Exiting.')
@@ -687,6 +708,7 @@ def load_data(args: Namespace, gpu_if_available: torch.device
 
     # Attempt to move data to the GPU.
     rgb_imgs = torch.tensor(rgb_imgs, device=gpu_if_available, dtype=torch.float32)
+    depth_imgs = torch.tensor(depth_imgs, device=gpu_if_available, dtype=torch.float32)
     poses = torch.tensor(poses, device=gpu_if_available, dtype=torch.float32)
     render_poses = torch.tensor(render_poses, device=gpu_if_available, dtype=torch.float32)
 
@@ -720,12 +742,12 @@ def split_into_sections(mats, grid_size):
     return sw_mats
 
 
-def get_sw_rays(images: torch.Tensor, img_height: int, img_width: int, intrinsics_matrix: torch.Tensor, poses: torch.Tensor,
+def get_sw_rays(rgb_imgs: torch.Tensor, depth_imgs, img_height: int, img_width: int, intrinsics_matrix: torch.Tensor, poses: torch.Tensor,
                 n_kfs: int,  grid_size: int, section_height: int,
                 section_width: int, gpu_if_available: torch.device, verbose=False
                 ) -> Tuple[torch.Tensor, float]:
     """
-    @param images - Training images.
+    @param rgb_imgs - Training rgb_imgs.
     @param poses - Pose for each training image.
     """
     if verbose:
@@ -737,18 +759,22 @@ def get_sw_rays(images: torch.Tensor, img_height: int, img_width: int, intrinsic
     rays = torch.stack([torch.stack(get_rays(img_height, img_width, intrinsics_matrix, p, gpu_if_available))
                         for p in poses[:, :3, :4]])
 
-    rays = torch.cat([rays, images[:, None]], 1)  # (N, ro+rd+rgb, img_height, img_width, 3)
-    rays = torch.permute(rays, (0, 2, 3, 1, 4))  # (N, img_height, img_width, ro+rd+rgb, 3)
+    # Repeat each depth measurement 3 times (without copying) so that it is the right shape for
+    # packing in the rays tensor.
+    depth_imgs = depth_imgs.unsqueeze(-1).expand(-1, -1, -1, 3)
+    # (N, ro+rd+rgb, img_height, img_width, 3)
+    rays = torch.cat([rays, rgb_imgs.unsqueeze(1), depth_imgs.unsqueeze(1)], 1)
+    rays = torch.permute(rays, (0, 2, 3, 1, 4))  # (N, img_height, img_width, ro+rd+rgbd, 3)
 
     sw_rays = torch.empty((n_kfs, grid_size, grid_size,
-                           section_height, section_width, 3, 3))
+                           section_height, section_width, 4, 3))
     for grid_row_idx, grid_col_idx in product(range(grid_size), range(grid_size)):
         img_start_row_idx = grid_row_idx * section_height
         img_stop_row_idx = (grid_row_idx + 1) * section_height
         img_start_col_idx = grid_col_idx * section_width
         img_stop_col_idx = (grid_col_idx + 1) * section_width
-        sw_rays[:, grid_row_idx, grid_col_idx, :, :, :] = rays[:,
-                                                               img_start_row_idx:img_stop_row_idx, img_start_col_idx:img_stop_col_idx, :, :]
+        sw_rays[:, grid_row_idx, grid_col_idx, :, :, :] = rays[:, img_start_row_idx:img_stop_row_idx,
+                                                               img_start_col_idx:img_stop_col_idx, :, :]
 
     t_delta = perf_counter() - t_start
 
@@ -926,8 +952,8 @@ def sample_sw_rays(sw_rays: torch.Tensor, sw_sampling_prob_dist: torch.Tensor,
             pw_sampling_prob_dist.view(-1), n_total_rays_to_sample)
 
     # Use sampled_flat_idxs to index into the rays. Now have obtained the sampled rays. Shape
-    # (n_total_rays_to_sample, 3, 3).
-    sampled_rays = sw_rays.view(-1, 3, 3)[sampled_flat_idxs]
+    # (n_total_rays_to_sample, 4, 3).
+    sampled_rays = sw_rays.view(-1, 4, 3)[sampled_flat_idxs]
 
     n_pixels_per_chunks = \
         torch.tensor([n_pixels_per_img, n_pixels_per_grid_row_in_img,
@@ -1028,18 +1054,30 @@ def get_sw_n_sampled(sampled_sw_idxs_tuple: Tuple[torch.Tensor, ...], dims_kf_sw
     return sw_n_sampled
 
 
-def get_sw_loss(rendered_rgbs: torch.Tensor, gt_rgbs: torch.Tensor, sw_n_sampled: torch.Tensor,
+def get_sw_loss(rendered_rgbs: torch.Tensor, rendered_depths, gt_rgbs: torch.Tensor, gt_depths, sw_n_sampled: torch.Tensor,
                 sampled_sw_idxs_tuple: Tuple[torch.Tensor, ...], extras, dims_sw: Tuple[int, int, int],
                 cpu: torch.device,
                 ) -> Tuple[torch.Tensor, float]:
     t_start = perf_counter()
 
     rendered_rgbs = rendered_rgbs.to(cpu)
+    rendered_depths = rendered_depths.to(cpu)
     gt_rgbs = gt_rgbs.to(cpu)
+    gt_depths = gt_depths.to(cpu)
+    invalid_depth_idxs_small = torch.where(gt_depths < 0.28)
+    invalid_depth_idxs_big = torch.where(gt_depths > 66)
 
-    def get_sw_coarse_or_fine_loss(get_sw_coarse_or_fine_rendered_rgbs):
-        mean_squared_diffs = torch.mean(
-            (get_sw_coarse_or_fine_rendered_rgbs - gt_rgbs) ** 2, axis=1)
+    def get_sw_coarse_or_fine_loss(get_sw_coarse_or_fine_rendered_rgbs,
+                                   get_sw_coarse_or_fine_rendered_depths):
+        rgb_mean_squared_diffs = \
+            torch.mean((get_sw_coarse_or_fine_rendered_rgbs - gt_rgbs) ** 2, axis=1)
+        depth_diffs = get_sw_coarse_or_fine_rendered_depths - gt_depths
+        # NOTE: Could normalize depth loss here.
+        depth_diffs_normalized = depth_diffs
+        depth_mean_squared_diffs = depth_diffs_normalized ** 2
+        depth_mean_squared_diffs[invalid_depth_idxs_small] = 0.0
+        depth_mean_squared_diffs[invalid_depth_idxs_big] = 0.0
+        mean_squared_diffs = rgb_mean_squared_diffs + depth_mean_squared_diffs
         sw_cumu_mean_squared_diffs = torch.index_put(torch.zeros(dims_sw), sampled_sw_idxs_tuple,
                                                      mean_squared_diffs, accumulate=True)
         # For each section, the average mean squared difference between rendered RGB and groundtruth RGB
@@ -1049,34 +1087,38 @@ def get_sw_loss(rendered_rgbs: torch.Tensor, gt_rgbs: torch.Tensor, sw_n_sampled
         return sw_coarse_or_fine_loss
 
     # Get section-wise coarse loss.
-    sw_loss = get_sw_coarse_or_fine_loss(rendered_rgbs)
+    sw_loss = get_sw_coarse_or_fine_loss(rendered_rgbs, rendered_depths)
 
     if 'rgb0' in extras:
         # Get section-wise fine loss.
-        sw_loss += get_sw_coarse_or_fine_loss(extras['rgb0'].to(cpu))
+        sw_loss += get_sw_coarse_or_fine_loss(extras['rgb0'].to(cpu), extras['disp0'].to(cpu))
 
     t_delta = perf_counter() - t_start
 
     return sw_loss, t_delta
 
 
-def add_1d_imgs_to_tensorboard(imgs_: torch.Tensor, img_rgb: torch.Tensor,
+def add_1d_imgs_to_tensorboard(imgs_: torch.Tensor, min_rgb, max_rgb: torch.Tensor,
                                tensorboard: SummaryWriter, tag: str, iter_idx: int, cpu,
                                padding_rgb: torch.Tensor = torch.tensor([0.6]).expand(3),
                                padding_width: int = 1
                                ) -> torch.Tensor:
     imgs = imgs_.to(cpu)
 
-    assert imgs.dim() == 3  # N, H, W
+    singular_input = imgs.dim() == 2
+    if singular_input:
+        imgs = imgs.unsqueeze(0)
 
     # Color each pixel of each image according to its value.
-    output_imgs = color_1d_imgs(imgs, torch.zeros((3)), img_rgb)
+    output_imgs = color_1d_imgs(imgs, min_rgb, max_rgb)
 
-    # Add border around each image.
-    if padding_width > 0:
-        output_imgs = pad_imgs(output_imgs, padding_rgb, padding_width)
-
-    tensorboard.add_images(tag, output_imgs, iter_idx, dataformats='NHWC')
+    if singular_input:
+        tensorboard.add_image(tag, output_imgs[0], iter_idx, dataformats='HWC')
+    else:
+        # Add border around each image.
+        if padding_width > 0:
+            output_imgs = pad_imgs(output_imgs, padding_rgb, padding_width)
+        tensorboard.add_images(tag, output_imgs, iter_idx, dataformats='NHWC')
 
 
 def skew_symmetric(w):
@@ -1146,6 +1188,7 @@ def tfmats_from_minreps(wu, world_from_camera1, gpu_if_available):  # [...,3]
     # Convert N - 1 poses relative to first pose into N poses relative to world frame.
     world_from_cameras = torch.cat((world_from_camera1.unsqueeze(0),
                                     world_from_camera1.matmul(camera1_from_cameras)))
+    assert not world_from_cameras.isnan().any()
 
     return world_from_cameras
 
@@ -1170,7 +1213,7 @@ def minreps_from_tfmats(Rt, gpu_if_available, eps=1e-8):  # [...,3,4]
     return wu
 
 
-def create_keyframes(rgb_imgs: torch.Tensor, initial_poses: torch.Tensor,
+def create_keyframes(rgb_imgs: torch.Tensor, depth_imgs, initial_poses: torch.Tensor,
                      train_idxs: List[int], keyframe_creation_strategy, every_Nth
                      ) -> Tuple[torch.Tensor, torch.Tensor, List[int], int]:
     if keyframe_creation_strategy == 'all':
@@ -1184,12 +1227,13 @@ def create_keyframes(rgb_imgs: torch.Tensor, initial_poses: torch.Tensor,
             f'Unknown keyframe creation strategy "{keyframe_creation_strategy}". Exiting.')
 
     kf_rgb_imgs = rgb_imgs[kf_idxs]
+    kf_depth_imgs = depth_imgs[kf_idxs]
     kf_initial_poses = initial_poses[kf_idxs]
     n_kfs = len(kf_idxs)
 
     print('Keyframe views are ', kf_idxs)
 
-    return kf_rgb_imgs, kf_initial_poses, kf_idxs, n_kfs
+    return kf_rgb_imgs, kf_depth_imgs, kf_initial_poses, kf_idxs, n_kfs
 
 
 def get_kf_poses(kf_initial_poses: torch.Tensor, kf_poses_params: torch.nn.Parameter,
@@ -1216,19 +1260,20 @@ def render_and_compute_loss(rays, intrinsics_matrix, render_kwargs_train, img_he
                                        torch.Tensor, float, float, float]:
     t_batching_start = perf_counter()
     batch = torch.transpose(rays.to(gpu_if_available), 0, 1)
-    batch_rays, gt_rgbs = batch[:2], batch[2]
+    batch_rays, gt_rgbs, gt_depths = batch[:2], batch[2], batch[3][:, 0]
     t_batching = perf_counter() - t_batching_start
 
     t_rendering_start = perf_counter()
     rendered_rgbs, rendered_disps, _, extras = \
         render(img_height, img_width, intrinsics_matrix, gpu_if_available, chunk=chunk, rays=batch_rays,
                verbose=train_iter_idx < 10, retraw=True, **render_kwargs_train)
+    rendered_depths = 1 / rendered_disps
     t_rendering = perf_counter() - t_rendering_start
 
     t_loss_start = perf_counter()
     optimizer.zero_grad()
 
-    sw_loss, t_loss = get_sw_loss(rendered_rgbs, gt_rgbs, sw_n_newly_sampled, sampled_sw_idxs_tuple, extras,
+    sw_loss, t_loss = get_sw_loss(rendered_rgbs, rendered_depths, gt_rgbs, gt_depths, sw_n_newly_sampled, sampled_sw_idxs_tuple, extras,
                                   dims_kf_sw, cpu)
 
     loss = torch.mean(sw_loss)
@@ -1240,7 +1285,7 @@ def render_and_compute_loss(rays, intrinsics_matrix, render_kwargs_train, img_he
             t_loss)
 
 
-def initialize_sw_kf_loss(kf_rgb_imgs, kf_poses, sw_unif_sampling_prob_dist, dims_kf_pw,
+def initialize_sw_kf_loss(kf_rgb_imgs, kf_depth_imgs, kf_poses, sw_unif_sampling_prob_dist, dims_kf_pw,
                           intrinsics_matrix, n_total_rays_to_unif_sample, render_kwargs_train,
                           chunk, optimizer, do_active_sampling, tensorboard, cpu, gpu_if_available,
                           verbose=False):
@@ -1258,7 +1303,7 @@ def initialize_sw_kf_loss(kf_rgb_imgs, kf_poses, sw_unif_sampling_prob_dist, dim
 
     with torch.no_grad():
         # Get all rays from all keyframes.
-        sw_kf_rays, _ = get_sw_rays(kf_rgb_imgs, img_height, img_width, intrinsics_matrix, kf_poses,
+        sw_kf_rays, _ = get_sw_rays(kf_rgb_imgs, kf_depth_imgs, img_height, img_width, intrinsics_matrix, kf_poses,
                                     n_kfs, grid_size, section_height, section_width, gpu_if_available)
     # Uniformly sample rays across all keyframes.
     (sampled_rays, sampled_pw_idxs, sw_n_newly_sampled, _) = sample_sw_rays(sw_kf_rays, sw_unif_sampling_prob_dist,
@@ -1277,7 +1322,7 @@ def initialize_sw_kf_loss(kf_rgb_imgs, kf_poses, sw_unif_sampling_prob_dist, dim
     return sw_kf_loss
 
 
-def select_keyframes(kf_rgb_imgs, kf_poses, kf_idxs, sw_kf_loss, img_height, img_width,
+def select_keyframes(kf_rgb_imgs, kf_depth_imgs, kf_poses, kf_idxs, sw_kf_loss, img_height, img_width,
                      intrinsics_matrix, is_first_iter,
                      n_total_rays_to_unif_sample, dims_kf_pw,
                      keyframe_selection_strategy, n_explore, n_exploit,
@@ -1289,6 +1334,7 @@ def select_keyframes(kf_rgb_imgs, kf_poses, kf_idxs, sw_kf_loss, img_height, img
 
     if keyframe_selection_strategy == 'all':
         skf_rgb_imgs = kf_rgb_imgs
+        skf_depth_imgs = kf_depth_imgs
         skf_poses = kf_poses
         skf_idxs = kf_idxs
         n_skfs = n_kfs
@@ -1316,6 +1362,7 @@ def select_keyframes(kf_rgb_imgs, kf_poses, kf_idxs, sw_kf_loss, img_height, img
         skf_from_kf_idxs, _ = torch.sort(torch.cat((idxs_explore, idxs_exploit)))
 
         skf_rgb_imgs = kf_rgb_imgs[skf_from_kf_idxs]
+        skf_depth_imgs = kf_depth_imgs[skf_from_kf_idxs]
         skf_poses = kf_poses[skf_from_kf_idxs]
         skf_idxs = kf_idxs[skf_from_kf_idxs]
         n_skfs = skf_idxs.shape[0]
@@ -1330,7 +1377,7 @@ def select_keyframes(kf_rgb_imgs, kf_poses, kf_idxs, sw_kf_loss, img_height, img
 
     t_delta = perf_counter() - t_start
 
-    return (skf_rgb_imgs, skf_poses, skf_idxs, n_skfs, dims_skf_pw, sw_skf_loss, skf_from_kf_idxs,
+    return (skf_rgb_imgs, skf_depth_imgs, skf_poses, skf_idxs, n_skfs, dims_skf_pw, sw_skf_loss, skf_from_kf_idxs,
             t_delta)
 
 
@@ -1365,21 +1412,22 @@ def sample_skf_rays(sw_skf_rays, kf_rgb_imgs, intrinsics_matrix, n_total_rays_to
 
             # Render the uniformly sampled rays.
             batch = torch.transpose(unif_sampled_rays, 0, 1).to(gpu_if_available)
-            batch_rays, unif_gt_rgbs = batch[:2], batch[2]
+            batch_rays, unif_gt_rgbs, unif_gt_depths = batch[:2], batch[2], batch[3][:, 0]
 
             with torch.no_grad():
-                unif_rendered_rgbs, _, _, extras = \
+                unif_rendered_rgbs, unif_rendered_disps, _, extras = \
                     render(img_height, img_width, intrinsics_matrix, gpu_if_available,
                            chunk=chunk, rays=batch_rays,
                            verbose=train_iter_idx < 10, retraw=True,
                            **render_kwargs_train)
+                unif_rendered_depths = 1 / unif_rendered_disps
 
             # Computing section-wise loss for uniformly sampled rays.
             # TODO: should this not be sw_kf_loss?
             unif_sampled_skf_sw_idxs_tuple = get_idxs_tuple(unif_sampled_pw_idxs[:, :3])
-            sw_kf_loss, _ = get_sw_loss(unif_rendered_rgbs, unif_gt_rgbs, sw_n_newly_sampled,
-                                        unif_sampled_skf_sw_idxs_tuple,
-                                        extras, dims_kf_sw, cpu)
+            sw_kf_loss, _ = get_sw_loss(unif_rendered_rgbs, unif_rendered_depths, unif_gt_rgbs,
+                                        unif_gt_depths, sw_n_newly_sampled, unif_sampled_skf_sw_idxs_tuple, extras,
+                                        dims_kf_sw, cpu)
 
         # Active ray sampling.
         sw_active_sampling_prob_dist = sw_skf_loss / torch.sum(sw_skf_loss)
@@ -1436,7 +1484,7 @@ def get_sw_sampling_prob_dist_modifier(kf_rgb_imgs, grid_size,
         raise RuntimeError('Unknown section-wise sampling probability distribution modifier '
                            f'strategy "{sw_sampling_prob_dist_modifier_strategy}". Exiting.')
 
-    add_1d_imgs_to_tensorboard(sw_sampling_prob_dist_modifier, torch.tensor([0, 0, 1]), tensorboard,
+    add_1d_imgs_to_tensorboard(sw_sampling_prob_dist_modifier, white_rgb, torch.tensor([0, 0, 1]), tensorboard,
                                'train/sampling_probability_distribution_modifier', 1, cpu, white_rgb)
 
     return sw_sampling_prob_dist_modifier

@@ -1,5 +1,21 @@
-datadir = ~/eth/implicit-mapping/datasets/apple/0/3-frames/orbslam/front-camera/right-camera/all-frames
+datadir = ~/eth/implicit-mapping/datasets/apple/00/3-frames/orbslam/front-camera/right-camera/all-frames
 
 expname = apple
 
 factor = 2  # Downsampling factor.
+
+save_logs_to_file = True
+
+keyframe_creation_strategy = all
+keyframe_selection_strategy = all
+
+s_train_scalars = 60
+s_sampling_vis = 60
+s_val = 60
+s_poses_vis = 60
+s_point_cloud_vis = 60
+#i_sampling_vis = 1
+#i_val = 1
+i_weights = 5000
+#i_point_cloud_vis = 1
+#N_importance = 64

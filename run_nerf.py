@@ -29,7 +29,7 @@ from run_nerf_helpers import (add_1d_imgs_to_tensorboard, append_to_log_file, cr
                               render_and_compute_loss, sample_pdf, sample_skf_rays, sample_sw_rays,
                               save_point_cloud_from_rgb_imgs_and_depth_imgs, select_keyframes,
                               should_trigger, split_into_sections, to8b, tfmats_from_minreps,
-                              minreps_from_tfmats, purple_rgb, white_rgb, GpuMonitor)
+                              minreps_from_tfmats, gray_rgb, purple_rgb, black_rgb, white_rgb, GpuMonitor)
 
 
 cpu = torch.device('cpu')
@@ -473,20 +473,24 @@ def train() -> None:
     tensorboard = SummaryWriter(log_dpath, flush_secs=10)
 
     # Load data from specified dataset.
-    (rgb_imgs, _, hwf, img_height, img_width, focal, intrinsics_matrix, initial_poses,
+    (rgb_imgs, depth_imgs, hwf, img_height, img_width, focal, intrinsics_matrix, initial_poses,
      render_poses, train_idxs, test_idxs, val_idxs, near, far) = load_data(args, gpu_if_available)
     test_rgb_imgs = rgb_imgs[test_idxs]
+    test_depth_imgs = depth_imgs[test_idxs]
     test_poses = initial_poses[test_idxs]
     # Log the test images to tensorboard.
     tensorboard.add_images('test/rgb/groundtruth',
                            pad_imgs(test_rgb_imgs, white_rgb, padding_width=2),
                            global_step=1, dataformats='NHWC')
+    add_1d_imgs_to_tensorboard(test_depth_imgs, black_rgb, white_rgb, tensorboard, 'test/depth/groundtruth',
+                               1, cpu, white_rgb, 2)
     val_idx = val_idxs[-2] if len(val_idxs) > 1 else val_idxs[0]
     val_rgb_img = rgb_imgs[val_idx]
+    val_depth_img = depth_imgs[val_idx]
     val_pose = initial_poses[val_idx, :3, :4].to(gpu_if_available)
 
-    kf_rgb_imgs, kf_initial_poses, kf_idxs, n_kfs = \
-        create_keyframes(rgb_imgs, initial_poses, train_idxs, args.keyframe_creation_strategy,
+    kf_rgb_imgs, kf_depth_imgs, kf_initial_poses, kf_idxs, n_kfs = \
+        create_keyframes(rgb_imgs, depth_imgs, initial_poses, train_idxs, args.keyframe_creation_strategy,
                          args.every_Nth)
 
     # Create log dir and copy the config file
@@ -513,6 +517,7 @@ def train() -> None:
         'near': near,
         'far': far,
     }
+
     render_kwargs_train.update(bds_dict)
     render_kwargs_test.update(bds_dict)
 
@@ -590,7 +595,7 @@ def train() -> None:
 
     with torch.no_grad():
         sw_kf_loss = \
-            initialize_sw_kf_loss(kf_rgb_imgs, kf_initial_poses, sw_unif_sampling_prob_dist, dims_kf_pw,
+            initialize_sw_kf_loss(kf_rgb_imgs, kf_depth_imgs, kf_initial_poses, sw_unif_sampling_prob_dist, dims_kf_pw,
                                   intrinsics_matrix, n_total_rays_to_unif_sample, render_kwargs_train,
                                   args.chunk, optimizer, do_active_sampling, tensorboard,
                                   cpu, gpu_if_available, verbose=verbose)
@@ -646,9 +651,9 @@ def train() -> None:
             kf_initial_poses, kf_poses_params, do_pose_optimization, gpu_if_available)
 
         # Select a subset of the keyframes to actually use in this training iteration.
-        (skf_rgb_imgs, skf_poses, skf_idxs, n_skfs, dims_skf_pw, sw_skf_loss, skf_from_kf_idxs,
+        (skf_rgb_imgs, skf_depth_imgs, skf_poses, skf_idxs, n_skfs, dims_skf_pw, sw_skf_loss, skf_from_kf_idxs,
          t_select_keyframes) = \
-            select_keyframes(kf_rgb_imgs, kf_poses, kf_idxs, sw_kf_loss, img_height, img_width,
+            select_keyframes(kf_rgb_imgs, kf_depth_imgs, kf_poses, kf_idxs, sw_kf_loss, img_height, img_width,
                              intrinsics_matrix, is_start_iter,
                              n_total_rays_to_unif_sample, dims_kf_pw,
                              args.keyframe_selection_strategy, args.n_explore, args.n_exploit,
@@ -657,7 +662,7 @@ def train() -> None:
         dims_skf_sw = dims_skf_pw[:3]
 
         # Compute the rays from the selected keyframe images and poses.
-        sw_skf_rays, t_get_rays = get_sw_rays(skf_rgb_imgs, img_height, img_width, intrinsics_matrix, skf_poses, n_skfs,
+        sw_skf_rays, t_get_rays = get_sw_rays(skf_rgb_imgs, skf_depth_imgs, img_height, img_width, intrinsics_matrix, skf_poses, n_skfs,
                                               grid_size, section_height, section_width, gpu_if_available)
 
         # Sample rays to use for training.
@@ -755,11 +760,11 @@ def train() -> None:
         if log_sampling_vis:
             sampling_name = 'active_sampling' if do_active_sampling else 'sampling'
             with torch.no_grad():
-                add_1d_imgs_to_tensorboard(sw_total_n_sampled, torch.Tensor([1, 0, 0]), tensorboard,
+                add_1d_imgs_to_tensorboard(sw_total_n_sampled, white_rgb, torch.Tensor([1, 0, 0]), tensorboard,
                                            f'train/{sampling_name}/cumulative_samples_per_section',
                                            train_iter_idx, cpu)
 
-                add_1d_imgs_to_tensorboard(sw_kf_loss, torch.Tensor([0, 0.8, 0]), tensorboard,
+                add_1d_imgs_to_tensorboard(sw_kf_loss, white_rgb, torch.Tensor([0, 0.8, 0]), tensorboard,
                                            'train/estimated_loss_distribution', train_iter_idx, cpu)
             t_prev_sampling_vis_log = t_train_iter_start
 
@@ -776,11 +781,13 @@ def train() -> None:
 
             tensorboard.add_image('validation/rgb/estimate', val_rendered_rgb,
                                   train_iter_idx, dataformats='HWC')
+            add_1d_imgs_to_tensorboard(val_rendered_depth, black_rgb, white_rgb, tensorboard,
+                                       'validation/depth/estimate', train_iter_idx, cpu)
             if train_iter_idx == args.i_val:
                 tensorboard.add_image('validation/rgb/groundtruth', val_rgb_img,
                                       train_iter_idx, dataformats='HWC')
-            tensorboard.add_image('validation/depth/estimate', val_rendered_depth,
-                                  train_iter_idx, dataformats='HW')
+                add_1d_imgs_to_tensorboard(val_depth_img, black_rgb, white_rgb, tensorboard,
+                                           'validation/depth/groundtruth', train_iter_idx, cpu)
             tensorboard.add_scalar('validation/loss', val_loss, train_iter_idx)
             tensorboard.add_scalar('validation/psnr', val_psnr, train_iter_idx)
             if args.save_logs_to_file:
@@ -852,7 +859,7 @@ def train() -> None:
 
         if log_B_vis:
             with torch.no_grad():
-                add_1d_imgs_to_tensorboard(B.unsqueeze(0), purple_rgb, tensorboard,
+                add_1d_imgs_to_tensorboard(B.unsqueeze(0), white_rgb, purple_rgb, tensorboard,
                                            'train/gaussian_positional_encoding_matrix',
                                            train_iter_idx, cpu, padding_width=0)
             if args.save_logs_to_file:
@@ -883,5 +890,6 @@ def train() -> None:
 
 
 if __name__ == '__main__':
+    # torch.autograd.set_detect_anomaly(True)
     with launch_ipdb_on_exception():
         train()

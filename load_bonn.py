@@ -109,11 +109,17 @@ def load_bonn_data(base_dir, downsample_factor):
 
     # Compute train indices and test indices.
     all_idxs = list(range(rgb_imgs.shape[0]))
-    if len(all_idxs) <= 5:
+    if len(all_idxs) == 1:
+        test_idxs = [0]
+        train_idxs = [0]
+    elif len(all_idxs) <= 5:
         test_idxs = [len(all_idxs) // 2]
+        train_idxs = [idx for idx in all_idxs if idx not in test_idxs]
     else:
         test_idxs = all_idxs[::8]
-    train_idxs = [idx for idx in all_idxs if idx not in test_idxs]
+        train_idxs = [idx for idx in all_idxs if idx not in test_idxs]
+
+    assert np.all(np.isfinite(depth_imgs))
 
     return rgb_imgs, depth_imgs, hwf, poses, render_poses, train_idxs, test_idxs
 
