@@ -588,7 +588,7 @@ def raw2outputs(raw, z_vals, rays_d, gpu_if_available, raw_noise_std=0, white_bk
     # values in a row are zero, which happens when all raw values in a row are negative.
     weights_sum = weights.sum(-1)
     depth_map = (weights * z_vals).sum(-1)
-    # Is this nan_to_num still needed?
+    # NOTE: Is this nan_to_num still needed?
     disp_map = (1 / (depth_map / weights_sum).clamp(min=1e-10)).nan_to_num(nan=torch.inf)
     acc_map = weights_sum
 
@@ -678,13 +678,13 @@ def load_data(args: Namespace, gpu_if_available: torch.device
         far = hemi_R+1.
 
     elif args.dataset_type == 'bonn':
-        rgb_imgs, depth_imgs, hwf, poses, render_poses, train_idxs, test_idxs = load_bonn_data(
+        rgb_imgs, depth_imgs, hwf, intrinsics_matrix, poses, render_poses, train_idxs, test_idxs = load_bonn_data(
             args.datadir, downsample_factor=args.factor)
 
         val_idxs = test_idxs
         near = 0
         far = depth_imgs.max() * 1.1
-        assert far < 66
+        assert far < 70
 
     else:
         raise RuntimeError(f'Unknown dataset type {args.dataset_type}. Exiting.')
@@ -1056,46 +1056,64 @@ def get_sw_n_sampled(sampled_sw_idxs_tuple: Tuple[torch.Tensor, ...], dims_kf_sw
 
 def get_sw_loss(rendered_rgbs: torch.Tensor, rendered_depths, gt_rgbs: torch.Tensor, gt_depths, sw_n_sampled: torch.Tensor,
                 sampled_sw_idxs_tuple: Tuple[torch.Tensor, ...], extras, dims_sw: Tuple[int, int, int],
-                cpu: torch.device,
+                include_depth_loss: bool, cpu: torch.device,
                 ) -> Tuple[torch.Tensor, float]:
     t_start = perf_counter()
 
     rendered_rgbs = rendered_rgbs.to(cpu)
     rendered_depths = rendered_depths.to(cpu)
     gt_rgbs = gt_rgbs.to(cpu)
-    gt_depths = gt_depths.to(cpu)
-    invalid_depth_idxs_small = torch.where(gt_depths < 0.28)
-    invalid_depth_idxs_big = torch.where(gt_depths > 66)
+    if include_depth_loss:
+        gt_depths = gt_depths.to(cpu)
+        invalid_depth_idxs_small = torch.where(gt_depths < 0.30)
+        invalid_depth_idxs_big = torch.where(gt_depths > 66)
+    sw_sampled_idxs = torch.where(sw_n_sampled > 0)
 
     def get_sw_coarse_or_fine_loss(get_sw_coarse_or_fine_rendered_rgbs,
                                    get_sw_coarse_or_fine_rendered_depths):
         rgb_mean_squared_diffs = \
             torch.mean((get_sw_coarse_or_fine_rendered_rgbs - gt_rgbs) ** 2, axis=1)
-        depth_diffs = get_sw_coarse_or_fine_rendered_depths - gt_depths
-        # NOTE: Could normalize depth loss here.
-        depth_diffs_normalized = depth_diffs
-        depth_mean_squared_diffs = depth_diffs_normalized ** 2
-        depth_mean_squared_diffs[invalid_depth_idxs_small] = 0.0
-        depth_mean_squared_diffs[invalid_depth_idxs_big] = 0.0
-        mean_squared_diffs = rgb_mean_squared_diffs + depth_mean_squared_diffs
-        sw_cumu_mean_squared_diffs = torch.index_put(torch.zeros(dims_sw), sampled_sw_idxs_tuple,
-                                                     mean_squared_diffs, accumulate=True)
+        # rgb_mean_squared_diffs[invalid_depth_idxs_big] = 0.0
+
+        if include_depth_loss:
+            depth_diffs = get_sw_coarse_or_fine_rendered_depths - gt_depths
+            depth_diffs_normalized = depth_diffs / 10
+            depth_mean_squared_diffs = depth_diffs_normalized ** 2
+            depth_mean_squared_diffs[invalid_depth_idxs_small] = 0.0
+            depth_mean_squared_diffs[invalid_depth_idxs_big] = 0.0
+
         # For each section, the average mean squared difference between rendered RGB and groundtruth RGB
         # for each sampled pixel within the section.
-        sw_coarse_or_fine_loss = torch.nan_to_num(sw_cumu_mean_squared_diffs / sw_n_sampled, nan=0)
+        sw_cumu_rgb_mean_squared_diffs = torch.index_put(torch.zeros(dims_sw), sampled_sw_idxs_tuple,
+                                                         rgb_mean_squared_diffs, accumulate=True)
+        sw_coarse_or_fine_rgb_loss = torch.zeros(dims_sw)
+        sw_coarse_or_fine_rgb_loss[sw_sampled_idxs] = \
+            sw_cumu_rgb_mean_squared_diffs[sw_sampled_idxs] / sw_n_sampled[sw_sampled_idxs]
 
-        return sw_coarse_or_fine_loss
+        sw_coarse_or_fine_depth_loss = torch.zeros(dims_sw)
+        if include_depth_loss:
+            sw_cumu_depth_mean_squared_diffs = torch.index_put(torch.zeros(dims_sw), sampled_sw_idxs_tuple,
+                                                               depth_mean_squared_diffs, accumulate=True)
+            sw_coarse_or_fine_depth_loss[sw_sampled_idxs] = \
+                sw_cumu_depth_mean_squared_diffs[sw_sampled_idxs] / sw_n_sampled[sw_sampled_idxs]
+
+        return sw_coarse_or_fine_rgb_loss, sw_coarse_or_fine_depth_loss
 
     # Get section-wise coarse loss.
-    sw_loss = get_sw_coarse_or_fine_loss(rendered_rgbs, rendered_depths)
+    sw_rgb_loss, sw_depth_loss = get_sw_coarse_or_fine_loss(rendered_rgbs, rendered_depths)
 
     if 'rgb0' in extras:
         # Get section-wise fine loss.
-        sw_loss += get_sw_coarse_or_fine_loss(extras['rgb0'].to(cpu), extras['disp0'].to(cpu))
+        sw_fine_rgb_loss, sw_fine_depth_loss = \
+            get_sw_coarse_or_fine_loss(extras['rgb0'].to(cpu), extras['disp0'].to(cpu))
+        sw_rgb_loss += sw_fine_rgb_loss
+        sw_depth_loss += sw_fine_depth_loss
+
+    sw_loss = sw_rgb_loss + sw_depth_loss
 
     t_delta = perf_counter() - t_start
 
-    return sw_loss, t_delta
+    return sw_loss, sw_rgb_loss, sw_depth_loss, t_delta
 
 
 def add_1d_imgs_to_tensorboard(imgs_: torch.Tensor, min_rgb, max_rgb: torch.Tensor,
@@ -1254,7 +1272,8 @@ def get_kf_poses(kf_initial_poses: torch.Tensor, kf_poses_params: torch.nn.Param
 
 
 def render_and_compute_loss(rays, intrinsics_matrix, render_kwargs_train, img_height, img_width,
-                            dims_kf_sw, chunk, sampled_sw_idxs_tuple, sw_n_newly_sampled, optimizer,
+                            dims_kf_sw, chunk, sampled_sw_idxs_tuple, sw_n_newly_sampled,
+                            include_depth_loss, optimizer,
                             train_iter_idx, cpu, gpu_if_available
                             ) -> Tuple[torch.Tensor, torch.Tensor, Dict, torch.Tensor, torch.Tensor,
                                        torch.Tensor, float, float, float]:
@@ -1273,15 +1292,15 @@ def render_and_compute_loss(rays, intrinsics_matrix, render_kwargs_train, img_he
     t_loss_start = perf_counter()
     optimizer.zero_grad()
 
-    sw_loss, t_loss = get_sw_loss(rendered_rgbs, rendered_depths, gt_rgbs, gt_depths, sw_n_newly_sampled, sampled_sw_idxs_tuple, extras,
-                                  dims_kf_sw, cpu)
+    sw_loss, sw_rgb_loss, sw_depth_loss, t_loss = get_sw_loss(rendered_rgbs, rendered_depths, gt_rgbs, gt_depths, sw_n_newly_sampled, sampled_sw_idxs_tuple, extras,
+                                                              dims_kf_sw, include_depth_loss, cpu)
 
     loss = torch.mean(sw_loss)
     psnr = mse2psnr(loss)
 
     t_loss = perf_counter() - t_loss_start
 
-    return (rendered_rgbs, rendered_disps, extras, sw_loss, loss, psnr, t_batching, t_rendering,
+    return (rendered_rgbs, rendered_disps, extras, sw_loss, sw_rgb_loss, sw_depth_loss, loss, psnr, t_batching, t_rendering,
             t_loss)
 
 
@@ -1314,10 +1333,12 @@ def initialize_sw_kf_loss(kf_rgb_imgs, kf_depth_imgs, kf_poses, sw_unif_sampling
                                                                             enforce_min_samples=True)
     # Render the sampled rays and compute section-wise loss.
     sampled_sw_idxs_tuple = get_idxs_tuple(sampled_pw_idxs[:, :3])
-    _, _, _, sw_kf_loss, _, _, _, _, _ = render_and_compute_loss(sampled_rays, intrinsics_matrix, render_kwargs_train,
-                                                                 img_height, img_width, dims_kf_sw, chunk,
-                                                                 sampled_sw_idxs_tuple, sw_n_newly_sampled, optimizer,
-                                                                 1, cpu, gpu_if_available)
+    include_depth_loss = True
+    _, _, _, sw_kf_loss, _, _, _, _, _, _, _ = render_and_compute_loss(
+        sampled_rays, intrinsics_matrix, render_kwargs_train,
+        img_height, img_width, dims_kf_sw, chunk,
+        sampled_sw_idxs_tuple, sw_n_newly_sampled, include_depth_loss, optimizer,
+        1, cpu, gpu_if_available)
 
     return sw_kf_loss
 
@@ -1425,9 +1446,10 @@ def sample_skf_rays(sw_skf_rays, kf_rgb_imgs, intrinsics_matrix, n_total_rays_to
             # Computing section-wise loss for uniformly sampled rays.
             # TODO: should this not be sw_kf_loss?
             unif_sampled_skf_sw_idxs_tuple = get_idxs_tuple(unif_sampled_pw_idxs[:, :3])
-            sw_kf_loss, _ = get_sw_loss(unif_rendered_rgbs, unif_rendered_depths, unif_gt_rgbs,
-                                        unif_gt_depths, sw_n_newly_sampled, unif_sampled_skf_sw_idxs_tuple, extras,
-                                        dims_kf_sw, cpu)
+            include_depth_loss = True
+            sw_kf_loss, _, _, _ = get_sw_loss(unif_rendered_rgbs, unif_rendered_depths, unif_gt_rgbs,
+                                              unif_gt_depths, sw_n_newly_sampled, unif_sampled_skf_sw_idxs_tuple, extras,
+                                              dims_kf_sw, include_depth_loss, cpu)
 
         # Active ray sampling.
         sw_active_sampling_prob_dist = sw_skf_loss / torch.sum(sw_skf_loss)
@@ -1493,8 +1515,20 @@ def get_sw_sampling_prob_dist_modifier(kf_rgb_imgs, grid_size,
 def save_point_cloud_from_rgb_imgs_and_depth_imgs(point_cloud_fpath, rgb_imgs, depth_imgs,
                                                   world_from_cameras, intrinsics_matrix,
                                                   tb_info=None):
-    point_cloud = point_cloud_from_rgb_imgs_and_depth_imgs(rgb_imgs, depth_imgs, world_from_cameras,
-                                                           intrinsics_matrix, z_forwards=False)
+    singular_input = rgb_imgs.dim() == 3
+    if singular_input:
+        rgb_imgs = rgb_imgs.unsqueeze(0)
+        depth_imgs = depth_imgs.unsqueeze(0)
+        world_from_cameras = world_from_cameras.unsqueeze(0)
+    if world_from_cameras.shape[1] == 3:
+        hom_row = torch.tensor([[0, 0, 0, 1]], dtype=torch.float32,
+                               device=world_from_cameras.device)
+        world_from_cameras = torch.cat((world_from_cameras,
+                                        hom_row.expand(world_from_cameras.shape[0], 1, 4)), 1)
+
+    point_cloud = point_cloud_from_rgb_imgs_and_depth_imgs(rgb_imgs.cpu().numpy(),
+                                                           depth_imgs.cpu().numpy(), world_from_cameras,
+                                                           intrinsics_matrix.cpu().numpy(), z_forwards=False)
     o3d.io.write_point_cloud(point_cloud_fpath.as_posix(), point_cloud)
 
     if tb_info is not None:

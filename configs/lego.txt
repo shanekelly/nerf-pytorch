@@ -1,6 +1,7 @@
-expname = lego_test
-basedir = ./logs
 datadir = ./data/nerf_synthetic/lego
+expname = lego_test
+
+factor = 1
 dataset_type = blender
 
 no_batching = True

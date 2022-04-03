@@ -43,6 +43,7 @@ def load_bonn_data(base_dir, downsample_factor):
     focal_length = camera_info['rgb']['focal_length'] * scale_factor
     depth_scale = camera_info['depth']['scale']
     hwf = [height, width, focal_length]
+    intrinsics_matrix = camera_info['rgb']['intrinsics_matrix']
 
     # Read images and poses.
     trajectory_fpath = base_dirpath / 'traj_z-backwards.txt'
@@ -121,7 +122,7 @@ def load_bonn_data(base_dir, downsample_factor):
 
     assert np.all(np.isfinite(depth_imgs))
 
-    return rgb_imgs, depth_imgs, hwf, poses, render_poses, train_idxs, test_idxs
+    return rgb_imgs, depth_imgs, hwf, intrinsics_matrix, poses, render_poses, train_idxs, test_idxs
 
 
 if __name__ == '__main__':
