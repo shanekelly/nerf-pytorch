@@ -208,8 +208,9 @@ class NeRF(nn.Module):
 
 # Ray helpers
 def get_rays(img_height: int, img_width: int, intrinsics_matrix: torch.Tensor, c2w: torch.Tensor, gpu_if_available: torch.device):
-    i, j = torch.meshgrid(torch.linspace(0, img_width-1, img_width),
-                          torch.linspace(0, img_height-1, img_height), indexing='ij')
+    i, j = torch.meshgrid(torch.linspace(0, img_width-1, img_width, device=gpu_if_available),
+                          torch.linspace(0, img_height-1, img_height, device=gpu_if_available),
+                          indexing='ij')
     i = i.t()
     j = j.t()
     dirs = torch.stack([(i-intrinsics_matrix[0][2])/intrinsics_matrix[0][0],
@@ -684,7 +685,7 @@ def load_data(args: Namespace, gpu_if_available: torch.device
         val_idxs = test_idxs
         near = 0
         far = depth_imgs.max() * 1.1
-        assert far < 70
+        assert far < 72
 
     else:
         raise RuntimeError(f'Unknown dataset type {args.dataset_type}. Exiting.')
@@ -1444,7 +1445,6 @@ def sample_skf_rays(sw_skf_rays, kf_rgb_imgs, intrinsics_matrix, n_total_rays_to
                 unif_rendered_depths = 1 / unif_rendered_disps
 
             # Computing section-wise loss for uniformly sampled rays.
-            # TODO: should this not be sw_kf_loss?
             unif_sampled_skf_sw_idxs_tuple = get_idxs_tuple(unif_sampled_pw_idxs[:, :3])
             include_depth_loss = True
             sw_kf_loss, _, _, _ = get_sw_loss(unif_rendered_rgbs, unif_rendered_depths, unif_gt_rgbs,
@@ -1465,7 +1465,9 @@ def sample_skf_rays(sw_skf_rays, kf_rgb_imgs, intrinsics_matrix, n_total_rays_to
     else:
         # Active sampling is disabled, so simply sample uniformly over all sections.
         sampled_rays, sampled_skf_sw_idxs, sw_n_newly_sampled, _ = \
-            sample_sw_rays(sw_skf_rays, sw_sampling_prob_dist * sw_sampling_prob_dist_modifier,
+            sample_sw_rays(sw_skf_rays,
+                           sw_sampling_prob_dist[skf_from_kf_idxs] *
+                           sw_sampling_prob_dist_modifier[skf_from_kf_idxs],
                            n_total_rays_to_sample,
                            kf_rgb_imgs, img_height, img_width, dims_kf_pw, dims_skf_pw,
                            skf_from_kf_idxs,
@@ -1528,7 +1530,7 @@ def save_point_cloud_from_rgb_imgs_and_depth_imgs(point_cloud_fpath, rgb_imgs, d
 
     point_cloud = point_cloud_from_rgb_imgs_and_depth_imgs(rgb_imgs.cpu().numpy(),
                                                            depth_imgs.cpu().numpy(), world_from_cameras,
-                                                           intrinsics_matrix.cpu().numpy(), z_forwards=False)
+                                                           intrinsics_matrix.detach().cpu().numpy(), z_forwards=False)
     o3d.io.write_point_cloud(point_cloud_fpath.as_posix(), point_cloud)
 
     if tb_info is not None:
@@ -1580,3 +1582,36 @@ def append_to_log_file(base_dpath, base_fname, i_log, s_log, content_to_append_)
     else:
         log_file_contents = content_to_append
     torch.save(log_file_contents, log_fpath)
+
+
+def intrinsics_params_from_intrinsics_matrix(intrinsics_matrix, gpu_if_available):
+    fx = intrinsics_matrix[0, 0]
+    fy = intrinsics_matrix[1, 1]
+    cx = intrinsics_matrix[0, 2]
+    cy = intrinsics_matrix[1, 2]
+    intrinsics_params = torch.tensor([fx, fy, cx, cy], device=gpu_if_available)
+
+    return intrinsics_params
+
+
+def intrinsics_matrix_from_intrinsics_params(intrinsics_params, gpu_if_available):
+    fx, fy, cx, cy = intrinsics_params
+
+    intrinsics_matrix = torch.eye(3, device=gpu_if_available)
+    intrinsics_matrix[0, 0] = fx
+    intrinsics_matrix[1, 1] = fy
+    intrinsics_matrix[0, 2] = cx
+    intrinsics_matrix[1, 2] = cy
+
+    return intrinsics_matrix
+
+
+def get_intrinsics_matrix(initial_intrinsics_matrix, intrinsics_params, do_intrinsics_optimization,
+                          gpu_if_available):
+    if do_intrinsics_optimization:
+        intrinsics_matrix = intrinsics_matrix_from_intrinsics_params(intrinsics_params,
+                                                                     gpu_if_available)
+    else:
+        intrinsics_matrix = initial_intrinsics_matrix
+
+    return intrinsics_matrix
