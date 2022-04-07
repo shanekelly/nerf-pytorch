@@ -14,5 +14,6 @@ s_train_scalars = 120
 s_sampling_vis = 120
 s_val = 120
 s_poses_vis = 120
+i_intrinsics_vis = 1
 i_weights = 5000
 N_importance = 64

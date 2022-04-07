@@ -1,0 +1,27 @@
+datadir = ~/eth/implicit-mapping/datasets/strawberry/0/5-to-10-sec/orbslam/front-camera/right-camera/all-frames
+
+expname = nerf_strawberry_0_5-to-10-secs
+
+factor = 1  # Downsampling factor.
+
+save_logs_to_file = False
+
+keyframe_creation_strategy = every_Nth
+every_Nth = 5
+keyframe_selection_strategy = explore_exploit
+n_explore = 5
+n_exploit = 0
+
+no_gaussian_positional_embedding = True
+no_active_sampling = True
+no_lazy_sw_loss = True
+no_pose_optimization = True
+no_intrinsics_optimization = True
+no_depth_measurements = True
+N_importance = 64
+
+n_training_iters = 200000
+s_train_scalars = 600
+s_sampling_vis = 600
+s_val = 600
+i_weights = 5000
