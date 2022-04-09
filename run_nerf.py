@@ -23,6 +23,7 @@ from tqdm import tqdm, trange
 from axes.util import o3d_axes_from_poses
 
 from run_nerf_helpers import (add_1d_imgs_to_tensorboard, append_to_log_file, create_keyframes,
+                              extract_mesh,
                               get_idxs_tuple, get_intrinsics_matrix, get_kf_poses, get_log_fpath,
                               get_sw_n_sampled, get_sw_rays, get_embedder, get_rays,
                               get_sw_sampling_prob_dist_modifier,
@@ -335,6 +336,10 @@ def config_parser():
     parser.add_argument("--render_factor", type=int, default=0,
                         help='downsampling factor to speed up rendering, set 4 or 8 for fast '
                         'preview')
+    parser.add_argument("--mesh_only", action='store_true',
+                        help='do not optimize, reload weights and save mesh to a file')
+    parser.add_argument("--mesh_grid_size", type=int, default=100,
+                        help='number of grid points to sample in each dimension for marching cubes')
 
     # training options
     parser.add_argument("--precrop_iters", type=int, default=0,
@@ -361,7 +366,7 @@ def config_parser():
                         help='load blender synthetic data at 400x400 instead of 800x800')
 
     # llff flags
-    parser.add_argument("--factor", type=int, default=8,
+    parser.add_argument("--factor", type=int, default=1,
                         help='downsample factor for LLFF images')
     parser.add_argument("--no_ndc", action='store_true',
                         help='do not use normalized device coordinates (set for non-forward facing '
@@ -505,10 +510,10 @@ def train() -> None:
                            global_step=1, dataformats='NHWC')
     add_1d_imgs_to_tensorboard(test_depth_imgs, black_rgb, white_rgb, tensorboard, 'test/depth/groundtruth',
                                1, cpu, white_rgb, 2)
-    val_idx = len(val_idxs) // 2 if len(val_idxs) > 1 else val_idxs[0]
-    val_rgb_img = rgb_imgs[val_idxs][val_idx]
-    val_depth_img = depth_imgs[val_idxs][val_idx]
-    val_pose = initial_poses[val_idxs][val_idx, :3, :4].to(gpu_if_available)
+    val_idx = val_idxs[len(val_idxs) // 2]
+    val_rgb_img = rgb_imgs[val_idx]
+    val_depth_img = depth_imgs[val_idx]
+    val_pose = initial_poses[val_idx, :3, :4].to(gpu_if_available)
 
     kf_rgb_imgs, kf_depth_imgs, kf_initial_poses, kf_idxs, n_kfs = \
         create_keyframes(rgb_imgs, depth_imgs, initial_poses, train_idxs, args.keyframe_creation_strategy,
@@ -586,6 +591,21 @@ def train() -> None:
             # imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
 
             return
+
+     # Short circuit if only extracting mesh from trained model
+    if args.mesh_only:
+        mesh = extract_mesh(render_kwargs_test, mesh_grid_size=args.mesh_grid_size, threshold=0.0)
+
+        testsavedir = os.path.join(basedir, expname, 'renderonly_{}_{:06d}'.format(
+            'test' if args.img_type_to_render == 'test' else 'path', start_iter_idx))
+        os.makedirs(testsavedir, exist_ok=True)
+        path = os.path.join(testsavedir, 'mesh.obj')
+
+        print("saving mesh to ", path)
+
+        mesh.export(path)
+
+        return
 
     # Parse command line arguments.
     N_rand = args.N_rand
@@ -772,8 +792,9 @@ def train() -> None:
                 'B': B
             }
             if render_kwargs_train['network_fine'] is not None:
-                save_dict['network_fine_state_dict'] = render_kwargs_train['network_fine'].state_dict(),
+                save_dict['network_fine_state_dict'] = render_kwargs_train['network_fine'].state_dict()
             torch.save(save_dict, path)
+            set_trace()
             print('Saved checkpoints at', path)
             t_prev_weights_log = t_train_iter_start
 
@@ -857,11 +878,11 @@ def train() -> None:
                 already_logged_val_gt = True
             tensorboard.add_scalar('validation/loss', val_loss, train_iter_idx)
             tensorboard.add_scalar('validation/psnr', val_psnr, train_iter_idx)
-            tb_info = (tensorboard, 'train/point-cloud', open3d_vis_count)
-            save_point_cloud_from_rgb_imgs_and_depth_imgs(
-                vis_dpath /
-                f'rendered-val-point-cloud-{train_iter_idx:06d}.ply', val_rendered_rgb,
-                val_rendered_depth, val_pose, intrinsics_matrix, tb_info)
+            # tb_info = (tensorboard, 'train/point-cloud', open3d_vis_count)
+            # save_point_cloud_from_rgb_imgs_and_depth_imgs(
+            #     vis_dpath /
+            #     f'rendered-val-point-cloud-{train_iter_idx:06d}.ply', val_rendered_rgb,
+            #     val_rendered_depth, val_pose, intrinsics_matrix, tb_info)
             if args.save_logs_to_file:
                 if is_first_iter:
                     torch.save(intrinsics_matrix.cpu(), vis_dpath / 'intrinsics-matrix_rgb.pt')

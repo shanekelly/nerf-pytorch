@@ -1,0 +1,16 @@
+datadir = ~/eth/implicit-mapping/datasets/strawberry/0/3-frames/orbslam/front-camera/right-camera/all-frames
+
+expname = taim_strawberry_0_3-frames
+
+save_logs_to_file = False
+
+keyframe_creation_strategy = all
+keyframe_selection_strategy = all
+
+N_importance = 64
+
+n_training_iters = 200000
+s_train_scalars = 600
+s_sampling_vis = 600
+s_val = 600
+i_weights = 5000

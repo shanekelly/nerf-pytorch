@@ -4,10 +4,12 @@ from pickle import dump, load
 from time import perf_counter
 from typing import Callable, Dict, List, Optional, Tuple
 
+import mcubes
 import numpy as np
 import open3d as o3d
 import torch
 import torch.nn as nn
+import trimesh
 
 from cv2 import circle, COLOR_RGB2HSV, cvtColor, FILLED
 from GPUtil import showUtilization
@@ -1615,3 +1617,29 @@ def get_intrinsics_matrix(initial_intrinsics_matrix, intrinsics_params, do_intri
         intrinsics_matrix = initial_intrinsics_matrix
 
     return intrinsics_matrix
+
+
+def extract_mesh(render_kwargs, mesh_grid_size=100, threshold=0.1):
+    network_query_fn, network = render_kwargs['network_query_fn'], render_kwargs['network_fine']
+    device = next(network.parameters()).device
+
+    with torch.no_grad():
+        points_x = np.linspace(0.75, 1.25, mesh_grid_size)
+        points_y = np.linspace(-0.25, 0.25, mesh_grid_size)
+        points_z = np.linspace(0.75, 1.25, mesh_grid_size)
+        query_pts = \
+            torch.tensor(np.stack(np.meshgrid(points_x, points_y, points_z),
+                                  -1).astype(np.float32)).reshape(-1, 1, 3).to(device)
+        viewdirs = None
+
+        output = network_query_fn(query_pts, viewdirs, network)
+
+        grid = output[..., -1].reshape(mesh_grid_size, mesh_grid_size, mesh_grid_size)
+
+        print('fraction occupied:', (grid > threshold).float().mean())
+
+        vertices, triangles = mcubes.marching_cubes(grid.detach().cpu().numpy(), threshold)
+        mesh = trimesh.Trimesh(vertices, triangles)
+        set_trace()
+
+    return mesh
