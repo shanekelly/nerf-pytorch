@@ -1059,14 +1059,14 @@ def get_sw_n_sampled(sampled_sw_idxs_tuple: Tuple[torch.Tensor, ...], dims_kf_sw
 
 def get_sw_loss(rendered_rgbs: torch.Tensor, rendered_depths, gt_rgbs: torch.Tensor, gt_depths, sw_n_sampled: torch.Tensor,
                 sampled_sw_idxs_tuple: Tuple[torch.Tensor, ...], extras, dims_sw: Tuple[int, int, int],
-                include_depth_loss: bool, cpu: torch.device,
+                depth_loss_iters_multiplier: float, cpu: torch.device,
                 ) -> Tuple[torch.Tensor, float]:
     t_start = perf_counter()
 
     rendered_rgbs = rendered_rgbs.to(cpu)
     rendered_depths = rendered_depths.to(cpu)
     gt_rgbs = gt_rgbs.to(cpu)
-    if include_depth_loss:
+    if depth_loss_iters_multiplier > 0.0:
         gt_depths = gt_depths.to(cpu)
         invalid_depth_idxs_small = torch.where(gt_depths < 0.30)
         invalid_depth_idxs_big = torch.where(gt_depths > 66)
@@ -1078,7 +1078,7 @@ def get_sw_loss(rendered_rgbs: torch.Tensor, rendered_depths, gt_rgbs: torch.Ten
             torch.mean((get_sw_coarse_or_fine_rendered_rgbs - gt_rgbs) ** 2, axis=1)
         # rgb_mean_squared_diffs[invalid_depth_idxs_big] = 0.0
 
-        if include_depth_loss:
+        if depth_loss_iters_multiplier > 0.0:
             depth_diffs = get_sw_coarse_or_fine_rendered_depths - gt_depths
             depth_diffs_normalized = depth_diffs / 10
             depth_mean_squared_diffs = depth_diffs_normalized ** 2
@@ -1094,11 +1094,12 @@ def get_sw_loss(rendered_rgbs: torch.Tensor, rendered_depths, gt_rgbs: torch.Ten
             sw_cumu_rgb_mean_squared_diffs[sw_sampled_idxs] / sw_n_sampled[sw_sampled_idxs]
 
         sw_coarse_or_fine_depth_loss = torch.zeros(dims_sw)
-        if include_depth_loss:
+        if depth_loss_iters_multiplier > 0.0:
             sw_cumu_depth_mean_squared_diffs = torch.index_put(torch.zeros(dims_sw), sampled_sw_idxs_tuple,
                                                                depth_mean_squared_diffs, accumulate=True)
             sw_coarse_or_fine_depth_loss[sw_sampled_idxs] = \
                 sw_cumu_depth_mean_squared_diffs[sw_sampled_idxs] / sw_n_sampled[sw_sampled_idxs]
+            sw_coarse_or_fine_depth_loss *= depth_loss_iters_multiplier
 
         return sw_coarse_or_fine_rgb_loss, sw_coarse_or_fine_depth_loss
 
@@ -1276,7 +1277,7 @@ def get_kf_poses(kf_initial_poses: torch.Tensor, kf_poses_params: torch.nn.Param
 
 def render_and_compute_loss(rays, intrinsics_matrix, render_kwargs_train, img_height, img_width,
                             dims_kf_sw, chunk, sampled_sw_idxs_tuple, sw_n_newly_sampled,
-                            include_depth_loss, optimizer,
+                            depth_loss_iters_multiplier, optimizer,
                             train_iter_idx, cpu, gpu_if_available
                             ) -> Tuple[torch.Tensor, torch.Tensor, Dict, torch.Tensor, torch.Tensor,
                                        torch.Tensor, float, float, float]:
@@ -1296,7 +1297,7 @@ def render_and_compute_loss(rays, intrinsics_matrix, render_kwargs_train, img_he
     optimizer.zero_grad()
 
     sw_loss, sw_rgb_loss, sw_depth_loss, t_loss = get_sw_loss(rendered_rgbs, rendered_depths, gt_rgbs, gt_depths, sw_n_newly_sampled, sampled_sw_idxs_tuple, extras,
-                                                              dims_kf_sw, include_depth_loss, cpu)
+                                                              dims_kf_sw, depth_loss_iters_multiplier, cpu)
 
     loss = torch.mean(sw_loss)
     psnr = mse2psnr(loss)
@@ -1336,11 +1337,11 @@ def initialize_sw_kf_loss(kf_rgb_imgs, kf_depth_imgs, kf_poses, sw_unif_sampling
                                                                             enforce_min_samples=True)
     # Render the sampled rays and compute section-wise loss.
     sampled_sw_idxs_tuple = get_idxs_tuple(sampled_pw_idxs[:, :3])
-    include_depth_loss = True
+    depth_loss_iters_multiplier = 1.0
     _, _, _, sw_kf_loss, _, _, _, _, _, _, _ = render_and_compute_loss(
         sampled_rays, intrinsics_matrix, render_kwargs_train,
         img_height, img_width, dims_kf_sw, chunk,
-        sampled_sw_idxs_tuple, sw_n_newly_sampled, include_depth_loss, optimizer,
+        sampled_sw_idxs_tuple, sw_n_newly_sampled, depth_loss_iters_multiplier, optimizer,
         1, cpu, gpu_if_available)
 
     return sw_kf_loss
@@ -1448,10 +1449,10 @@ def sample_skf_rays(sw_skf_rays, kf_rgb_imgs, intrinsics_matrix, n_total_rays_to
 
             # Computing section-wise loss for uniformly sampled rays.
             unif_sampled_skf_sw_idxs_tuple = get_idxs_tuple(unif_sampled_pw_idxs[:, :3])
-            include_depth_loss = True
+            depth_loss_iters_multiplier = 1.0
             sw_kf_loss, _, _, _ = get_sw_loss(unif_rendered_rgbs, unif_rendered_depths, unif_gt_rgbs,
                                               unif_gt_depths, sw_n_newly_sampled, unif_sampled_skf_sw_idxs_tuple, extras,
-                                              dims_kf_sw, include_depth_loss, cpu)
+                                              dims_kf_sw, depth_loss_iters_multiplier, cpu)
 
         # Active ray sampling.
         sw_active_sampling_prob_dist = sw_skf_loss / torch.sum(sw_skf_loss)
@@ -1643,3 +1644,18 @@ def extract_mesh(render_kwargs, mesh_grid_size=100, threshold=0.1):
         set_trace()
 
     return mesh
+
+
+def get_depth_loss_iters_multiplier(include_depth_loss, train_iter_idx, depth_loss_iters_diminish_point):
+    if not include_depth_loss:
+        return torch.tensor(0.0)
+
+    # At this value of depth loss multiplier, we consider the depth loss to be diminished.
+    diminished_value = torch.tensor(0.01)
+
+    # The time constant of the exponentially decaying function.
+    tao = -depth_loss_iters_diminish_point / torch.log(diminished_value)
+
+    depth_loss_iters_multiplier = torch.exp(-train_iter_idx / tao)
+
+    return depth_loss_iters_multiplier

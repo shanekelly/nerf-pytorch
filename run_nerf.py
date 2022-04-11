@@ -23,7 +23,7 @@ from tqdm import tqdm, trange
 from axes.util import o3d_axes_from_poses
 
 from run_nerf_helpers import (add_1d_imgs_to_tensorboard, append_to_log_file, create_keyframes,
-                              extract_mesh,
+                              extract_mesh, get_depth_loss_iters_multiplier,
                               get_idxs_tuple, get_intrinsics_matrix, get_kf_poses, get_log_fpath,
                               get_sw_n_sampled, get_sw_rays, get_embedder, get_rays,
                               get_sw_sampling_prob_dist_modifier,
@@ -483,6 +483,11 @@ def config_parser():
                         'gaussian positional encoding matrix, B.')
     parser.add_argument('--no_depth_measurements', action='store_true', help='Set to ignore sensor '
                         'depth measurements. Disables direct learning of depth.')
+    parser.add_argument('--depth_loss_iters_diminish_point', type=int, default=10000, help='Used to tune '
+                        'how quickly the depth loss will be diminished. After the specified number '
+                        'of iterations, the exponentially decaying function that determines how much'
+                        'the depth loss is diminished will equal 0.01 (ie, 99% of the depth loss '
+                        'will be ignored).')
 
     return parser
 
@@ -667,14 +672,6 @@ def train() -> None:
 
     already_logged_val_gt = False
 
-    depth_loss_running_queue_max_size = 100
-    depth_loss_running_queue = Queue(maxsize=depth_loss_running_queue_max_size)
-    depth_loss_running_avg = 0.0
-    effective_depth_loss_running_avg = 0.0
-    include_depth_loss = not args.no_depth_measurements
-    # include_depth_loss_thresh = 1e-3
-    include_depth_loss_thresh = 5e-3
-
     start_iter_idx += 1
     open3d_vis_count += 1
     n_training_iters = args.n_training_iters + 1
@@ -742,15 +739,15 @@ def train() -> None:
         sw_total_n_sampled[skf_from_kf_idxs] += sw_n_newly_sampled
 
         # Render the sampled rays and compute the loss.
+        depth_loss_iters_multiplier = get_depth_loss_iters_multiplier(not args.no_depth_measurements,
+                                                                      train_iter_idx, args.depth_loss_iters_diminish_point)
         sampled_skf_sw_idxs_tuple = get_idxs_tuple(sampled_skf_sw_idxs[:, :3])
-        if not depth_loss_running_queue.empty() and include_depth_loss:
-            include_depth_loss = not effective_depth_loss_running_avg <= include_depth_loss_thresh
         (train_rendered_rgbs, train_gt_rgbs, _, new_sw_skf_loss, new_sw_skf_rgb_loss,
          new_sw_skf_depth_loss, train_loss, train_psnr, t_batching,
          t_rendering, t_loss) = render_and_compute_loss(sampled_rays, intrinsics_matrix, render_kwargs_train,
                                                         img_height, img_width, dims_skf_sw, args.chunk,
                                                         sampled_skf_sw_idxs_tuple, sw_n_newly_sampled,
-                                                        include_depth_loss, optimizer,
+                                                        depth_loss_iters_multiplier, optimizer,
                                                         train_iter_idx, cpu, gpu_if_available)
 
         # Compute gradients for parameters via backpropagation and use them to update parameter
@@ -770,13 +767,6 @@ def train() -> None:
             param_group['lr'] = new_lrate
 
         depth_train_loss = new_sw_skf_depth_loss.mean()
-        if depth_loss_running_queue.full():
-            depth_loss_running_avg -= \
-                depth_loss_running_queue.get() / depth_loss_running_queue_max_size
-        depth_loss_running_queue.put(depth_train_loss)
-        depth_loss_running_avg += depth_train_loss / depth_loss_running_queue_max_size
-        effective_depth_loss_running_avg = depth_loss_running_avg * (
-            depth_loss_running_queue_max_size / depth_loss_running_queue.qsize())
 
         # Rest is logging.
 
@@ -832,8 +822,8 @@ def train() -> None:
                 rgb_train_loss = new_sw_skf_rgb_loss.mean()
                 tensorboard.add_scalar('train/loss_rgb', rgb_train_loss, train_iter_idx)
                 tensorboard.add_scalar('train/loss_depth', depth_train_loss, train_iter_idx)
-                tensorboard.add_scalar('train/loss_depth_running_avg',
-                                       effective_depth_loss_running_avg, train_iter_idx)
+                tensorboard.add_scalar('train/loss_depth_multiplier',
+                                       depth_loss_iters_multiplier, train_iter_idx)
                 tensorboard.add_scalar(
                     'train/loss_percent_rgb',
                     100 * rgb_train_loss / (rgb_train_loss + depth_train_loss),
