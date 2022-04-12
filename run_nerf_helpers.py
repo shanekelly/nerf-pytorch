@@ -1059,7 +1059,7 @@ def get_sw_n_sampled(sampled_sw_idxs_tuple: Tuple[torch.Tensor, ...], dims_kf_sw
 
 def get_sw_loss(rendered_rgbs: torch.Tensor, rendered_depths, gt_rgbs: torch.Tensor, gt_depths, sw_n_sampled: torch.Tensor,
                 sampled_sw_idxs_tuple: Tuple[torch.Tensor, ...], extras, dims_sw: Tuple[int, int, int],
-                depth_loss_iters_multiplier: float, cpu: torch.device,
+                depth_loss_iters_multiplier: float, cpu: torch.device
                 ) -> Tuple[torch.Tensor, float]:
     t_start = perf_counter()
 
@@ -1084,6 +1084,8 @@ def get_sw_loss(rendered_rgbs: torch.Tensor, rendered_depths, gt_rgbs: torch.Ten
             depth_mean_squared_diffs = depth_diffs_normalized ** 2
             depth_mean_squared_diffs[invalid_depth_idxs_small] = 0.0
             depth_mean_squared_diffs[invalid_depth_idxs_big] = 0.0
+            depth_loss_meters_multiplier = get_depth_loss_meters_multiplier(gt_depths)
+            depth_mean_squared_diffs *= depth_loss_meters_multiplier
 
         # For each section, the average mean squared difference between rendered RGB and groundtruth RGB
         # for each sampled pixel within the section.
@@ -1659,3 +1661,35 @@ def get_depth_loss_iters_multiplier(include_depth_loss, train_iter_idx, depth_lo
     depth_loss_iters_multiplier = torch.exp(-train_iter_idx / tao)
 
     return depth_loss_iters_multiplier
+
+
+def log_depth_loss_iters_multiplier_function(tensorboard, include_depth_loss, depth_loss_iters_diminish_point):
+    iters = torch.linspace(0, depth_loss_iters_diminish_point, 100).round()
+    depth_loss_iters_multipliers = get_depth_loss_iters_multiplier(include_depth_loss, iters,
+                                                                   depth_loss_iters_diminish_point)
+    for iter_val, depth_loss_iters_multiplier in zip(iters, depth_loss_iters_multipliers):
+        tensorboard.add_scalar('train/loss_depth_iters_multiplier',
+                               depth_loss_iters_multiplier, iter_val)
+
+
+def get_depth_loss_meters_multiplier(gt_depth):
+    multiplier_min = 0.1
+    multiplier_max = 1.0
+    center = 5
+    steepness = 2
+
+    height = multiplier_max - multiplier_min
+    shift = torch.log(torch.tensor(1 / height)) / steepness - center
+
+    depth_loss_meters_multiplier = \
+        multiplier_min + 1 / (1 / height + torch.exp(steepness * (gt_depth + shift)))
+
+    return depth_loss_meters_multiplier
+
+
+def log_depth_loss_meters_multiplier_function(tensorboard):
+    depth_vals = torch.arange(0, 10)
+    depth_loss_meters_multipliers = get_depth_loss_meters_multiplier(depth_vals)
+    for depth_val, depth_loss_meters_multiplier in zip(depth_vals, depth_loss_meters_multipliers):
+        tensorboard.add_scalar('train/loss_depth_meters_multiplier',
+                               depth_loss_meters_multiplier, depth_val)

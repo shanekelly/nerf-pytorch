@@ -11,9 +11,9 @@ n_explore = 4
 n_exploit = 1
 
 N_importance = 64
-depth_loss_iters_diminishing_point = 2000
+depth_loss_iters_diminish_point = 2000
 
-n_training_iters = 200000
+n_training_iters = 50000
 s_train_scalars = 120
 s_intrinsics_vis = 120
 s_sampling_vis = 120

@@ -28,7 +28,9 @@ from run_nerf_helpers import (add_1d_imgs_to_tensorboard, append_to_log_file, cr
                               get_sw_n_sampled, get_sw_rays, get_embedder, get_rays,
                               get_sw_sampling_prob_dist_modifier,
                               intrinsics_params_from_intrinsics_matrix, img2mse, initialize_sw_kf_loss,
-                              load_data, mse2psnr, NeRF, ndc_rays, pad_imgs, pad_sections, render,
+                              load_data, log_depth_loss_meters_multiplier_function,
+                              log_depth_loss_iters_multiplier_function,
+                              mse2psnr, NeRF, ndc_rays, pad_imgs, pad_sections, render,
                               render_and_compute_loss, sample_pdf, sample_skf_rays, sample_sw_rays,
                               save_point_cloud_from_rgb_imgs_and_depth_imgs, select_keyframes,
                               should_trigger, split_into_sections, to8b, tfmats_from_minreps,
@@ -658,6 +660,10 @@ def train() -> None:
         get_sw_sampling_prob_dist_modifier(kf_rgb_imgs, grid_size,
                                            args.sw_sampling_prob_dist_modifier_strategy,
                                            tensorboard, cpu)
+
+    log_depth_loss_iters_multiplier_function(tensorboard, not args.no_depth_measurements,
+                                             args.depth_loss_iters_diminish_point)
+    log_depth_loss_meters_multiplier_function(tensorboard)
 
     t_prev_train_scalars_log = 0.0
     t_prev_val_log = 0.0
