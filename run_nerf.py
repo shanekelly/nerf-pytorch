@@ -179,7 +179,7 @@ def create_nerf(args, initial_poses: torch.Tensor, initial_intrinsics_matrix: to
     model = NeRF(D=args.netdepth, img_width=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
                  input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(gpu_if_available)
-    grad_vars = list(model.parameters())
+    grad_vars = [{'params': model.parameters(), 'lr': args.initial_scene_lr}]
 
     model_fine = None
 
@@ -188,7 +188,7 @@ def create_nerf(args, initial_poses: torch.Tensor, initial_intrinsics_matrix: to
                           input_ch=input_ch, output_ch=output_ch, skips=skips,
                           input_ch_views=input_ch_views,
                           use_viewdirs=args.use_viewdirs).to(gpu_if_available)
-        grad_vars += list(model_fine.parameters())
+        grad_vars += [{'params': model_fine.parameters(), 'lr': args.initial_scene_lr}]
 
     def network_query_fn(inputs, viewdirs, network_fn):
         return run_network(inputs, viewdirs, network_fn, embed_fn=embed_fn,
@@ -201,11 +201,11 @@ def create_nerf(args, initial_poses: torch.Tensor, initial_intrinsics_matrix: to
         # then add them to grad_vars, which will get passed to the optimizer.
         kf_poses_params = Parameter(minreps_from_tfmats(initial_poses, gpu_if_available))
         with torch.no_grad():
-            grad_vars.extend([kf_poses_params])
+            grad_vars.append({'params': kf_poses_params, 'lr': args.initial_poses_lr})
 
     if not args.no_gaussian_positional_embedding and args.B_opt:
         with torch.no_grad():
-            grad_vars.append(B)
+            grad_vars.append({'params': B, 'lr': args.initial_gpe_mat_lr})
 
     if args.no_intrinsics_optimization:
         intrinsics_params = None
@@ -215,10 +215,10 @@ def create_nerf(args, initial_poses: torch.Tensor, initial_intrinsics_matrix: to
         intrinsics_params = Parameter(intrinsics_params_from_intrinsics_matrix(
             initial_intrinsics_matrix, gpu_if_available))
         with torch.no_grad():
-            grad_vars.extend([intrinsics_params])
+            grad_vars.append({'params': intrinsics_params, 'lr': args.initial_intrinsics_lr})
 
     # Create optimizer
-    optimizer = torch.optim.Adam(params=grad_vars, lr=args.lrate, betas=(0.9, 0.999))
+    optimizer = torch.optim.Adam(params=grad_vars, betas=(0.9, 0.999))
 
     start_iter_idx = 0
     open3d_vis_count = 0
@@ -291,10 +291,26 @@ def config_parser():
                         help='channels per layer in fine network')
     parser.add_argument("--N_rand", type=int, default=2048,
                         help='batch size (number of random rays per gradient step)')
-    parser.add_argument("--lrate", type=float, default=5e-4,
-                        help='learning rate')
-    parser.add_argument("--lrate_decay", type=int, default=250,
-                        help='exponential learning rate decay (in 1000 steps)')
+    parser.add_argument("--initial_scene_lr", type=float, default=5e-4,
+                        help='Initial learning rate for neural volume weights.')
+    parser.add_argument("--scene_lr_10_pct_pt", type=int, default=60000,
+                        help='After this many training iterations, the learning rate will have '
+                        'decayed to 10 percent of its original value.')
+    parser.add_argument("--initial_poses_lr", type=float, default=5e-4,
+                        help='Initial learning rate for camera poses.')
+    parser.add_argument("--poses_lr_10_pct_pt", type=int, default=60000,
+                        help='After this many training iterations, the learning rate will have '
+                        'decayed to 10 percent of its original value.')
+    parser.add_argument("--initial_gpe_mat_lr", type=float, default=5e-3,
+                        help='Initial learning rate for the Gaussian positional embedding matrix.')
+    parser.add_argument("--gpe_mat_lr_10_pct_pt", type=int, default=60000,
+                        help='After this many training iterations, the learning rate will have '
+                        'decayed to 10 percent of its original value.')
+    parser.add_argument("--initial_intrinsics_lr", type=float, default=5e-3,
+                        help='Initial learning rate for the Gaussian positional embedding matrix.')
+    parser.add_argument("--intrinsics_lr_10_pct_pt", type=int, default=60000,
+                        help='After this many training iterations, the learning rate will have '
+                        'decayed to 10 percent of its original value.')
     parser.add_argument("--chunk", type=int, default=8192,
                         help='number of rays processed in parallel, decrease if running out of '
                         'memory')
@@ -764,13 +780,38 @@ def train() -> None:
         optimizer.step()
         t_backprop = perf_counter() - t_backprop_start
 
-        # Update learning rate.
-        decay_rate = 0.1
-        decay_steps = args.lrate_decay * 1000
-        new_lrate = args.lrate * (decay_rate ** (global_step / decay_steps))
+        # Update learning rate for the coarse network.
+        lr_decay_rate = 0.1
+        param_group_idx = 0
+        new_scene_lr = args.initial_scene_lr * (lr_decay_rate ** (global_step /
+                                                                  args.scene_lr_10_pct_pt))
+        optimizer.param_groups[param_group_idx]['lr'] = new_scene_lr
+        param_group_idx += 1
 
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = new_lrate
+        # Update learning rate for the fine network.
+        if args.N_importance > 0:
+            optimizer.param_groups[param_group_idx]['lr'] = new_scene_lr
+            param_group_idx += 1
+
+        # Update learning rate for the poses.
+        if not args.no_pose_optimization:
+            new_poses_lr = args.initial_poses_lr * (lr_decay_rate ** (global_step /
+                                                                      args.poses_lr_10_pct_pt))
+            optimizer.param_groups[param_group_idx]['lr'] = new_poses_lr
+            param_group_idx += 1
+
+        # Update learning rate for the Gaussian positional embedding matrix.
+        if args.B_opt:
+            new_gpe_mat_lr = args.initial_gpe_mat_lr * (lr_decay_rate ** (global_step /
+                                                                          args.gpe_mat_lr_10_pct_pt))
+            optimizer.param_groups[param_group_idx]['lr'] = new_gpe_mat_lr
+            param_group_idx += 1
+
+        # Update learning rate for the camera intrinsics.
+        if not args.no_intrinsics_optimization:
+            new_intrinsics_lr = args.initial_intrinsics_lr * (lr_decay_rate ** (global_step /
+                                                                                args.intrinsics_lr_10_pct_pt))
+            optimizer.param_groups[param_group_idx]['lr'] = new_intrinsics_lr
 
         depth_train_loss = new_sw_skf_depth_loss.mean()
 
@@ -835,7 +876,16 @@ def train() -> None:
                     100 * rgb_train_loss / (rgb_train_loss + depth_train_loss),
                     train_iter_idx)
                 tensorboard.add_scalar('train/psnr', train_psnr, train_iter_idx)
-                tensorboard.add_scalar('train/learning_rate', new_lrate, train_iter_idx)
+                tensorboard.add_scalar('train/learning_rate_scene', new_scene_lr, train_iter_idx)
+                if not args.no_pose_optimization:
+                    tensorboard.add_scalar('train/learning_rate_poses',
+                                           new_poses_lr, train_iter_idx)
+                if args.B_opt:
+                    tensorboard.add_scalar('train/learning_rate_gpe_mat',
+                                           new_gpe_mat_lr, train_iter_idx)
+                if not args.no_intrinsics_optimization:
+                    tensorboard.add_scalar('train/learning_rate_intrinsics',
+                                           new_intrinsics_lr, train_iter_idx)
                 if (args.save_logs_to_file):
                     append_to_log_file(vis_dpath, 'loss', args.i_train_scalars, args.s_train_scalars,
                                        train_loss)
