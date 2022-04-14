@@ -296,9 +296,9 @@ def config_parser():
     parser.add_argument("--scene_lr_10_pct_pt", type=int, default=60000,
                         help='After this many training iterations, the learning rate will have '
                         'decayed to 10 percent of its original value.')
-    parser.add_argument("--initial_poses_lr", type=float, default=5e-4,
+    parser.add_argument("--initial_poses_lr", type=float, default=1e-3,
                         help='Initial learning rate for camera poses.')
-    parser.add_argument("--poses_lr_10_pct_pt", type=int, default=60000,
+    parser.add_argument("--poses_lr_10_pct_pt", type=int, default=30000,
                         help='After this many training iterations, the learning rate will have '
                         'decayed to 10 percent of its original value.')
     parser.add_argument("--initial_gpe_mat_lr", type=float, default=5e-3,
@@ -308,7 +308,7 @@ def config_parser():
                         'decayed to 10 percent of its original value.')
     parser.add_argument("--initial_intrinsics_lr", type=float, default=5e-3,
                         help='Initial learning rate for the Gaussian positional embedding matrix.')
-    parser.add_argument("--intrinsics_lr_10_pct_pt", type=int, default=60000,
+    parser.add_argument("--intrinsics_lr_10_pct_pt", type=int, default=30000,
                         help='After this many training iterations, the learning rate will have '
                         'decayed to 10 percent of its original value.')
     parser.add_argument("--chunk", type=int, default=8192,
