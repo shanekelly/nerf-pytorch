@@ -43,7 +43,10 @@ def load_bonn_data(base_dir, downsample_factor):
     focal_length = camera_info['rgb']['focal_length'] * scale_factor
     depth_scale = camera_info['depth']['scale']
     hwf = [height, width, focal_length]
-    intrinsics_matrix = camera_info['rgb']['intrinsics_matrix']
+    intrinsics_matrix = np.array(camera_info['rgb']['intrinsics_matrix'])
+    intrinsics_matrix_focal_length = (intrinsics_matrix[0, 0] + intrinsics_matrix[1, 1]) / 2
+    intrinsics_matrix[0, 0] = intrinsics_matrix_focal_length
+    intrinsics_matrix[1, 1] = intrinsics_matrix_focal_length
 
     # Read images and poses.
     trajectory_fpath = base_dirpath / 'traj_z-backwards.txt'

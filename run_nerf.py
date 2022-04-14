@@ -876,15 +876,15 @@ def train() -> None:
                     100 * rgb_train_loss / (rgb_train_loss + depth_train_loss),
                     train_iter_idx)
                 tensorboard.add_scalar('train/psnr', train_psnr, train_iter_idx)
-                tensorboard.add_scalar('train/learning_rate_scene', new_scene_lr, train_iter_idx)
+                tensorboard.add_scalar('learning_rate/scene', new_scene_lr, train_iter_idx)
                 if not args.no_pose_optimization:
-                    tensorboard.add_scalar('train/learning_rate_poses',
+                    tensorboard.add_scalar('learning_rate/poses',
                                            new_poses_lr, train_iter_idx)
                 if args.B_opt:
-                    tensorboard.add_scalar('train/learning_rate_gpe_mat',
+                    tensorboard.add_scalar('learning_rate/gpe_mat',
                                            new_gpe_mat_lr, train_iter_idx)
                 if not args.no_intrinsics_optimization:
-                    tensorboard.add_scalar('train/learning_rate_intrinsics',
+                    tensorboard.add_scalar('learning_rate/intrinsics',
                                            new_intrinsics_lr, train_iter_idx)
                 if (args.save_logs_to_file):
                     append_to_log_file(vis_dpath, 'loss', args.i_train_scalars, args.s_train_scalars,
@@ -1005,11 +1005,9 @@ def train() -> None:
             t_prev_B_vis_log = t_train_iter_start
 
         if log_intrinsics_vis:
-            tensorboard.add_scalars('intrinsics', {
-                'fx': intrinsics_matrix[0, 0],
-                'fy': intrinsics_matrix[1, 1],
-                'cx': intrinsics_matrix[0, 2],
-                'cy': intrinsics_matrix[1, 2]}, train_iter_idx)
+            tensorboard.add_scalar('intrinsics/f', intrinsics_matrix[0, 0], train_iter_idx)
+            tensorboard.add_scalar('intrinsics/cx', intrinsics_matrix[0, 2], train_iter_idx)
+            tensorboard.add_scalar('intrinsics/cy', intrinsics_matrix[1, 2], train_iter_idx)
             t_prev_intrinsics_vis_log = t_train_iter_start
 
         if do_active_sampling and do_lazy_sw_loss:

@@ -1590,21 +1590,20 @@ def append_to_log_file(base_dpath, base_fname, i_log, s_log, content_to_append_)
 
 
 def intrinsics_params_from_intrinsics_matrix(intrinsics_matrix, gpu_if_available):
-    fx = intrinsics_matrix[0, 0]
-    fy = intrinsics_matrix[1, 1]
+    f = intrinsics_matrix[0, 0]
     cx = intrinsics_matrix[0, 2]
     cy = intrinsics_matrix[1, 2]
-    intrinsics_params = torch.tensor([fx, fy, cx, cy], device=gpu_if_available)
+    intrinsics_params = torch.tensor([f, cx, cy], device=gpu_if_available)
 
     return intrinsics_params
 
 
 def intrinsics_matrix_from_intrinsics_params(intrinsics_params, gpu_if_available):
-    fx, fy, cx, cy = intrinsics_params
+    f, cx, cy = intrinsics_params
 
     intrinsics_matrix = torch.eye(3, device=gpu_if_available)
-    intrinsics_matrix[0, 0] = fx
-    intrinsics_matrix[1, 1] = fy
+    intrinsics_matrix[0, 0] = f
+    intrinsics_matrix[1, 1] = f
     intrinsics_matrix[0, 2] = cx
     intrinsics_matrix[1, 2] = cy
 
@@ -1668,7 +1667,7 @@ def log_depth_loss_iters_multiplier_function(tensorboard, include_depth_loss, de
     depth_loss_iters_multipliers = get_depth_loss_iters_multiplier(include_depth_loss, iters,
                                                                    depth_loss_iters_diminish_point)
     for iter_val, depth_loss_iters_multiplier in zip(iters, depth_loss_iters_multipliers):
-        tensorboard.add_scalar('train/loss_depth_iters_multiplier',
+        tensorboard.add_scalar('depth_loss_multiplier/iters',
                                depth_loss_iters_multiplier, iter_val)
 
 
@@ -1691,5 +1690,5 @@ def log_depth_loss_meters_multiplier_function(tensorboard):
     depth_vals = torch.arange(0, 10)
     depth_loss_meters_multipliers = get_depth_loss_meters_multiplier(depth_vals)
     for depth_val, depth_loss_meters_multiplier in zip(depth_vals, depth_loss_meters_multipliers):
-        tensorboard.add_scalar('train/loss_depth_meters_multiplier',
+        tensorboard.add_scalar('depth_loss_multiplier/meters',
                                depth_loss_meters_multiplier, depth_val)
