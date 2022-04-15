@@ -28,7 +28,7 @@ from run_nerf_helpers import (add_1d_imgs_to_tensorboard, append_to_log_file, cr
                               get_sw_n_sampled, get_sw_rays, get_embedder, get_rays,
                               get_sw_sampling_prob_dist_modifier,
                               intrinsics_params_from_intrinsics_matrix, img2mse, initialize_sw_kf_loss,
-                              load_data, log_depth_loss_meters_multiplier_function,
+                              load_data, load_data_and_create_keyframes, log_depth_loss_meters_multiplier_function,
                               log_depth_loss_iters_multiplier_function,
                               mse2psnr, NeRF, ndc_rays, pad_imgs, pad_sections, render,
                               render_and_compute_loss, sample_pdf, sample_skf_rays, sample_sw_rays,
@@ -501,7 +501,7 @@ def config_parser():
                         'gaussian positional encoding matrix, B.')
     parser.add_argument('--no_depth_measurements', action='store_true', help='Set to ignore sensor '
                         'depth measurements. Disables direct learning of depth.')
-    parser.add_argument('--depth_loss_iters_diminish_point', type=int, default=10000, help='Used to tune '
+    parser.add_argument('--depth_loss_iters_diminish_point', type=int, default=5000, help='Used to tune '
                         'how quickly the depth loss will be diminished. After the specified number '
                         'of iterations, the exponentially decaying function that determines how much'
                         'the depth loss is diminished will equal 0.01 (ie, 99% of the depth loss '
@@ -521,26 +521,10 @@ def train() -> None:
     vis_dpath.mkdir(parents=True, exist_ok=True)
     tensorboard = SummaryWriter(log_dpath, flush_secs=10)
 
-    # Load data from specified dataset.
-    (rgb_imgs, depth_imgs, hwf, img_height, img_width, focal, initial_intrinsics_matrix, initial_poses,
-     render_poses, train_idxs, test_idxs, val_idxs, near, far) = load_data(args, gpu_if_available)
-    test_rgb_imgs = rgb_imgs[test_idxs]
-    test_depth_imgs = depth_imgs[test_idxs]
-    test_poses = initial_poses[test_idxs]
-    # Log the test images to tensorboard.
-    tensorboard.add_images('test/rgb/groundtruth',
-                           pad_imgs(test_rgb_imgs, white_rgb, padding_width=2),
-                           global_step=1, dataformats='NHWC')
-    add_1d_imgs_to_tensorboard(test_depth_imgs, black_rgb, white_rgb, tensorboard, 'test/depth/groundtruth',
-                               1, cpu, white_rgb, 2)
-    val_idx = val_idxs[len(val_idxs) // 2]
-    val_rgb_img = rgb_imgs[val_idx]
-    val_depth_img = depth_imgs[val_idx]
-    val_pose = initial_poses[val_idx, :3, :4].to(gpu_if_available)
-
-    kf_rgb_imgs, kf_depth_imgs, kf_initial_poses, kf_idxs, n_kfs = \
-        create_keyframes(rgb_imgs, depth_imgs, initial_poses, train_idxs, args.keyframe_creation_strategy,
-                         args.every_Nth)
+    (hwf, img_height, img_width, focal, initial_intrinsics_matrix, initial_poses, render_poses,
+     near, far, val_rgb_img, val_depth_img, val_pose,
+     kf_rgb_imgs, kf_depth_imgs, kf_initial_poses, kf_idxs, n_kfs) = \
+        load_data_and_create_keyframes(args, gpu_if_available, tensorboard, cpu)
 
     # Create log dir and copy the config file
     basedir = args.basedir
@@ -669,9 +653,9 @@ def train() -> None:
                                   args.chunk, optimizer, do_active_sampling, tensorboard,
                                   cpu, gpu_if_available, verbose=verbose)
     sw_total_n_sampled = torch.zeros(dims_kf_sw, dtype=torch.int64)
-    tensorboard.add_images('train/keyframes',
-                           pad_sections(kf_rgb_imgs, dims_kf_pw, white_rgb, padding_width=2),
-                           global_step=1, dataformats='NHWC')
+    # tensorboard.add_images('train/keyframes',
+    #                        pad_sections(kf_rgb_imgs, dims_kf_pw, white_rgb, padding_width=2),
+    #                        global_step=1, dataformats='NHWC')
     sw_sampling_prob_dist_modifier = \
         get_sw_sampling_prob_dist_modifier(kf_rgb_imgs, grid_size,
                                            args.sw_sampling_prob_dist_modifier_strategy,
@@ -693,6 +677,8 @@ def train() -> None:
     t_training_start = perf_counter()
 
     already_logged_val_gt = False
+
+    showUtilization()
 
     start_iter_idx += 1
     open3d_vis_count += 1
@@ -831,7 +817,6 @@ def train() -> None:
             if render_kwargs_train['network_fine'] is not None:
                 save_dict['network_fine_state_dict'] = render_kwargs_train['network_fine'].state_dict()
             torch.save(save_dict, path)
-            set_trace()
             print('Saved checkpoints at', path)
             t_prev_weights_log = t_train_iter_start
 
@@ -846,22 +831,22 @@ def train() -> None:
             imageio.mimwrite(moviebase + 'rgb.mp4', to8b(rgbs), fps=30, quality=8)
             imageio.mimwrite(moviebase + 'disp.mp4', to8b(disps / np.max(disps)), fps=30, quality=8)
 
-        if log_test:
-            testsavedir = os.path.join(basedir, expname, f'testset_{train_iter_idx:06d}')
-            os.makedirs(testsavedir, exist_ok=True)
-            with torch.no_grad():
-                test_rendered_rgbs_np, _ = render_path(
-                    test_poses.to(gpu_if_available), hwf, intrinsics_matrix, args.chunk,
-                    render_kwargs_test,
-                    gt_imgs=test_rgb_imgs, savedir=testsavedir)
-                test_rendered_rgbs = torch.from_numpy(test_rendered_rgbs_np)
-                test_loss = img2mse(test_rendered_rgbs, test_rgb_imgs.to(cpu))
-                test_psnr = mse2psnr(test_loss)
+#         if log_test:
+#             testsavedir = os.path.join(basedir, expname, f'testset_{train_iter_idx:06d}')
+#             os.makedirs(testsavedir, exist_ok=True)
+#             with torch.no_grad():
+#                 test_rendered_rgbs_np, _ = render_path(
+#                     test_poses.to(gpu_if_available), hwf, intrinsics_matrix, args.chunk,
+#                     render_kwargs_test,
+#                     gt_imgs=test_rgb_imgs, savedir=testsavedir)
+#                 test_rendered_rgbs = torch.from_numpy(test_rendered_rgbs_np)
+#                 test_loss = img2mse(test_rendered_rgbs, test_rgb_imgs.to(cpu))
+#                 test_psnr = mse2psnr(test_loss)
 
-            tensorboard.add_images('test/rgb/estimate', pad_imgs(test_rendered_rgbs, white_rgb, 2),
-                                   train_iter_idx, dataformats='NHWC')
-            tensorboard.add_scalar('test/loss', test_loss, train_iter_idx)
-            tensorboard.add_scalar('test/psnr', test_psnr, train_iter_idx)
+#             tensorboard.add_images('test/rgb/estimate', pad_imgs(test_rendered_rgbs, white_rgb, 2),
+#                                    train_iter_idx, dataformats='NHWC')
+#             tensorboard.add_scalar('test/loss', test_loss, train_iter_idx)
+#             tensorboard.add_scalar('test/psnr', test_psnr, train_iter_idx)
 
         if log_train_scalars:
             with torch.no_grad():

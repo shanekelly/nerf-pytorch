@@ -520,6 +520,7 @@ def render_rays(ray_batch: torch.Tensor, network_fn: NeRF, network_query_fn: Cal
         ret['acc0'] = acc_map_0
         ret['z_std'] = torch.std(z_samples, dim=-1, unbiased=False)  # [N_rays]
 
+    found_nan = False
     for k in ret:
         is_disp = k[:4] == 'disp'
         is_nan = torch.isnan(ret[k])
@@ -527,10 +528,12 @@ def render_rays(ray_batch: torch.Tensor, network_fn: NeRF, network_query_fn: Cal
             n_nan = torch.sum(is_nan)
             if is_disp:
                 print(f'Found {n_nan} NaN values in {k}. Replacing with inf.')
-                torch.nan_to_num_(ret[k], nan=torch.inf)
+                # torch.nan_to_num_(ret[k], nan=torch.inf)
+                found_nan = True
             else:
                 print(f'Found {n_nan} NaN values in {k}. Replacing with zeros.')
-                torch.nan_to_num_(ret[k], nan=0)
+                # torch.nan_to_num_(ret[k], nan=0)
+                found_nan = True
 
         if is_disp:
             continue
@@ -539,7 +542,11 @@ def render_rays(ray_batch: torch.Tensor, network_fn: NeRF, network_query_fn: Cal
         if is_inf.any():
             n_inf = torch.sum(is_inf)
             print(f'Found {n_inf} inf values in {k}. Replacing with zeros.')
-            torch.nan_to_num_(ret[k], posinf=0, neginf=0)
+            # torch.nan_to_num_(ret[k], posinf=0, neginf=0)
+            found_nan = True
+
+    if found_nan:
+        set_trace()
 
     return ret
 
@@ -592,7 +599,10 @@ def raw2outputs(raw, z_vals, rays_d, gpu_if_available, raw_noise_std=0, white_bk
     weights_sum = weights.sum(-1)
     depth_map = (weights * z_vals).sum(-1)
     # NOTE: Is this nan_to_num still needed?
-    disp_map = (1 / (depth_map / weights_sum).clamp(min=1e-10)).nan_to_num(nan=torch.inf)
+    # disp_map = (1 / (depth_map / weights_sum).clamp(min=1e-10)).nan_to_num(nan=torch.inf)
+    disp_map = 1 / (depth_map / weights_sum).clamp(min=1e-10)
+    if disp_map.isnan().any():
+        set_trace()
     acc_map = weights_sum
 
     if white_bkgd:
@@ -604,7 +614,7 @@ def raw2outputs(raw, z_vals, rays_d, gpu_if_available, raw_noise_std=0, white_bk
     return rgb_map, disp_map, acc_map, weights, depth_map
 
 
-def load_data(args: Namespace, gpu_if_available: torch.device
+def load_data(args: Namespace, gpu_if_available: torch.device, cpu
               ) -> Tuple[torch.Tensor, torch.Tensor, List[int], int, int, float, torch.Tensor,
                          torch.Tensor, torch.Tensor, List[int], List[int], List[int], float, float]:
     # Load data
@@ -687,7 +697,7 @@ def load_data(args: Namespace, gpu_if_available: torch.device
         val_idxs = test_idxs
         near = 0
         far = depth_imgs.max() * 1.1
-        assert far < 72
+        assert far < 73
 
     else:
         raise RuntimeError(f'Unknown dataset type {args.dataset_type}. Exiting.')
@@ -710,14 +720,14 @@ def load_data(args: Namespace, gpu_if_available: torch.device
     intrinsics_matrix = torch.tensor(intrinsics_matrix)
 
     # Attempt to move data to the GPU.
-    rgb_imgs = torch.tensor(rgb_imgs, device=gpu_if_available, dtype=torch.float32)
-    depth_imgs = torch.tensor(depth_imgs, device=gpu_if_available, dtype=torch.float32)
-    poses = torch.tensor(poses, device=gpu_if_available, dtype=torch.float32)
-    render_poses = torch.tensor(render_poses, device=gpu_if_available, dtype=torch.float32)
+    rgb_imgs = torch.tensor(rgb_imgs, device=cpu, dtype=torch.float32)
+    depth_imgs = torch.tensor(depth_imgs, device=cpu, dtype=torch.float32)
+    poses = torch.tensor(poses, device=cpu, dtype=torch.float32)
+    render_poses = torch.tensor(render_poses, device=cpu, dtype=torch.float32)
 
-    print('TRAIN views are', train_idxs)
-    print('TEST views are', test_idxs)
-    print('VAL views are', val_idxs)
+    # print('TRAIN views are', train_idxs)
+    # print('TEST views are', test_idxs)
+    # print('VAL views are', val_idxs)
 
     train_idxs = torch.tensor(train_idxs)
     test_idxs = torch.tensor(test_idxs)
@@ -725,6 +735,32 @@ def load_data(args: Namespace, gpu_if_available: torch.device
 
     return (rgb_imgs, depth_imgs, hwf, img_height, img_width, focal, intrinsics_matrix, poses, render_poses, train_idxs, test_idxs,
             val_idxs, near, far)
+
+
+def load_data_and_create_keyframes(args, gpu_if_available, tensorboard, cpu):
+    # Load data from specified dataset.
+    (rgb_imgs, depth_imgs, hwf, img_height, img_width, focal, initial_intrinsics_matrix, initial_poses,
+     render_poses, train_idxs, _, val_idxs, near, far) = load_data(args, gpu_if_available, cpu)
+
+    val_idx = val_idxs[len(val_idxs) // 2]
+    val_rgb_img = rgb_imgs[val_idx]
+    val_depth_img = depth_imgs[val_idx]
+    val_pose = initial_poses[val_idx, :3, :4].to(gpu_if_available)
+
+    kf_rgb_imgs, kf_depth_imgs, kf_initial_poses, kf_idxs, n_kfs = \
+        create_keyframes(rgb_imgs, depth_imgs, initial_poses, train_idxs, args.keyframe_creation_strategy,
+                         args.every_Nth)
+
+    val_rgb_img = val_rgb_img.to(gpu_if_available)
+    val_depth_img = val_depth_img.to(gpu_if_available)
+    val_pose = val_pose.to(gpu_if_available)
+    kf_rgb_imgs = kf_rgb_imgs.to(gpu_if_available)
+    kf_depth_imgs = kf_depth_imgs.to(gpu_if_available)
+    kf_initial_poses = kf_initial_poses.to(gpu_if_available)
+
+    return (hwf, img_height, img_width, focal, initial_intrinsics_matrix, initial_poses, render_poses,
+            near, far, val_rgb_img, val_depth_img, val_pose, kf_rgb_imgs, kf_depth_imgs,
+            kf_initial_poses, kf_idxs, n_kfs)
 
 
 def split_into_sections(mats, grid_size):
@@ -989,8 +1025,8 @@ def sample_sw_rays(sw_rays: torch.Tensor, sw_sampling_prob_dist: torch.Tensor,
             # circle(sampling_vis_img_np, (pixel_col_idx, pixel_row_idx), 2, (1, 1, 1), FILLED)
             circle(sampling_vis_img_np, (pixel_col_idx, pixel_row_idx), 1, (1, 0, 0), FILLED)
 
-        tensorboard.add_images(tensorboard_tag, sampling_vis_imgs, train_iter_idx,
-                               dataformats='NHWC')
+        # tensorboard.add_images(tensorboard_tag, sampling_vis_imgs, train_iter_idx,
+        #                        dataformats='NHWC')
 
     t_delta = perf_counter() - t_start
     if verbose:
@@ -1255,7 +1291,7 @@ def create_keyframes(rgb_imgs: torch.Tensor, depth_imgs, initial_poses: torch.Te
     kf_initial_poses = initial_poses[kf_idxs]
     n_kfs = len(kf_idxs)
 
-    print('Keyframe views are ', kf_idxs)
+    print('Number of keyframes:', kf_idxs.shape[0])
 
     return kf_rgb_imgs, kf_depth_imgs, kf_initial_poses, kf_idxs, n_kfs
 
@@ -1328,6 +1364,8 @@ def initialize_sw_kf_loss(kf_rgb_imgs, kf_depth_imgs, kf_poses, sw_unif_sampling
 
     with torch.no_grad():
         # Get all rays from all keyframes.
+        # return torch.ones(dims_kf_sw, dtype=torch.float32, device=cpu)
+
         sw_kf_rays, _ = get_sw_rays(kf_rgb_imgs, kf_depth_imgs, img_height, img_width, intrinsics_matrix, kf_poses,
                                     n_kfs, grid_size, section_height, section_width, gpu_if_available)
     # Uniformly sample rays across all keyframes.
@@ -1681,7 +1719,11 @@ def get_depth_loss_meters_multiplier(gt_depth):
     shift = torch.log(torch.tensor(1 / height)) / steepness - center
 
     depth_loss_meters_multiplier = \
-        multiplier_min + 1 / (1 / height + torch.exp(steepness * (gt_depth + shift)))
+        multiplier_min + 1 / (1 / height + torch.exp((steepness * (gt_depth +
+                                                                   shift)).clamp(max=50)))
+
+    # if gt_depth.requires_grad:
+    #     set_trace()
 
     return depth_loss_meters_multiplier
 

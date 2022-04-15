@@ -1,6 +1,6 @@
-datadir = ~/eth/implicit-mapping/datasets/apple/00/40-to-45-sec/orbslam/front-camera/right-camera/all-frames
+datadir = ~/eth/implicit-mapping/datasets/apple/small/0/40-to-45-sec/orbslam/front-camera/right-camera/all-frames
 
-expname = taim_apple_00_40-to-45-sec
+expname = taim_apple_small_0_40-to-45-sec
 
 save_logs_to_file = False
 

@@ -9,8 +9,8 @@ keyframe_selection_strategy = all
 
 N_importance = 64
 
-n_training_iters = 200000
-s_train_scalars = 600
-s_sampling_vis = 600
-s_val = 600
+n_training_iters = 50000
+s_train_scalars = 120
+s_sampling_vis = 120
+s_val = 120
 i_weights = 5000
