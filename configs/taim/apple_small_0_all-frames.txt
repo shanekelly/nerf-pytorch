@@ -11,11 +11,15 @@ n_explore = 4
 n_exploit = 1
 
 N_importance = 64
+
+n_training_iters = 100000
+scene_lr_10_pct_pt = 125000
+poses_lr_10_pct_pt = 60000
+scene_lr_10_pct_pt = 60000
 depth_loss_iters_diminish_point = 5000
 
-n_training_iters = 50000
-s_train_scalars = 120
-s_intrinsics_vis = 120
-s_sampling_vis = 120
-s_val = 120
-i_weights = 5000
+s_train_scalars = 1800
+s_intrinsics_vis = 1800
+s_sampling_vis = 1800
+s_val = 1800
+i_weights = 10000

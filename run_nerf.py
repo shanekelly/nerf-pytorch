@@ -447,7 +447,6 @@ def config_parser():
     parser.add_argument('--s_stop', type=int, default=-1,
                         help='When to stop training, in seconds.')
 
-    # sk: My options.
     parser.add_argument('--img_grid_side_len',   type=int, default=8,
                         help='The side length of the grid used to split up training images for '
                         'image active sampling.')
@@ -493,7 +492,7 @@ def config_parser():
                         'modifier not exist / have no effect. "avg_saturation" modifies by the '
                         'average saturation of the pixels within each section.')
     parser.add_argument('--no_gaussian_positional_embedding', action='store_true', help='Set to '
-                        'use the standard NeRF positional embedding instead of the iMAP Gaussian '
+                        'use the standard NeRF positional embedding instead of the Gaussian '
                         'positional embedding with learned B matrix.')
     parser.add_argument('--initial_gpe_scale', type=float, default=12, help='The scale to use for '
                         'initializing the Gaussian Positional Encoding matrix.')

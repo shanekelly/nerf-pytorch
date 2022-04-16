@@ -600,7 +600,7 @@ def raw2outputs(raw, z_vals, rays_d, gpu_if_available, raw_noise_std=0, white_bk
     depth_map = (weights * z_vals).sum(-1)
     # NOTE: Is this nan_to_num still needed?
     # disp_map = (1 / (depth_map / weights_sum).clamp(min=1e-10)).nan_to_num(nan=torch.inf)
-    disp_map = 1 / (depth_map / weights_sum).clamp(min=1e-10)
+    disp_map = 1 / (depth_map / (weights_sum + 1e-10) + 1e-10)
     if disp_map.isnan().any():
         set_trace()
     acc_map = weights_sum
@@ -1710,10 +1710,10 @@ def log_depth_loss_iters_multiplier_function(tensorboard, include_depth_loss, de
 
 
 def get_depth_loss_meters_multiplier(gt_depth):
-    multiplier_min = 0.1
+    multiplier_min = 0.0
     multiplier_max = 1.0
-    center = 5
-    steepness = 2
+    center = 4
+    steepness = 1.5
 
     height = multiplier_max - multiplier_min
     shift = torch.log(torch.tensor(1 / height)) / steepness - center
