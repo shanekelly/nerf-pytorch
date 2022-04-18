@@ -9,6 +9,7 @@ import numpy as np
 import open3d as o3d
 import torch
 import torch.nn as nn
+import torchvision
 import trimesh
 
 from cv2 import circle, COLOR_RGB2HSV, cvtColor, FILLED
@@ -23,6 +24,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from image.plot import color_1d_imgs
 from point_cloud.rgbd import point_cloud_from_rgb_imgs_and_depth_imgs
+from nn.predict import predict_strawberry_instance_segmentation_masks
 
 from load_llff import load_llff_data
 from load_deepvoxels import load_dv_data
@@ -891,11 +893,20 @@ def pad_imgs(imgs: torch.Tensor, padding_rgb: torch.Tensor, padding_width: int
     return padded_imgs
 
 
-def pad_sections(imgs: torch.Tensor, dims_pw: Tuple[int, int, int, int, int],
-                 padding_rgb: torch.Tensor, padding_width: int
+def pad_sections(imgs_: torch.Tensor, dims_pw: Tuple[int, int, int, int, int],
+                 padding_rgb: torch.Tensor, padding_width: int,
+                 desired_img_shape: Optional[Tuple[int, int]] = None
                  ) -> torch.Tensor:
+    if desired_img_shape is not None:
+        imgs = torchvision.transforms.functional.resize(
+            imgs_.permute([0, 3, 1, 2]), desired_img_shape).permute([0, 2, 3, 1])
+    else:
+        imgs = imgs_
+
     n_imgs, img_height, img_width, _ = imgs.shape
-    _, grid_size, _, section_height, section_width = dims_pw
+    _, grid_size, _, _, _ = dims_pw
+    section_height = img_height // grid_size
+    section_width = img_width // grid_size
 
     n_pads = grid_size + 2
     n_pad_pixels_per_axis = padding_width * n_pads
@@ -1523,9 +1534,23 @@ def sample_skf_rays(sw_skf_rays, kf_rgb_imgs, intrinsics_matrix, n_total_rays_to
 
 
 def get_sw_sampling_prob_dist_modifier(kf_rgb_imgs, grid_size,
-                                       sw_sampling_prob_dist_modifier_strategy, tensorboard, cpu):
+                                       sw_sampling_prob_dist_modifier_strategy, tensorboard, cpu,
+                                       fruit_detection_model_fpath):
 
-    if sw_sampling_prob_dist_modifier_strategy == 'avg_saturation':
+    if sw_sampling_prob_dist_modifier_strategy == 'fruit_detections':
+        # Compute the percent of all pixels within each section that are considered to be part of a
+        # fruit, according to the fruit detector NN.
+
+        fruit_masks = predict_strawberry_instance_segmentation_masks(
+            fruit_detection_model_fpath, kf_rgb_imgs)
+        # Split into sections.
+        sw_kf_fruit_masks = split_into_sections(fruit_masks, grid_size)
+        # Compute the mean saturation of each section.
+        sw_kf_avg_fruityness = torch.mean(sw_kf_fruit_masks.to(torch.float32), dim=(3, 4))
+
+        sw_sampling_prob_dist_modifier = sw_kf_avg_fruityness
+
+    elif sw_sampling_prob_dist_modifier_strategy == 'avg_saturation':
         # Compute the mean saturation of each section.
 
         # Convert RGB images to HSV.
@@ -1552,7 +1577,7 @@ def get_sw_sampling_prob_dist_modifier(kf_rgb_imgs, grid_size,
                            f'strategy "{sw_sampling_prob_dist_modifier_strategy}". Exiting.')
 
     add_1d_imgs_to_tensorboard(sw_sampling_prob_dist_modifier, white_rgb, torch.tensor([0, 0, 1]), tensorboard,
-                               'train/sampling_probability_distribution_modifier', 1, cpu, white_rgb)
+                               'train/sampling_probability_distribution_modifier', 1, cpu)
 
     return sw_sampling_prob_dist_modifier
 

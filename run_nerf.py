@@ -485,12 +485,15 @@ def config_parser():
                         '--keyframe_selection_strategy is "explore_exploit". The number of '
                         'keyframes with the highest loss to select.')
     parser.add_argument('--sw_sampling_prob_dist_modifier_strategy',
-                        choices=['uniform', 'avg_saturation'], default='uniform',
+                        choices=['fruit_detections', 'uniform', 'avg_saturation'], default='uniform',
                         help='A section-wise modifier will be element-wise multiplied with the ray '
                         'sampling probability distribution before sampling rays. This argument '
                         'allows for customizing that modifier. "uniform" effectively make this '
                         'modifier not exist / have no effect. "avg_saturation" modifies by the '
                         'average saturation of the pixels within each section.')
+    parser.add_argument('--fruit_detection_model_fpath', default='', help='Path to the NN model '
+                        'to use for fruit detection if sw_sampling_prob_dist_modifier_strategy '
+                        'is set to "fruit_detections".')
     parser.add_argument('--no_gaussian_positional_embedding', action='store_true', help='Set to '
                         'use the standard NeRF positional embedding instead of the Gaussian '
                         'positional embedding with learned B matrix.')
@@ -652,13 +655,15 @@ def train() -> None:
                                   args.chunk, optimizer, do_active_sampling, tensorboard,
                                   cpu, gpu_if_available, verbose=verbose)
     sw_total_n_sampled = torch.zeros(dims_kf_sw, dtype=torch.int64)
-    # tensorboard.add_images('train/keyframes',
-    #                        pad_sections(kf_rgb_imgs, dims_kf_pw, white_rgb, padding_width=2),
-    #                        global_step=1, dataformats='NHWC')
+    tensorboard.add_images('train/keyframes',
+                           pad_sections(kf_rgb_imgs, dims_kf_pw, white_rgb, padding_width=2,
+                                        desired_img_shape=(120, 160)),
+                           global_step=1, dataformats='NHWC')
     sw_sampling_prob_dist_modifier = \
         get_sw_sampling_prob_dist_modifier(kf_rgb_imgs, grid_size,
                                            args.sw_sampling_prob_dist_modifier_strategy,
-                                           tensorboard, cpu)
+                                           tensorboard, cpu,
+                                           Path(args.fruit_detection_model_fpath).expanduser())
 
     log_depth_loss_iters_multiplier_function(tensorboard, not args.no_depth_measurements,
                                              args.depth_loss_iters_diminish_point)
