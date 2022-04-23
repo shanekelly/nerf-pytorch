@@ -21,6 +21,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm, trange
 
 from axes.util import o3d_axes_from_poses
+from im_util.transforms import euler_zyx_from_tfmat
 
 from run_nerf_helpers import (add_1d_imgs_to_tensorboard, append_to_log_file, create_keyframes,
                               extract_mesh, get_depth_loss_iters_multiplier,
@@ -412,6 +413,10 @@ def config_parser():
                         help='Frequency of visualizing keyframe poses.')
     parser.add_argument("--s_poses_vis", type=int, default=-1,
                         help='Frequency of visualizing keyframe poses.')
+    parser.add_argument("--i_pose_scalars", type=int, default=0,
+                        help='Frequency of visualizing keyframe poses.')
+    parser.add_argument("--s_pose_scalars", type=int, default=-1,
+                        help='Frequency of visualizing keyframe poses.')
     parser.add_argument("--i_kf_renders_vis", type=int, default=0,
                         help='Frequency of visualizing RGBD results of rendering at keyframe poses.')
     parser.add_argument("--s_kf_renders_vis", type=int, default=-1,
@@ -667,6 +672,7 @@ def train() -> None:
     t_prev_val_log = 0.0
     t_prev_sampling_vis_log = 0.0
     t_prev_poses_vis_log = 0.0
+    t_prev_pose_scalars_log = 0.0
     t_prev_point_cloud_vis_log = 0.0
     t_prev_weights_log = 0.0
     t_prev_kf_renders_log = 0.0
@@ -695,6 +701,8 @@ def train() -> None:
         log_val_vis = should_trigger(train_iter_idx, args.i_val, t_prev_val_log, args.s_val)
         log_poses_vis = should_trigger(train_iter_idx, args.i_poses_vis, t_prev_poses_vis_log,
                                        args.s_poses_vis)
+        log_pose_scalars = should_trigger(train_iter_idx, args.i_pose_scalars, t_prev_pose_scalars_log,
+                                          args.s_pose_scalars)
         log_point_cloud_vis = should_trigger(train_iter_idx, args.i_point_cloud_vis,
                                              t_prev_point_cloud_vis_log, args.s_point_cloud_vis)
         log_B_vis = should_trigger(train_iter_idx, args.i_B_vis, t_prev_B_vis_log, args.s_B_vis)
@@ -922,7 +930,7 @@ def train() -> None:
                         [[0.0, 0.0, 0.0, 1.0]])), 0), vis_dpath / 'val-pose.pt')
                 append_to_log_file(vis_dpath, 'val-rgbd', args.i_val, args.s_val,
                                    torch.cat((val_rendered_rgb, val_rendered_depth.unsqueeze(-1)), -1))
-            open3d_vis_count += 1
+            # open3d_vis_count += 1
             t_prev_val_log = t_train_iter_start
 
         if log_kf_renders_log:
@@ -938,6 +946,25 @@ def train() -> None:
                 append_to_log_file(vis_dpath, 'kfs-rgbd', args.i_kf_renders_vis,
                                    args.s_kf_renders_vis, kf_rendered_rgbds)
             t_prev_kf_renders_log = t_train_iter_start
+
+        if log_pose_scalars:
+            with torch.no_grad():
+                for idx, (world_from_pose, world_from_initial_pose) in enumerate(zip(kf_poses, kf_initial_poses)):
+                    pose_from_initial_pose = (torch.linalg.inv(world_from_pose) @
+                                              world_from_initial_pose)
+                    d_x = pose_from_initial_pose[0, 3]
+                    d_y = pose_from_initial_pose[1, 3]
+                    d_z = pose_from_initial_pose[2, 3]
+                    euler_zyx = np.rad2deg(
+                        euler_zyx_from_tfmat(pose_from_initial_pose.cpu().numpy()))
+                    d_z_rot = euler_zyx[0]
+                    d_y_rot = euler_zyx[1]
+                    d_x_rot = euler_zyx[2]
+                    tensorboard.add_scalars(f'poses/diff-from-init-{idx}', {
+                        'dist-x': d_x, 'dist-y': d_y, 'dist-z': d_z,
+                        'rot-x': d_x_rot, 'rot-y': d_y_rot, 'rot-z': d_z_rot},
+                        train_iter_idx)
+            t_prev_pose_scalars_log = t_train_iter_start
 
         if log_poses_vis:
             with torch.no_grad():
