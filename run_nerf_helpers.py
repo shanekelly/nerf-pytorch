@@ -1754,7 +1754,7 @@ def log_depth_loss_iters_multiplier_function(tensorboard, include_depth_loss, de
 
 
 def get_depth_loss_meters_multiplier(gt_depth):
-    multiplier_min = 0.0
+    multiplier_min = 0.05
     multiplier_max = 1.0
     center = 4
     steepness = 1.5
@@ -1765,9 +1765,6 @@ def get_depth_loss_meters_multiplier(gt_depth):
     depth_loss_meters_multiplier = \
         multiplier_min + 1 / (1 / height + torch.exp((steepness * (gt_depth +
                                                                    shift)).clamp(max=50)))
-
-    # if gt_depth.requires_grad:
-    #     set_trace()
 
     return depth_loss_meters_multiplier
 
