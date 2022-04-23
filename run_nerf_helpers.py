@@ -12,7 +12,7 @@ import torch.nn as nn
 import torchvision
 import trimesh
 
-from cv2 import circle, COLOR_RGB2HSV, cvtColor, FILLED
+from cv2 import applyColorMap, circle, COLOR_RGB2HSV, COLORMAP_JET, cvtColor, FILLED, imwrite
 from GPUtil import showUtilization
 from ipdb import set_trace
 from open3d.visualization.tensorboard_plugin import summary
@@ -23,7 +23,7 @@ from torch.nn.functional import relu
 from torch.utils.tensorboard import SummaryWriter
 
 from image.plot import color_1d_imgs
-from point_cloud.rgbd import point_cloud_from_rgb_imgs_and_depth_imgs
+from point_cloud.rgbd import point_cloud_from_rgb_img_and_depth_img
 from nn.predict import predict_fruit_instance_segmentation_masks
 
 from load_llff import load_llff_data
@@ -364,6 +364,7 @@ def render(img_height: int, img_width: int, intrinsics_matrix: torch.Tensor, gpu
 
     if ndc:
         # for forward facing scenes
+        assert False
         rays_o, rays_d = ndc_rays(img_height, img_width,
                                   intrinsics_matrix[0][0], 1., rays_o, rays_d)
 
@@ -1485,6 +1486,11 @@ def sample_skf_rays(sw_skf_rays, kf_rgb_imgs, intrinsics_matrix, n_total_rays_to
     dims_kf_sw = dims_kf_pw[:3]
     _, img_height, img_width, _ = kf_rgb_imgs.shape
 
+    if pw_sampling_prob_modifier is not None:
+        skf_pw_sampling_prob_modifier = pw_sampling_prob_modifier[skf_from_kf_idxs]
+    else:
+        skf_pw_sampling_prob_modifier = None
+
     if do_active_sampling:
         # If we aren't uniformly sampling on every iteration, then we should only uniformly
         # sample on the first iteration of this run.
@@ -1501,7 +1507,7 @@ def sample_skf_rays(sw_skf_rays, kf_rgb_imgs, intrinsics_matrix, n_total_rays_to
                                    tensorboard, 'train/uniform_sampling/sampled_pixels', train_iter_idx,
                                    cpu, log_sampling_vis=log_sampling_vis, verbose=verbose,
                                    enforce_min_samples=False,
-                                   pw_sampling_prob_modifier=pw_sampling_prob_modifier[skf_from_kf_idxs])
+                                   pw_sampling_prob_modifier=skf_pw_sampling_prob_modifier)
 
             # Render the uniformly sampled rays.
             batch = torch.transpose(unif_sampled_rays, 0, 1).to(gpu_if_available)
@@ -1533,7 +1539,7 @@ def sample_skf_rays(sw_skf_rays, kf_rgb_imgs, intrinsics_matrix, n_total_rays_to
                            tensorboard, 'train/active_sampling/sampled_pixels',
                            train_iter_idx, cpu, log_sampling_vis=log_sampling_vis,
                            verbose=verbose,
-                           pw_sampling_prob_modifier=pw_sampling_prob_modifier[skf_from_kf_idxs])
+                           pw_sampling_prob_modifier=skf_pw_sampling_prob_modifier)
     else:
         # Active sampling is disabled, so simply sample uniformly over all sections.
         sampled_rays, sampled_skf_sw_idxs, sw_n_newly_sampled, pw_n_newly_sampled, _ = \
@@ -1545,7 +1551,7 @@ def sample_skf_rays(sw_skf_rays, kf_rgb_imgs, intrinsics_matrix, n_total_rays_to
                            skf_from_kf_idxs,
                            tensorboard, 'train/sampling/sampled_pixels', train_iter_idx, cpu,
                            log_sampling_vis=log_sampling_vis, verbose=verbose,
-                           pw_sampling_prob_modifier=pw_sampling_prob_modifier[skf_from_kf_idxs])
+                           pw_sampling_prob_modifier=skf_pw_sampling_prob_modifier)
 
     t_delta = perf_counter() - t_start
 
@@ -1601,10 +1607,16 @@ def get_sw_sampling_prob_dist_modifier(kf_rgb_imgs, grid_size,
     return sw_sampling_prob_dist_modifier
 
 
-def save_point_cloud_from_rgb_imgs_and_depth_imgs(point_cloud_fpath, rgb_imgs, depth_imgs,
-                                                  world_from_cameras, intrinsics_matrix,
-                                                  tb_info=None):
-    singular_input = rgb_imgs.dim() == 3
+def save_point_clouds_from_rgb_imgs_and_depth_imgs(point_cloud_dpath, rgb_imgs, depth_imgs,
+                                                   world_from_cameras, intrinsics_matrix,
+                                                   tb_info=None):
+    if isinstance(rgb_imgs, torch.Tensor):
+        rgb_imgs = rgb_imgs.detach().cpu().numpy()
+    if isinstance(depth_imgs, torch.Tensor):
+        depth_imgs = depth_imgs.detach().cpu().numpy()
+    if isinstance(world_from_cameras, torch.Tensor):
+        world_from_cameras = world_from_cameras.detach().cpu().numpy()
+    singular_input = rgb_imgs.ndim == 3
     if singular_input:
         rgb_imgs = rgb_imgs.unsqueeze(0)
         depth_imgs = depth_imgs.unsqueeze(0)
@@ -1615,10 +1627,12 @@ def save_point_cloud_from_rgb_imgs_and_depth_imgs(point_cloud_fpath, rgb_imgs, d
         world_from_cameras = torch.cat((world_from_cameras,
                                         hom_row.expand(world_from_cameras.shape[0], 1, 4)), 1)
 
-    point_cloud = point_cloud_from_rgb_imgs_and_depth_imgs(rgb_imgs.cpu().numpy(),
-                                                           depth_imgs.cpu().numpy(), world_from_cameras,
-                                                           intrinsics_matrix.detach().cpu().numpy(), z_forwards=False)
-    o3d.io.write_point_cloud(point_cloud_fpath.as_posix(), point_cloud)
+    for idx, (rgb_img, depth_img, world_from_camera) in enumerate(zip(rgb_imgs, depth_imgs,
+                                                                      world_from_cameras)):
+        point_cloud = point_cloud_from_rgb_img_and_depth_img(rgb_img,
+                                                             depth_img, world_from_camera,
+                                                             intrinsics_matrix)
+        o3d.io.write_point_cloud((point_cloud_dpath / f'ptcld-{idx}.ply').as_posix(), point_cloud)
 
     if tb_info is not None:
         tensorboard, tb_tag, tb_iter = tb_info
@@ -1711,9 +1725,8 @@ def extract_mesh(render_kwargs, mesh_grid_size=100, threshold=0.1):
         points_x = np.linspace(0.75, 1.25, mesh_grid_size)
         points_y = np.linspace(-0.25, 0.25, mesh_grid_size)
         points_z = np.linspace(0.75, 1.25, mesh_grid_size)
-        query_pts = \
-            torch.tensor(np.stack(np.meshgrid(points_x, points_y, points_z),
-                                  -1).astype(np.float32)).reshape(-1, 1, 3).to(device)
+        query_pts = torch.tensor(np.stack(np.meshgrid(points_x, points_y, points_z),
+                                          -1).astype(np.float32)).reshape(-1, 1, 3).to(device)
         viewdirs = None
 
         output = network_query_fn(query_pts, viewdirs, network)
@@ -1762,9 +1775,8 @@ def get_depth_loss_meters_multiplier(gt_depth):
     height = multiplier_max - multiplier_min
     shift = torch.log(torch.tensor(1 / height)) / steepness - center
 
-    depth_loss_meters_multiplier = \
-        multiplier_min + 1 / (1 / height + torch.exp((steepness * (gt_depth +
-                                                                   shift)).clamp(max=50)))
+    depth_loss_meters_multiplier = multiplier_min + 1 / (1 / height + torch.exp((steepness * (gt_depth +
+                                                                                              shift)).clamp(max=50)))
 
     return depth_loss_meters_multiplier
 
@@ -1811,3 +1823,28 @@ def get_pw_sampling_prob_modifier(kf_rgb_imgs,
         pw_sampling_prob_modifier = None
 
     return pw_sampling_prob_modifier
+
+
+def save_imgs(output_dpath, gt_rgb_imgs, rgb_imgs, depth_imgs):
+    if isinstance(gt_rgb_imgs, torch.Tensor):
+        gt_rgb_imgs = gt_rgb_imgs.detach().cpu().numpy()
+    if isinstance(rgb_imgs, torch.Tensor):
+        rgb_imgs = rgb_imgs.detach().cpu().numpy()
+    if isinstance(depth_imgs, torch.Tensor):
+        depth_imgs = depth_imgs.detach().cpu().numpy()
+
+    if gt_rgb_imgs.max() < 1.1:
+        gt_rgb_imgs *= 255
+    gt_rgb_imgs = gt_rgb_imgs.astype(np.uint8)[:, :, :, ::-1]
+
+    if rgb_imgs.max() < 1.1:
+        rgb_imgs *= 255
+    rgb_imgs = rgb_imgs.astype(np.uint8)[:, :, :, ::-1]
+
+    depth_imgs = (depth_imgs * 255 / depth_imgs.max()).astype(np.uint8)
+
+    for idx, (gt_rgb_img, rgb_img, depth_img) in enumerate(zip(gt_rgb_imgs, rgb_imgs, depth_imgs)):
+        imwrite((output_dpath / f'gt-rgb-{idx}.png').as_posix(), gt_rgb_img)
+        imwrite((output_dpath / f'rgb-{idx}.png').as_posix(), rgb_img)
+        imwrite((output_dpath / f'depth-{idx}.png').as_posix(),
+                applyColorMap(depth_img, COLORMAP_JET))
