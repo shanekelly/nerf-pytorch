@@ -24,7 +24,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from image.plot import color_1d_imgs
 from point_cloud.rgbd import point_cloud_from_rgb_imgs_and_depth_imgs
-from nn.predict import predict_strawberry_instance_segmentation_masks
+from nn.predict import predict_fruit_instance_segmentation_masks
 
 from load_llff import load_llff_data
 from load_deepvoxels import load_dv_data
@@ -384,7 +384,7 @@ def render(img_height: int, img_width: int, intrinsics_matrix: torch.Tensor, gpu
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
         all_ret[k] = torch.reshape(all_ret[k], k_sh)
 
-    k_extract = ['rgb_map', 'disp_map', 'acc_map']
+    k_extract = ['rgb_map', 'disp_map', 'acc_map', 'depth_map']
     ret_list = [all_ret[k] for k in k_extract]
     ret_dict = {k: all_ret[k] for k in all_ret if k not in k_extract}
 
@@ -493,7 +493,7 @@ def render_rays(ray_batch: torch.Tensor, network_fn: NeRF, network_query_fn: Cal
 
     if N_importance > 0:
 
-        rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map
+        rgb_map_0, disp_map_0, acc_map_0, depth_map_0 = rgb_map, disp_map, acc_map, depth_map
 
         z_vals_mid = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
         z_samples = sample_pdf(z_vals_mid, weights[..., 1:-1],
@@ -511,7 +511,7 @@ def render_rays(ray_batch: torch.Tensor, network_fn: NeRF, network_query_fn: Cal
         rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
             raw, z_vals, rays_d, gpu_if_available, raw_noise_std, white_bkgd, pytest=pytest)
 
-    ret = {'rgb_map': rgb_map, 'disp_map': disp_map, 'acc_map': acc_map}
+    ret = {'rgb_map': rgb_map, 'disp_map': disp_map, 'acc_map': acc_map, 'depth_map': depth_map}
 
     if retraw:
         ret['raw'] = raw
@@ -520,6 +520,7 @@ def render_rays(ray_batch: torch.Tensor, network_fn: NeRF, network_query_fn: Cal
         ret['rgb0'] = rgb_map_0
         ret['disp0'] = disp_map_0
         ret['acc0'] = acc_map_0
+        ret['depth0'] = depth_map_0
         ret['z_std'] = torch.std(z_samples, dim=-1, unbiased=False)  # [N_rays]
 
     found_nan = False
@@ -602,7 +603,7 @@ def raw2outputs(raw, z_vals, rays_d, gpu_if_available, raw_noise_std=0, white_bk
     depth_map = (weights * z_vals).sum(-1)
     # NOTE: Is this nan_to_num still needed?
     # disp_map = (1 / (depth_map / weights_sum).clamp(min=1e-10)).nan_to_num(nan=torch.inf)
-    disp_map = 1 / (depth_map / (weights_sum + 1e-10) + 1e-10)
+    disp_map = weights_sum / (depth_map + 1e-10)
     if disp_map.isnan().any():
         set_trace()
     acc_map = weights_sum
@@ -739,12 +740,15 @@ def load_data(args: Namespace, gpu_if_available: torch.device, cpu
             val_idxs, near, far)
 
 
-def load_data_and_create_keyframes(args, gpu_if_available, tensorboard, cpu):
+def load_data_and_create_keyframes(args, gpu_if_available, tensorboard, cpu, val_idx):
     # Load data from specified dataset.
     (rgb_imgs, depth_imgs, hwf, img_height, img_width, focal, initial_intrinsics_matrix, initial_poses,
      render_poses, train_idxs, _, val_idxs, near, far) = load_data(args, gpu_if_available, cpu)
 
-    val_idx = val_idxs[len(val_idxs) // 2]
+    if val_idx is None:
+        val_idx = val_idxs[len(val_idxs) // 2]
+    else:
+        val_idx = val_idxs[val_idx]
     val_rgb_img = rgb_imgs[val_idx]
     val_depth_img = depth_imgs[val_idx]
     val_pose = initial_poses[val_idx, :3, :4].to(gpu_if_available)
@@ -937,8 +941,9 @@ def sample_sw_rays(sw_rays: torch.Tensor, sw_sampling_prob_dist: torch.Tensor,
                    dims_kf_pw: Tuple[int, int, int, int, int],
                    dims_pw: Tuple[int, int, int, int, int],
                    sampled_from_kf_idxs, tensorboard: SummaryWriter,
-                   tensorboard_tag: str, train_iter_idx: int, log_sampling_vis: bool = False,
-                   verbose: bool = False, enforce_min_samples: bool = False
+                   tensorboard_tag: str, train_iter_idx: int, cpu, log_sampling_vis: bool = False,
+                   verbose: bool = False, enforce_min_samples: bool = False,
+                   pw_sampling_prob_modifier: Optional[torch.Tensor] = None
                    ) -> Tuple[torch.Tensor, torch.Tensor, float]:
     """
     @param dims_kf_pw - Pixel-wise dimensions of all keyframes. At least needed for visualizing all
@@ -954,7 +959,10 @@ def sample_sw_rays(sw_rays: torch.Tensor, sw_sampling_prob_dist: torch.Tensor,
         print('Sampling rays across grid sections...', end='')
 
     n_kfs, grid_size, _, section_height, section_width = dims_kf_pw
-    dims_kf_sw = dims_kf_pw[:3]
+    # dims_kf_sw = dims_kf_pw[:3]
+    dims_skf_pw = list(dims_kf_pw)
+    dims_skf_pw[0] = sw_sampling_prob_dist.shape[0]
+    dims_skf_pw = tuple(dims_skf_pw)
 
     dims_sw = dims_pw[:3]
 
@@ -970,6 +978,12 @@ def sample_sw_rays(sw_rays: torch.Tensor, sw_sampling_prob_dist: torch.Tensor,
     # with.  Shape (n_kfs, grid_size, grid_size, section_height, section_width).
     pw_sampling_prob_dist = sw_sampling_prob_dist.float().unsqueeze(-1).unsqueeze(-1).repeat(
         (1, 1, 1, section_height, section_width))
+    if pw_sampling_prob_modifier is not None:
+        pw_sampling_prob_dist *= pw_from_im(pw_sampling_prob_modifier, dims_skf_pw)
+    # if log_sampling_vis:
+    #     add_1d_imgs_to_tensorboard(pw_sampling_prob_dist.permute([0, 1, 3, 2, 4]).reshape(n_kfs, img_height, img_width),
+    #                                white_rgb, torch.tensor([1, 0.5, 0]), tensorboard,
+    #                                f'train/sampling_probability', train_iter_idx, cpu, padding_width=10)
 
     if enforce_min_samples:
         sampled_flat_idxs = torch.empty((n_total_rays_to_sample), dtype=torch.int64)
@@ -1012,7 +1026,9 @@ def sample_sw_rays(sw_rays: torch.Tensor, sw_sampling_prob_dist: torch.Tensor,
     sampled_pw_idxs = nd_idxs_from_1d_idxs(sampled_flat_idxs, n_pixels_per_chunks)
 
     sampled_sw_idxs_tuple = get_idxs_tuple(sampled_pw_idxs[:, :3])
-    sw_n_newly_sampled = get_sw_n_sampled(sampled_sw_idxs_tuple, dims_sw)
+    sw_n_newly_sampled = n_sampled_from_idxs_tuple(sampled_sw_idxs_tuple, dims_sw)
+    sampled_pw_idxs_tuple = get_idxs_tuple(sampled_pw_idxs)
+    pw_n_newly_sampled = n_sampled_from_idxs_tuple(sampled_pw_idxs_tuple, dims_pw)
 
     if log_sampling_vis:
         section_padding_width = 2
@@ -1043,7 +1059,7 @@ def sample_sw_rays(sw_rays: torch.Tensor, sw_sampling_prob_dist: torch.Tensor,
     if verbose:
         print(f' done in {t_delta:.3f} seconds.')
 
-    return sampled_rays, sampled_pw_idxs, sw_n_newly_sampled, t_delta
+    return sampled_rays, sampled_pw_idxs, sw_n_newly_sampled, pw_n_newly_sampled, t_delta
 
 
 def get_n_to_sample(prob_dist: torch.Tensor, n_samples: int
@@ -1096,8 +1112,8 @@ def get_idxs_tuple(idxs: torch.Tensor
     return tuple(torch.transpose(idxs, 0, 1))
 
 
-def get_sw_n_sampled(sampled_sw_idxs_tuple: Tuple[torch.Tensor, ...], dims_kf_sw: Tuple[int, int, int]
-                     ) -> torch.Tensor:
+def n_sampled_from_idxs_tuple(sampled_sw_idxs_tuple: Tuple[torch.Tensor, ...], dims_kf_sw: Tuple[int, int, int]
+                              ) -> torch.Tensor:
     sw_n_sampled = torch.index_put(torch.zeros(dims_kf_sw, dtype=torch.int64), sampled_sw_idxs_tuple,
                                    torch.tensor([1], dtype=torch.int64), accumulate=True)
 
@@ -1336,10 +1352,9 @@ def render_and_compute_loss(rays, intrinsics_matrix, render_kwargs_train, img_he
     t_batching = perf_counter() - t_batching_start
 
     t_rendering_start = perf_counter()
-    rendered_rgbs, rendered_disps, _, extras = \
+    rendered_rgbs, _, rendered_depths, _, extras = \
         render(img_height, img_width, intrinsics_matrix, gpu_if_available, chunk=chunk, rays=batch_rays,
                verbose=train_iter_idx < 10, retraw=True, **render_kwargs_train)
-    rendered_depths = 1 / rendered_disps
     t_rendering = perf_counter() - t_rendering_start
 
     t_loss_start = perf_counter()
@@ -1353,7 +1368,7 @@ def render_and_compute_loss(rays, intrinsics_matrix, render_kwargs_train, img_he
 
     t_loss = perf_counter() - t_loss_start
 
-    return (rendered_rgbs, rendered_disps, extras, sw_loss, sw_rgb_loss, sw_depth_loss, loss, psnr, t_batching, t_rendering,
+    return (rendered_rgbs, extras, sw_loss, sw_rgb_loss, sw_depth_loss, loss, psnr, t_batching, t_rendering,
             t_loss)
 
 
@@ -1380,16 +1395,17 @@ def initialize_sw_kf_loss(kf_rgb_imgs, kf_depth_imgs, kf_poses, sw_unif_sampling
         sw_kf_rays, _ = get_sw_rays(kf_rgb_imgs, kf_depth_imgs, img_height, img_width, intrinsics_matrix, kf_poses,
                                     n_kfs, grid_size, section_height, section_width, gpu_if_available)
     # Uniformly sample rays across all keyframes.
-    (sampled_rays, sampled_pw_idxs, sw_n_newly_sampled, _) = sample_sw_rays(sw_kf_rays, sw_unif_sampling_prob_dist,
-                                                                            n_total_rays_to_unif_sample, kf_rgb_imgs, img_height, img_width,
-                                                                            dims_kf_pw, dims_kf_pw, torch.arange(
-                                                                                dims_kf_pw[0]), tensorboard, 'train/uniform_sampling/sampled_pixels',
-                                                                            1, log_sampling_vis=True, verbose=verbose,
-                                                                            enforce_min_samples=True)
+    (sampled_rays, sampled_pw_idxs, sw_n_newly_sampled, _, _) = sample_sw_rays(
+        sw_kf_rays, sw_unif_sampling_prob_dist,
+        n_total_rays_to_unif_sample, kf_rgb_imgs, img_height, img_width,
+        dims_kf_pw, dims_kf_pw, torch.arange(
+            dims_kf_pw[0]), tensorboard, 'train/uniform_sampling/sampled_pixels',
+        1, cpu, log_sampling_vis=True, verbose=verbose,
+        enforce_min_samples=True)
     # Render the sampled rays and compute section-wise loss.
     sampled_sw_idxs_tuple = get_idxs_tuple(sampled_pw_idxs[:, :3])
     depth_loss_iters_multiplier = 1.0
-    _, _, _, sw_kf_loss, _, _, _, _, _, _, _ = render_and_compute_loss(
+    _, _, sw_kf_loss, _, _, _, _, _, _, _ = render_and_compute_loss(
         sampled_rays, intrinsics_matrix, render_kwargs_train,
         img_height, img_width, dims_kf_sw, chunk,
         sampled_sw_idxs_tuple, sw_n_newly_sampled, depth_loss_iters_multiplier, optimizer,
@@ -1462,7 +1478,7 @@ def sample_skf_rays(sw_skf_rays, kf_rgb_imgs, intrinsics_matrix, n_total_rays_to
                     n_total_rays_to_actively_sample, sw_sampling_prob_dist_modifier, sw_skf_loss,
                     dims_kf_pw, dims_skf_pw, skf_from_kf_idxs, chunk, render_kwargs_train,
                     train_iter_idx, do_active_sampling, do_lazy_sw_loss, tensorboard,
-                    log_sampling_vis, verbose, cpu, gpu_if_available):
+                    log_sampling_vis, verbose, cpu, gpu_if_available, pw_sampling_prob_modifier):
 
     t_start = perf_counter()
 
@@ -1477,14 +1493,15 @@ def sample_skf_rays(sw_skf_rays, kf_rgb_imgs, intrinsics_matrix, n_total_rays_to
             # estimate.
             with torch.no_grad():
                 (unif_sampled_rays, unif_sampled_pw_idxs, sw_n_newly_sampled,
-                 t_uniform_sampling) = \
+                 pw_n_newly_sampled, t_uniform_sampling) = \
                     sample_sw_rays(sw_skf_rays, sw_unif_sampling_prob_dist,
                                    n_total_rays_to_unif_sample,
                                    kf_rgb_imgs, img_height, img_width, dims_kf_pw, dims_skf_pw,
                                    skf_from_kf_idxs,
                                    tensorboard, 'train/uniform_sampling/sampled_pixels', train_iter_idx,
-                                   log_sampling_vis=log_sampling_vis, verbose=verbose,
-                                   enforce_min_samples=False)
+                                   cpu, log_sampling_vis=log_sampling_vis, verbose=verbose,
+                                   enforce_min_samples=False,
+                                   pw_sampling_prob_modifier=pw_sampling_prob_modifier[skf_from_kf_idxs])
 
             # Render the uniformly sampled rays.
             batch = torch.transpose(unif_sampled_rays, 0, 1).to(gpu_if_available)
@@ -1507,30 +1524,32 @@ def sample_skf_rays(sw_skf_rays, kf_rgb_imgs, intrinsics_matrix, n_total_rays_to
 
         # Active ray sampling.
         sw_active_sampling_prob_dist = sw_skf_loss / torch.sum(sw_skf_loss)
-        sampled_rays, sampled_skf_sw_idxs, sw_n_newly_sampled, _ = \
+        sampled_rays, sampled_skf_sw_idxs, sw_n_newly_sampled, pw_n_newly_sampled, _ = \
             sample_sw_rays(sw_skf_rays,
                            sw_active_sampling_prob_dist[skf_from_kf_idxs] *
                            sw_sampling_prob_dist_modifier[skf_from_kf_idxs],
                            n_total_rays_to_actively_sample,
                            kf_rgb_imgs, img_height, img_width, dims_kf_pw, dims_skf_pw, skf_from_kf_idxs,
                            tensorboard, 'train/active_sampling/sampled_pixels',
-                           train_iter_idx, log_sampling_vis=log_sampling_vis,
-                           verbose=verbose)
+                           train_iter_idx, cpu, log_sampling_vis=log_sampling_vis,
+                           verbose=verbose,
+                           pw_sampling_prob_modifier=pw_sampling_prob_modifier[skf_from_kf_idxs])
     else:
         # Active sampling is disabled, so simply sample uniformly over all sections.
-        sampled_rays, sampled_skf_sw_idxs, sw_n_newly_sampled, _ = \
+        sampled_rays, sampled_skf_sw_idxs, sw_n_newly_sampled, pw_n_newly_sampled, _ = \
             sample_sw_rays(sw_skf_rays,
                            sw_sampling_prob_dist[skf_from_kf_idxs] *
                            sw_sampling_prob_dist_modifier[skf_from_kf_idxs],
                            n_total_rays_to_sample,
                            kf_rgb_imgs, img_height, img_width, dims_kf_pw, dims_skf_pw,
                            skf_from_kf_idxs,
-                           tensorboard, 'train/sampling/sampled_pixels', train_iter_idx,
-                           log_sampling_vis=log_sampling_vis, verbose=verbose)
+                           tensorboard, 'train/sampling/sampled_pixels', train_iter_idx, cpu,
+                           log_sampling_vis=log_sampling_vis, verbose=verbose,
+                           pw_sampling_prob_modifier=pw_sampling_prob_modifier[skf_from_kf_idxs])
 
     t_delta = perf_counter() - t_start
 
-    return sampled_rays, sampled_skf_sw_idxs, sw_n_newly_sampled, t_delta
+    return sampled_rays, sampled_skf_sw_idxs, sw_n_newly_sampled, pw_n_newly_sampled, t_delta
 
 
 def get_sw_sampling_prob_dist_modifier(kf_rgb_imgs, grid_size,
@@ -1541,7 +1560,7 @@ def get_sw_sampling_prob_dist_modifier(kf_rgb_imgs, grid_size,
         # Compute the percent of all pixels within each section that are considered to be part of a
         # fruit, according to the fruit detector NN.
 
-        fruit_masks = predict_strawberry_instance_segmentation_masks(
+        fruit_masks = predict_fruit_instance_segmentation_masks(
             fruit_detection_model_fpath, kf_rgb_imgs)
         # Split into sections.
         sw_kf_fruit_masks = split_into_sections(fruit_masks, grid_size)
@@ -1577,7 +1596,7 @@ def get_sw_sampling_prob_dist_modifier(kf_rgb_imgs, grid_size,
                            f'strategy "{sw_sampling_prob_dist_modifier_strategy}". Exiting.')
 
     add_1d_imgs_to_tensorboard(sw_sampling_prob_dist_modifier, white_rgb, torch.tensor([0, 0, 1]), tensorboard,
-                               'train/sampling_probability_distribution_modifier', 1, cpu)
+                               'train/section-wise_sampling_probability_modifier', 1, cpu)
 
     return sw_sampling_prob_dist_modifier
 
@@ -1759,3 +1778,39 @@ def log_depth_loss_meters_multiplier_function(tensorboard):
     for depth_val, depth_loss_meters_multiplier in zip(depth_vals, depth_loss_meters_multipliers):
         tensorboard.add_scalar('depth_loss_multiplier/meters',
                                depth_loss_meters_multiplier, depth_val)
+
+
+def pw_from_im(iw, dims_pw):
+    """
+    Pixel-wise tensors (N,S,S,SH,SW(,C)) from image-wise tensors (N,H,W(,C)).
+    """
+    # Reshape into (N,S,SH,S,SW) first, then permute.
+    return iw.reshape(
+        [dims_pw[0], dims_pw[1], dims_pw[3], dims_pw[2], dims_pw[4]]).permute([0, 1, 3, 2, 4])
+
+
+def iw_from_pw(pw, dims_iw):
+    """
+    Image-wise tensors (N,H,W(,C)) from pixel-wise tensors (N,S,S,SH,SW(,C)).
+    """
+    return pw.permute([0, 1, 3, 2, 4]).reshape(dims_iw)
+
+
+def get_pw_sampling_prob_modifier(kf_rgb_imgs,
+                                  pw_sampling_prob_modifier_strategy, tensorboard, cpu,
+                                  fruit_detection_model_fpath):
+
+    if pw_sampling_prob_modifier_strategy == 'fruit_detections':
+        fruit_masks = predict_fruit_instance_segmentation_masks(
+            fruit_detection_model_fpath, kf_rgb_imgs) * 0.5 + 0.5
+
+        pw_sampling_prob_modifier = fruit_masks
+
+        add_1d_imgs_to_tensorboard(pw_sampling_prob_modifier, white_rgb, torch.tensor([0, 1, 1]), tensorboard,
+                                   'train/pixel-wise_sampling_probability_modifier', 1, cpu)
+
+    elif pw_sampling_prob_modifier_strategy == 'none':
+
+        pw_sampling_prob_modifier = None
+
+    return pw_sampling_prob_modifier

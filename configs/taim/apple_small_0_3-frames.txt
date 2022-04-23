@@ -1,0 +1,25 @@
+datadir = ~/eth/implicit-mapping/datasets/apple/small/0/3-frames/orbslam/front-camera/right-camera/all-frames
+
+expname = taim_apple_small_0_3-frames
+
+save_logs_to_file = False
+
+keyframe_creation_strategy = all
+keyframe_selection_strategy = all
+
+N_importance = 64
+
+n_training_iters = 20000
+depth_loss_iters_diminish_point = 2000
+scene_lr_10_pct_pt = 24000
+poses_lr_10_pct_pt = 12000
+intrinsics_lr_10_pct_pt = 12000
+
+s_train_scalars = 600
+s_intrinsics_vis = 600
+s_sampling_vis = 600
+s_val = 600
+i_weights = 5000
+
+pw_sampling_prob_modifier_strategy = fruit_detections
+fruit_detection_model_fpath = ~/eth/implicit-mapping/fruit-detector-weights/apple.pth

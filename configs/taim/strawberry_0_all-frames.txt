@@ -1,14 +1,16 @@
-datadir = ~/eth/implicit-mapping/datasets/apple/small/0/all-frames/orbslam/front-camera/right-camera/all-frames
+datadir = ~/eth/implicit-mapping/datasets/strawberry/0/all-frames/orbslam/front-camera/right-camera/all-frames
 
-expname = taim_apple_small_0_all-frames
+expname = taim_strawberry_0_all-frames
 
 save_logs_to_file = False
 
 keyframe_creation_strategy = every_Nth
-every_Nth = 10
+every_Nth = 8
 keyframe_selection_strategy = explore_exploit
 n_explore = 4
 n_exploit = 1
+pw_sampling_prob_modifier_strategy = fruit_detections
+fruit_detection_model_fpath = ~/eth/implicit-mapping/fruit-detector-weights/strawberry.pth
 
 N_importance = 64
 
@@ -18,6 +20,7 @@ poses_lr_10_pct_pt = 60000
 intrinsics_lr_10_pct_pt = 60000
 depth_loss_iters_diminish_point = 5000
 
+val_idx = -10
 s_train_scalars = 1800
 s_intrinsics_vis = 1800
 s_sampling_vis = 1800
