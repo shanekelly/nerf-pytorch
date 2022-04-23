@@ -33,7 +33,7 @@ from run_nerf_helpers import (add_1d_imgs_to_tensorboard, append_to_log_file, cr
                               log_depth_loss_iters_multiplier_function,
                               mse2psnr, NeRF, ndc_rays, pad_imgs, pad_sections, render,
                               render_and_compute_loss, sample_pdf, sample_skf_rays,
-                              save_imgs, save_point_clouds_from_rgb_imgs_and_depth_imgs, select_keyframes,
+                              save_imgs, save_poses, save_point_clouds_from_rgb_imgs_and_depth_imgs, select_keyframes,
                               should_trigger, split_into_sections, to8b, tfmats_from_minreps,
                               minreps_from_tfmats, gray_rgb, purple_rgb, black_rgb, white_rgb, GpuMonitor)
 
@@ -587,6 +587,7 @@ def train() -> None:
                                                            rendered_depth_imgs, poses_to_render,
                                                            intrinsics_matrix)
             save_imgs(vis_dpath, render_gt_rgb_imgs, rendered_rgb_imgs, rendered_depth_imgs)
+            save_poses(vis_dpath, poses_to_render)
             # imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
 
             return

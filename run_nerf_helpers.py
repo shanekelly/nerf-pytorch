@@ -1848,3 +1848,8 @@ def save_imgs(output_dpath, gt_rgb_imgs, rgb_imgs, depth_imgs):
         imwrite((output_dpath / f'rgb-{idx}.png').as_posix(), rgb_img)
         imwrite((output_dpath / f'depth-{idx}.png').as_posix(),
                 applyColorMap(depth_img, COLORMAP_JET))
+
+
+def save_poses(output_dpath, poses):
+    for idx, pose in enumerate(poses):
+        torch.save(pose, output_dpath / f'world-from-camera-{idx}.pth')
