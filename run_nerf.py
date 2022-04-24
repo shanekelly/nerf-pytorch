@@ -24,14 +24,16 @@ from axes.util import o3d_axes_from_poses
 from im_util.transforms import euler_zyx_from_tfmat
 
 from run_nerf_helpers import (add_1d_imgs_to_tensorboard, append_to_log_file, create_keyframes,
-                              extract_mesh, get_depth_loss_iters_multiplier,
+                              exp_decay, extract_mesh, get_depth_loss_iters_multiplier,
                               get_idxs_tuple, get_intrinsics_matrix, get_kf_poses, get_log_fpath,
                               get_sw_rays, get_embedder, get_rays,
-                              get_sw_sampling_prob_dist_modifier, get_pw_sampling_prob_modifier,
+                              get_sw_sampling_prob_dist_modifier, get_raw_pw_sampling_prob_modifier,
+                              get_pw_sampling_prob_modifier,
                               intrinsics_params_from_intrinsics_matrix, img2mse, initialize_sw_kf_loss,
                               iw_from_pw, load_data, load_data_and_create_keyframes,
                               log_depth_loss_meters_multiplier_function,
                               log_depth_loss_iters_multiplier_function,
+                              log_scalar_schedules,
                               mse2psnr, NeRF, ndc_rays, pad_imgs, pad_sections, render,
                               render_and_compute_loss, sample_pdf, sample_skf_rays,
                               save_imgs, save_poses, save_point_clouds_from_rgb_imgs_and_depth_imgs, select_keyframes,
@@ -299,6 +301,10 @@ def config_parser():
     parser.add_argument("--intrinsics_lr_10_pct_pt", type=int, default=30000,
                         help='After this many training iterations, the learning rate will have '
                         'decayed to 10 percent of its original value.')
+    parser.add_argument("--pw_sampling_prob_modifier_max_min_ratio_iter_center", type=float,
+                        default=20000,
+                        help='The training iteration number where the pixel-wise sampling '
+                        'probability modifier max-min ratio will be in the middle.')
     parser.add_argument("--chunk", type=int, default=8192,
                         help='number of rays processed in parallel, decrease if running out of '
                         'memory')
@@ -659,14 +665,24 @@ def train() -> None:
                                                                         args.sw_sampling_prob_dist_modifier_strategy,
                                                                         tensorboard, cpu,
                                                                         Path(args.fruit_detection_model_fpath).expanduser())
-    pw_sampling_prob_modifier = get_pw_sampling_prob_modifier(kf_rgb_imgs,
-                                                              args.pw_sampling_prob_modifier_strategy,
-                                                              tensorboard, cpu,
-                                                              Path(args.fruit_detection_model_fpath).expanduser())
+    raw_pw_sampling_prob_modifier = get_raw_pw_sampling_prob_modifier(kf_rgb_imgs,
+                                                                      args.pw_sampling_prob_modifier_strategy,
+                                                                      tensorboard, cpu,
+                                                                      Path(args.fruit_detection_model_fpath).expanduser())
 
     log_depth_loss_iters_multiplier_function(tensorboard, not args.no_depth_measurements,
                                              args.depth_loss_iters_diminish_point)
     log_depth_loss_meters_multiplier_function(tensorboard)
+
+    log_scalar_schedules(
+        tensorboard, args.n_training_iters,
+        args.initial_scene_lr, args.scene_lr_10_pct_pt,
+        args.initial_poses_lr, args.poses_lr_10_pct_pt,
+        args.initial_gpe_mat_lr, args.gpe_mat_lr_10_pct_pt,
+        args.initial_intrinsics_lr, args.intrinsics_lr_10_pct_pt,
+        args.depth_loss_iters_diminish_point,
+        args.pw_sampling_prob_modifier_max_min_ratio_iter_center
+    )
 
     t_prev_train_scalars_log = 0.0
     t_prev_val_log = 0.0
@@ -738,13 +754,19 @@ def train() -> None:
                                               grid_size, section_height, section_width, gpu_if_available)
 
         # Sample rays to use for training.
-        sampled_rays, sampled_skf_sw_idxs, sw_n_newly_sampled, pw_n_newly_sampled, t_sample_rays = sample_skf_rays(sw_skf_rays, kf_rgb_imgs, intrinsics_matrix, n_total_rays_to_sample, sw_unif_sampling_prob_dist,
-                                                                                                                   n_total_rays_to_unif_sample, sw_sampling_prob_dist,
-                                                                                                                   n_total_rays_to_actively_sample, sw_sampling_prob_dist_modifier,
-                                                                                                                   sw_skf_loss, dims_kf_pw, dims_skf_pw,
-                                                                                                                   skf_from_kf_idxs, args.chunk, render_kwargs_train, train_iter_idx,
-                                                                                                                   do_active_sampling, do_lazy_sw_loss, tensorboard, log_sampling_vis,
-                                                                                                                   verbose, cpu, gpu_if_available, pw_sampling_prob_modifier)
+        pw_sampling_prob_modifier = get_pw_sampling_prob_modifier(
+            raw_pw_sampling_prob_modifier,
+            args.pw_sampling_prob_modifier_max_min_ratio_iter_center, train_iter_idx)
+        (sampled_rays, sampled_skf_sw_idxs, sw_n_newly_sampled, pw_n_newly_sampled,
+         t_sample_rays) = sample_skf_rays(
+            sw_skf_rays, kf_rgb_imgs, intrinsics_matrix, n_total_rays_to_sample,
+            sw_unif_sampling_prob_dist,
+            n_total_rays_to_unif_sample, sw_sampling_prob_dist,
+            n_total_rays_to_actively_sample, sw_sampling_prob_dist_modifier,
+            sw_skf_loss, dims_kf_pw, dims_skf_pw,
+            skf_from_kf_idxs, args.chunk, render_kwargs_train, train_iter_idx,
+            do_active_sampling, do_lazy_sw_loss, tensorboard, log_sampling_vis,
+            verbose, cpu, gpu_if_available, pw_sampling_prob_modifier)
 
         # Accumulate the total number of times each section has been sampled from so that it can be
         # visualized when log_sampling_vis is True.
@@ -772,10 +794,9 @@ def train() -> None:
         t_backprop = perf_counter() - t_backprop_start
 
         # Update learning rate for the coarse network.
-        lr_decay_rate = 0.1
         param_group_idx = 0
-        new_scene_lr = args.initial_scene_lr * (lr_decay_rate ** (global_step /
-                                                                  args.scene_lr_10_pct_pt))
+        new_scene_lr = exp_decay(args.initial_scene_lr,
+                                 args.scene_lr_10_pct_pt, global_step)
         optimizer.param_groups[param_group_idx]['lr'] = new_scene_lr
         param_group_idx += 1
 
@@ -786,22 +807,22 @@ def train() -> None:
 
         # Update learning rate for the poses.
         if not args.no_pose_optimization:
-            new_poses_lr = args.initial_poses_lr * (lr_decay_rate ** (global_step /
-                                                                      args.poses_lr_10_pct_pt))
+            new_poses_lr = exp_decay(args.initial_poses_lr,
+                                     args.poses_lr_10_pct_pt, global_step)
             optimizer.param_groups[param_group_idx]['lr'] = new_poses_lr
             param_group_idx += 1
 
         # Update learning rate for the Gaussian positional embedding matrix.
         if args.B_opt:
-            new_gpe_mat_lr = args.initial_gpe_mat_lr * (lr_decay_rate ** (global_step /
-                                                                          args.gpe_mat_lr_10_pct_pt))
+            new_gpe_mat_lr = exp_decay(args.initial_gpe_mat_lr,
+                                       args.gpe_mat_lr_10_pct_pt, global_step)
             optimizer.param_groups[param_group_idx]['lr'] = new_gpe_mat_lr
             param_group_idx += 1
 
         # Update learning rate for the camera intrinsics.
         if not args.no_intrinsics_optimization:
-            new_intrinsics_lr = args.initial_intrinsics_lr * (lr_decay_rate ** (global_step /
-                                                                                args.intrinsics_lr_10_pct_pt))
+            new_intrinsics_lr = exp_decay(args.initial_intrinsics_lr,
+                                          args.intrinsics_lr_10_pct_pt, global_step)
             optimizer.param_groups[param_group_idx]['lr'] = new_intrinsics_lr
 
         depth_train_loss = new_sw_skf_depth_loss.mean()

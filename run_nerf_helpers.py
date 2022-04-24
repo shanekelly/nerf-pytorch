@@ -981,10 +981,10 @@ def sample_sw_rays(sw_rays: torch.Tensor, sw_sampling_prob_dist: torch.Tensor,
         (1, 1, 1, section_height, section_width))
     if pw_sampling_prob_modifier is not None:
         pw_sampling_prob_dist *= pw_from_im(pw_sampling_prob_modifier, dims_skf_pw)
-    # if log_sampling_vis:
-    #     add_1d_imgs_to_tensorboard(pw_sampling_prob_dist.permute([0, 1, 3, 2, 4]).reshape(n_kfs, img_height, img_width),
-    #                                white_rgb, torch.tensor([1, 0.5, 0]), tensorboard,
-    #                                f'train/sampling_probability', train_iter_idx, cpu, padding_width=10)
+    if log_sampling_vis:
+        add_1d_imgs_to_tensorboard(pw_sampling_prob_dist.permute([0, 1, 3, 2, 4]).reshape(n_kfs, img_height, img_width),
+                                   white_rgb, torch.tensor([1, 0.5, 0]), tensorboard,
+                                   f'train/pixel-wise_sampling_probability', train_iter_idx, cpu, padding_width=10)
 
     if enforce_min_samples:
         sampled_flat_idxs = torch.empty((n_total_rays_to_sample), dtype=torch.int64)
@@ -1772,11 +1772,8 @@ def get_depth_loss_meters_multiplier(gt_depth):
     center = 4
     steepness = 1.5
 
-    height = multiplier_max - multiplier_min
-    shift = torch.log(torch.tensor(1 / height)) / steepness - center
-
-    depth_loss_meters_multiplier = multiplier_min + 1 / (1 / height + torch.exp((steepness * (gt_depth +
-                                                                                              shift)).clamp(max=50)))
+    depth_loss_meters_multiplier = squiggle(center, multiplier_min, multiplier_max, steepness,
+                                            gt_depth)
 
     return depth_loss_meters_multiplier
 
@@ -1805,24 +1802,46 @@ def iw_from_pw(pw, dims_iw):
     return pw.permute([0, 1, 3, 2, 4]).reshape(dims_iw)
 
 
-def get_pw_sampling_prob_modifier(kf_rgb_imgs,
-                                  pw_sampling_prob_modifier_strategy, tensorboard, cpu,
-                                  fruit_detection_model_fpath):
+def get_raw_pw_sampling_prob_modifier(kf_rgb_imgs,
+                                      pw_sampling_prob_modifier_strategy, tensorboard, cpu,
+                                      fruit_detection_model_fpath):
 
     if pw_sampling_prob_modifier_strategy == 'fruit_detections':
         fruit_masks = predict_fruit_instance_segmentation_masks(
-            fruit_detection_model_fpath, kf_rgb_imgs) * 0.5 + 0.5
+            fruit_detection_model_fpath, kf_rgb_imgs)
 
         pw_sampling_prob_modifier = fruit_masks
 
         add_1d_imgs_to_tensorboard(pw_sampling_prob_modifier, white_rgb, torch.tensor([0, 1, 1]), tensorboard,
-                                   'train/pixel-wise_sampling_probability_modifier', 1, cpu)
+                                   'train/raw_pixel-wise_sampling_probability_modifier', 1, cpu)
 
     elif pw_sampling_prob_modifier_strategy == 'none':
 
         pw_sampling_prob_modifier = None
 
     return pw_sampling_prob_modifier
+
+
+def get_pw_sampling_prob_modifier_max_min_ratio(x_center, train_iter_idx):
+    y_min = 1
+    y_max = 10
+    y_steepness = -0.0005
+
+    pw_sampling_prob_modifier_max_min_ratio = squiggle(x_center, y_min, y_max, y_steepness,
+                                                       train_iter_idx)
+
+    return pw_sampling_prob_modifier_max_min_ratio
+
+
+def get_pw_sampling_prob_modifier(raw_pw_sampling_prob_modifier, x_center, train_iter_idx):
+    max_min_ratio = get_pw_sampling_prob_modifier_max_min_ratio(x_center, train_iter_idx)
+
+    min_val = 1 / max_min_ratio
+    scaling = 1 - min_val
+
+    pw_scaling_prob_modifier = raw_pw_sampling_prob_modifier * scaling + min_val
+
+    return pw_scaling_prob_modifier
 
 
 def save_imgs(output_dpath, gt_rgb_imgs, rgb_imgs, depth_imgs):
@@ -1853,3 +1872,49 @@ def save_imgs(output_dpath, gt_rgb_imgs, rgb_imgs, depth_imgs):
 def save_poses(output_dpath, poses):
     for idx, pose in enumerate(poses):
         torch.save(pose, output_dpath / f'world-from-camera-{idx}.pth')
+
+
+def squiggle(x_center, y_min, y_max, y_steepness, x):
+    y_height = y_max - y_min
+    x_shift = torch.log(torch.tensor(1 / y_height)) / y_steepness - x_center
+
+    y = y_min + 1 / (1 / y_height + torch.exp((y_steepness * (x + x_shift)).clamp(max=50)))
+
+    return y
+
+
+def exp_decay(initial_y, ten_pct_pt, x):
+    value = initial_y * (0.1 ** (x / ten_pct_pt))
+    return value
+
+
+def log_scalar_schedules(tensorboard, max_n_iters,
+                         initial_scene_lr, scene_lr_10_pct_pt,
+                         initial_poses_lr, poses_lr_10_pct_pt,
+                         initial_gpe_mat_lr, gpe_mat_lr_10_pct_pt,
+                         initial_intrinsics_lr, intrinsics_lr_10_pct_pt,
+                         depth_loss_iters_diminish_pt,
+                         pw_sampling_prob_multiplier_max_min_ratio_center
+                         ):
+    iter_vals = torch.linspace(0, max_n_iters, 100).round()
+
+    depth = get_depth_loss_iters_multiplier(True, iter_vals,
+                                            depth_loss_iters_diminish_pt)
+    depth /= depth.max()
+    scene = exp_decay(initial_scene_lr, scene_lr_10_pct_pt, iter_vals)
+    scene /= scene.max()
+    poses = exp_decay(initial_poses_lr, poses_lr_10_pct_pt, iter_vals)
+    poses /= poses.max()
+    gpe_mat = exp_decay(initial_gpe_mat_lr, gpe_mat_lr_10_pct_pt, iter_vals)
+    gpe_mat /= gpe_mat.max()
+    intrinsics = exp_decay(initial_intrinsics_lr, intrinsics_lr_10_pct_pt, iter_vals)
+    intrinsics /= intrinsics.max()
+    pw_max_min = get_pw_sampling_prob_modifier_max_min_ratio(
+        pw_sampling_prob_multiplier_max_min_ratio_center, iter_vals)
+    pw_max_min /= pw_max_min.max()
+
+    for iter_val, d, s, p, g, i, f in zip(iter_vals, depth, scene, poses, gpe_mat, intrinsics,
+                                          pw_max_min):
+        tensorboard.add_scalars('scalar_schedules', {
+            'depth': d, 'scene': s, 'poses': p, 'gpe-mat': g, 'intrinsics': i, 'fruit-sampling': f},
+            iter_val)
