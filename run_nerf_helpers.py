@@ -960,10 +960,12 @@ def sample_sw_rays(sw_rays: torch.Tensor, sw_sampling_prob_dist: torch.Tensor,
         print('Sampling rays across grid sections...', end='')
 
     n_kfs, grid_size, _, section_height, section_width = dims_kf_pw
+    n_skfs = sw_sampling_prob_dist.shape[0]
     # dims_kf_sw = dims_kf_pw[:3]
     dims_skf_pw = list(dims_kf_pw)
-    dims_skf_pw[0] = sw_sampling_prob_dist.shape[0]
+    dims_skf_pw[0] = n_skfs
     dims_skf_pw = tuple(dims_skf_pw)
+    dims_skf_iw = (n_skfs, img_height, img_width)
 
     dims_sw = dims_pw[:3]
 
@@ -982,9 +984,10 @@ def sample_sw_rays(sw_rays: torch.Tensor, sw_sampling_prob_dist: torch.Tensor,
     if pw_sampling_prob_modifier is not None:
         pw_sampling_prob_dist *= pw_from_im(pw_sampling_prob_modifier, dims_skf_pw)
     if log_sampling_vis:
-        add_1d_imgs_to_tensorboard(pw_sampling_prob_dist.permute([0, 1, 3, 2, 4]).reshape(n_kfs, img_height, img_width),
-                                   white_rgb, torch.tensor([1, 0.5, 0]), tensorboard,
-                                   f'train/pixel-wise_sampling_probability', train_iter_idx, cpu, padding_width=10)
+        add_1d_imgs_to_tensorboard(
+            iw_from_pw(pw_sampling_prob_dist, dims_skf_iw),
+            white_rgb, torch.tensor([1, 0.5, 0]), tensorboard,
+            f'train/pixel-wise_sampling_probability', train_iter_idx, cpu, padding_width=10)
 
     if enforce_min_samples:
         sampled_flat_idxs = torch.empty((n_total_rays_to_sample), dtype=torch.int64)
@@ -1896,7 +1899,7 @@ def log_scalar_schedules(tensorboard, max_n_iters,
                          depth_loss_iters_diminish_pt,
                          pw_sampling_prob_multiplier_max_min_ratio_center
                          ):
-    iter_vals = torch.linspace(0, max_n_iters, 100).round()
+    iter_vals = torch.linspace(0, max_n_iters, 101).round()
 
     depth = get_depth_loss_iters_multiplier(True, iter_vals,
                                             depth_loss_iters_diminish_pt)
