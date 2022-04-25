@@ -1612,30 +1612,42 @@ def get_sw_sampling_prob_dist_modifier(kf_rgb_imgs, grid_size,
 
 def save_point_clouds_from_rgb_imgs_and_depth_imgs(point_cloud_dpath, rgb_imgs, depth_imgs,
                                                    world_from_cameras, intrinsics_matrix,
-                                                   tb_info=None):
+                                                   fruit_masks, tb_info=None):
     if isinstance(rgb_imgs, torch.Tensor):
         rgb_imgs = rgb_imgs.detach().cpu().numpy()
     if isinstance(depth_imgs, torch.Tensor):
         depth_imgs = depth_imgs.detach().cpu().numpy()
     if isinstance(world_from_cameras, torch.Tensor):
         world_from_cameras = world_from_cameras.detach().cpu().numpy()
+    if isinstance(fruit_masks, torch.Tensor):
+        fruit_masks = fruit_masks.detach().cpu().numpy()
     singular_input = rgb_imgs.ndim == 3
     if singular_input:
         rgb_imgs = rgb_imgs.unsqueeze(0)
         depth_imgs = depth_imgs.unsqueeze(0)
         world_from_cameras = world_from_cameras.unsqueeze(0)
+        fruit_masks.unsqueeze(0)
     if world_from_cameras.shape[1] == 3:
         hom_row = torch.tensor([[0, 0, 0, 1]], dtype=torch.float32,
                                device=world_from_cameras.device)
         world_from_cameras = torch.cat((world_from_cameras,
                                         hom_row.expand(world_from_cameras.shape[0], 1, 4)), 1)
 
-    for idx, (rgb_img, depth_img, world_from_camera) in enumerate(zip(rgb_imgs, depth_imgs,
-                                                                      world_from_cameras)):
+    for idx, (rgb_img, depth_img, world_from_camera, fruit_mask) in enumerate(zip(
+            rgb_imgs, depth_imgs, world_from_cameras, fruit_masks)):
         point_cloud = point_cloud_from_rgb_img_and_depth_img(rgb_img,
                                                              depth_img, world_from_camera,
                                                              intrinsics_matrix)
-        o3d.io.write_point_cloud((point_cloud_dpath / f'ptcld-{idx}.ply').as_posix(), point_cloud)
+        o3d.io.write_point_cloud((point_cloud_dpath / f'ptcld_{idx}.ply').as_posix(), point_cloud)
+
+        depth_img_fruit_only = depth_img.copy()
+        depth_img_fruit_only[fruit_mask < 0.95] = np.nan
+        point_cloud_fruit_only = point_cloud_from_rgb_img_and_depth_img(
+            rgb_img,
+            depth_img_fruit_only, world_from_camera,
+            intrinsics_matrix)
+        o3d.io.write_point_cloud((point_cloud_dpath / f'ptcld-fruit-only_{idx}.ply').as_posix(),
+                                 point_cloud_fruit_only)
 
     if tb_info is not None:
         tensorboard, tb_tag, tb_iter = tb_info
@@ -1866,15 +1878,15 @@ def save_imgs(output_dpath, gt_rgb_imgs, rgb_imgs, depth_imgs):
     depth_imgs = (depth_imgs * 255 / depth_imgs.max()).astype(np.uint8)
 
     for idx, (gt_rgb_img, rgb_img, depth_img) in enumerate(zip(gt_rgb_imgs, rgb_imgs, depth_imgs)):
-        imwrite((output_dpath / f'gt-rgb-{idx}.png').as_posix(), gt_rgb_img)
-        imwrite((output_dpath / f'rgb-{idx}.png').as_posix(), rgb_img)
-        imwrite((output_dpath / f'depth-{idx}.png').as_posix(),
+        imwrite((output_dpath / f'gt-rgb_{idx}.png').as_posix(), gt_rgb_img)
+        imwrite((output_dpath / f'rgb_{idx}.png').as_posix(), rgb_img)
+        imwrite((output_dpath / f'depth_{idx}.png').as_posix(),
                 applyColorMap(depth_img, COLORMAP_JET))
 
 
 def save_poses(output_dpath, poses):
     for idx, pose in enumerate(poses):
-        torch.save(pose, output_dpath / f'world-from-camera-{idx}.pth')
+        torch.save(pose, output_dpath / f'world-from-camera_{idx}.pth')
 
 
 def squiggle(x_center, y_min, y_max, y_steepness, x):

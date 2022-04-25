@@ -22,6 +22,7 @@ from tqdm import tqdm, trange
 
 from axes.util import o3d_axes_from_poses
 from im_util.transforms import euler_zyx_from_tfmat
+from nn.predict import predict_fruit_instance_segmentation_masks
 
 from run_nerf_helpers import (add_1d_imgs_to_tensorboard, append_to_log_file, create_keyframes,
                               exp_decay, extract_mesh, get_depth_loss_iters_multiplier,
@@ -593,10 +594,13 @@ def train() -> None:
                 render_path(poses_to_render, hwf, intrinsics_matrix, args.chunk, render_kwargs_test,
                             gt_imgs=render_gt_rgb_imgs, savedir=log_dpath,
                             render_factor=args.render_factor)
+            fruit_masks = predict_fruit_instance_segmentation_masks(
+                Path(args.fruit_detection_model_fpath).expanduser(), render_gt_rgb_imgs,
+                dilate_masks=False, blur_masks=False)
             save_point_clouds_from_rgb_imgs_and_depth_imgs(vis_dpath,
                                                            rendered_rgb_imgs,
                                                            rendered_depth_imgs, poses_to_render,
-                                                           intrinsics_matrix)
+                                                           intrinsics_matrix, fruit_masks)
             save_imgs(vis_dpath, render_gt_rgb_imgs, rendered_rgb_imgs, rendered_depth_imgs)
             save_poses(vis_dpath, poses_to_render)
             # imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
