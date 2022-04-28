@@ -10,6 +10,7 @@ from queue import Queue
 import numpy as np
 import open3d as o3d
 import torch
+import torchvision
 
 from GPUtil import showUtilization
 from ipdb import launch_ipdb_on_exception, set_trace
@@ -30,6 +31,7 @@ from run_nerf_helpers import (add_1d_imgs_to_tensorboard, append_to_log_file, cr
                               get_sw_rays, get_embedder, get_rays,
                               get_sw_sampling_prob_dist_modifier, get_raw_pw_sampling_prob_modifier,
                               get_pw_sampling_prob_modifier,
+                              get_last_selectable_kf_idx,
                               intrinsics_params_from_intrinsics_matrix, img2mse, initialize_sw_kf_loss,
                               iw_from_pw, load_data, load_data_and_create_keyframes,
                               log_depth_loss_meters_multiplier_function,
@@ -93,6 +95,7 @@ def render_path(render_poses, hwf, intrinsics_matrix, chunk, render_kwargs, gt_i
         # Render downsampled for speed
         img_height = img_height//render_factor
         img_width = img_width//render_factor
+        intrinsics_matrix = intrinsics_matrix / render_factor
 
     rgbs = []
     disps = []
@@ -510,6 +513,7 @@ def config_parser():
                         'of iterations, the exponentially decaying function that determines how much'
                         'the depth loss is diminished will equal 0.01 (ie, 99% of the depth loss '
                         'will be ignored).')
+    parser.add_argument('--incrementally_add_keyframes', action='store_true')
 
     return parser
 
@@ -526,7 +530,7 @@ def train() -> None:
     tensorboard = SummaryWriter(log_dpath, flush_secs=10)
 
     (hwf, img_height, img_width, _, initial_intrinsics_matrix, initial_poses, render_poses,
-     near, far, val_rgb_img, val_depth_img, val_pose,
+     near, far, val_rgb_imgs, val_depth_imgs, val_poses,
      kf_rgb_imgs, kf_depth_imgs, kf_initial_poses, kf_idxs, n_kfs) = \
         load_data_and_create_keyframes(args, gpu_if_available, tensorboard, cpu, args.val_idx)
 
@@ -559,6 +563,9 @@ def train() -> None:
     render_kwargs_train.update(bds_dict)
     render_kwargs_test.update(bds_dict)
 
+    new_intrinsics_lr = args.initial_intrinsics_lr
+    new_poses_lr = args.initial_poses_lr
+
     # Short circuit if only rendering out from trained model
 
     if args.render_only:
@@ -572,7 +579,7 @@ def train() -> None:
             elif args.img_type_to_render == 'train':
                 kf_poses, _ = \
                     get_kf_poses(kf_initial_poses, kf_poses_params, not args.no_pose_optimization,
-                                 gpu_if_available)
+                                 gpu_if_available, args.initial_poses_lr, new_poses_lr)
                 render_gt_rgb_imgs = kf_rgb_imgs
                 poses_to_render = kf_poses
             elif args.img_type_to_render == 'render':
@@ -588,8 +595,9 @@ def train() -> None:
             # os.makedirs(testsavedir, exist_ok=True)
             # print('test poses shape', render_poses.shape)
 
-            intrinsics_matrix = get_intrinsics_matrix(initial_intrinsics_matrix, intrinsics_params,
-                                                      not args.no_intrinsics_optimization, gpu_if_available)
+            intrinsics_matrix = get_intrinsics_matrix(
+                initial_intrinsics_matrix, intrinsics_params, not args.no_intrinsics_optimization,
+                gpu_if_available, args.initial_intrinsics_lr, new_intrinsics_lr)
             rendered_rgb_imgs, _, rendered_depth_imgs = \
                 render_path(poses_to_render, hwf, intrinsics_matrix, args.chunk, render_kwargs_test,
                             gt_imgs=render_gt_rgb_imgs, savedir=log_dpath,
@@ -600,7 +608,8 @@ def train() -> None:
             save_point_clouds_from_rgb_imgs_and_depth_imgs(vis_dpath,
                                                            rendered_rgb_imgs,
                                                            rendered_depth_imgs, poses_to_render,
-                                                           intrinsics_matrix, fruit_masks)
+                                                           intrinsics_matrix, fruit_masks,
+                                                           args.render_factor)
             save_imgs(vis_dpath, render_gt_rgb_imgs, rendered_rgb_imgs, rendered_depth_imgs)
             save_poses(vis_dpath, poses_to_render)
             # imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
@@ -653,8 +662,11 @@ def train() -> None:
     sw_sampling_prob_dist = torch.tensor(1 / n_total_sections).expand(dims_kf_sw)
 
     with torch.no_grad():
-        intrinsics_matrix = get_intrinsics_matrix(initial_intrinsics_matrix, intrinsics_params, not
-                                                  args.no_intrinsics_optimization, gpu_if_available)
+        intrinsics_matrix = get_intrinsics_matrix(
+            initial_intrinsics_matrix, intrinsics_params, not
+            args.no_intrinsics_optimization, gpu_if_available,
+            args.initial_intrinsics_lr, new_intrinsics_lr
+        )
         sw_kf_loss = initialize_sw_kf_loss(kf_rgb_imgs, kf_depth_imgs, kf_initial_poses, sw_unif_sampling_prob_dist, dims_kf_pw,
                                            intrinsics_matrix, n_total_rays_to_unif_sample, render_kwargs_train,
                                            args.chunk, optimizer, do_active_sampling, tensorboard,
@@ -701,6 +713,8 @@ def train() -> None:
     t_training_start = perf_counter()
 
     already_logged_val_gt = False
+    last_selectable_kf_idx = None
+    kf_set_expanded_yet = False
 
     showUtilization()
 
@@ -738,24 +752,33 @@ def train() -> None:
 
         # Get the keyframe poses.
         kf_poses, t_get_poses = get_kf_poses(
-            kf_initial_poses, kf_poses_params, do_pose_optimization, gpu_if_available)
-        intrinsics_matrix = get_intrinsics_matrix(initial_intrinsics_matrix, intrinsics_params, not
-                                                  args.no_intrinsics_optimization, gpu_if_available)
+            kf_initial_poses, kf_poses_params, do_pose_optimization,
+            gpu_if_available, args.initial_poses_lr, new_poses_lr)
+        intrinsics_matrix = get_intrinsics_matrix(
+            initial_intrinsics_matrix, intrinsics_params,
+            not args.no_intrinsics_optimization, gpu_if_available,
+            args.initial_intrinsics_lr, new_intrinsics_lr)
 
         with torch.no_grad():
             # Select a subset of the keyframes to actually use in this training iteration.
-            (skf_rgb_imgs, skf_depth_imgs, skf_poses, skf_idxs, n_skfs, dims_skf_pw, sw_skf_loss, skf_from_kf_idxs,
-             t_select_keyframes) = select_keyframes(kf_rgb_imgs, kf_depth_imgs, kf_poses, kf_idxs, sw_kf_loss, img_height, img_width,
-                                                    intrinsics_matrix, is_start_iter,
-                                                    n_total_rays_to_unif_sample, dims_kf_pw,
-                                                    args.keyframe_selection_strategy, args.n_explore, args.n_exploit,
-                                                    sw_unif_sampling_prob_dist, tensorboard, verbose, train_iter_idx,
-                                                    optimizer, args.chunk, render_kwargs_train, cpu, gpu_if_available)
+            last_selectable_kf_idx, kf_set_expanded_yet = get_last_selectable_kf_idx(
+                sw_kf_loss, args.incrementally_add_keyframes, last_selectable_kf_idx,
+                kf_set_expanded_yet, tensorboard, train_iter_idx)
+        (skf_rgb_imgs, skf_depth_imgs, skf_poses, skf_idxs, n_skfs, dims_skf_pw, sw_skf_loss,
+         skf_from_kf_idxs, t_select_keyframes) = select_keyframes(
+            kf_rgb_imgs, kf_depth_imgs, kf_poses, kf_idxs, sw_kf_loss, img_height, img_width,
+            intrinsics_matrix, is_start_iter,
+            n_total_rays_to_unif_sample, dims_kf_pw,
+            args.keyframe_selection_strategy, args.n_explore, args.n_exploit,
+            sw_unif_sampling_prob_dist, tensorboard, verbose, train_iter_idx,
+            optimizer, args.chunk, render_kwargs_train, cpu, gpu_if_available,
+            last_selectable_kf_idx)
         dims_skf_sw = dims_skf_pw[:3]
 
         # Compute the rays from the selected keyframe images and poses.
-        sw_skf_rays, t_get_rays = get_sw_rays(skf_rgb_imgs, skf_depth_imgs, img_height, img_width, intrinsics_matrix, skf_poses, n_skfs,
-                                              grid_size, section_height, section_width, gpu_if_available)
+        sw_skf_rays, t_get_rays = get_sw_rays(
+            skf_rgb_imgs, skf_depth_imgs, img_height, img_width, intrinsics_matrix, skf_poses, n_skfs,
+            grid_size, section_height, section_width, gpu_if_available)
 
         # Sample rays to use for training.
         pw_sampling_prob_modifier = get_pw_sampling_prob_modifier(
@@ -854,7 +877,8 @@ def train() -> None:
             # Turn on testing mode
             with torch.no_grad():
                 rgbs, disps, _ = render_path(render_poses, hwf, intrinsics_matrix,
-                                             args.chunk, render_kwargs_test)
+                                             args.chunk, render_kwargs_test,
+                                             render_factor=args.render_factor)
             print('Done, saving', rgbs.shape, disps.shape)
             moviebase = os.path.join(basedir, expname, '{}_spiral_{:06d}_'.format(expname,
                                                                                   train_iter_idx))
@@ -925,22 +949,47 @@ def train() -> None:
         if log_val_vis:
             # Log a rendered validation view to Tensorboard.
             with torch.no_grad():
-                val_rendered_rgb, _, _, val_rendered_depth, _ = render(img_height, img_width, intrinsics_matrix, gpu_if_available,
-                                                                       chunk=args.chunk, c2w=val_pose, **render_kwargs_test)
+                # val_rendered_rgb, _, _, val_rendered_depth, _ = render(
+                #     img_height, img_width, intrinsics_matrix, gpu_if_available,
+                #     chunk=args.chunk, c2w=val_pose, **render_kwargs_test)
 
-                val_loss = img2mse(val_rendered_rgb, val_rgb_img)
+                if val_poses.shape[0] <= 4:
+                    val_poses_to_render = val_poses.to(gpu_if_available)
+                    val_gt_rgb_imgs = val_rgb_imgs
+                    val_gt_depth_imgs = val_depth_imgs
+                else:
+                    val_idxs_to_render = torch.tensor(
+                        [0, 1, 2, 3]) * ((last_selectable_kf_idx + 1) // 4)
+                    val_idxs_to_render[-1] = last_selectable_kf_idx - 1
+                    val_poses_to_render = val_poses[val_idxs_to_render].to(gpu_if_available)
+                    val_gt_rgb_imgs = val_rgb_imgs[val_idxs_to_render]
+                    val_gt_depth_imgs = val_depth_imgs[val_idxs_to_render]
+
+                rendered_rgb_imgs, _, rendered_depth_imgs = \
+                    render_path(val_poses_to_render, hwf, intrinsics_matrix, args.chunk,
+                                render_kwargs_test,
+                                savedir=log_dpath, render_factor=args.render_factor)
+                rendered_rgb_imgs = torch.from_numpy(rendered_rgb_imgs)
+                rendered_depth_imgs = torch.from_numpy(rendered_depth_imgs)
+                if args.render_factor != 0:
+                    val_gt_rgb_imgs = torchvision.transforms.functional.resize(
+                        val_gt_rgb_imgs.permute([0, 3, 1, 2]),
+                        (img_height // args.render_factor, img_width // args.render_factor)
+                    ).permute([0, 2, 3, 1])
+
+                val_loss = img2mse(rendered_rgb_imgs, val_gt_rgb_imgs)
                 val_psnr = mse2psnr(val_loss)
 
-            tensorboard.add_image('validation/rgb/estimate', val_rendered_rgb,
-                                  train_iter_idx, dataformats='HWC')
-            add_1d_imgs_to_tensorboard(val_rendered_depth, black_rgb, white_rgb, tensorboard,
-                                       'validation/depth/estimate', train_iter_idx, cpu)
-            if not already_logged_val_gt:
-                tensorboard.add_image('validation/rgb/groundtruth', val_rgb_img,
+            for idx, (rendered_rgb_img, rendered_depth_img, val_gt_rgb_img, val_gt_depth_img) in enumerate(
+                    zip(rendered_rgb_imgs, rendered_depth_imgs, val_gt_rgb_imgs, val_gt_depth_imgs)):
+                tensorboard.add_image(f'validation/{idx}/rgb/estimate', rendered_rgb_img,
                                       train_iter_idx, dataformats='HWC')
-                add_1d_imgs_to_tensorboard(val_depth_img, black_rgb, white_rgb, tensorboard,
-                                           'validation/depth/groundtruth', train_iter_idx, cpu)
-                already_logged_val_gt = True
+                add_1d_imgs_to_tensorboard(rendered_depth_img, black_rgb, white_rgb, tensorboard,
+                                           f'validation/{idx}/depth/estimate', train_iter_idx, cpu)
+                tensorboard.add_image(f'validation/{idx}/rgb/groundtruth', val_gt_rgb_img,
+                                      train_iter_idx, dataformats='HWC')
+                add_1d_imgs_to_tensorboard(val_gt_depth_img, black_rgb, white_rgb, tensorboard,
+                                           f'validation/{idx}/depth/groundtruth', train_iter_idx, cpu)
             tensorboard.add_scalar('validation/loss', val_loss, train_iter_idx)
             tensorboard.add_scalar('validation/psnr', val_psnr, train_iter_idx)
             # tb_info = (tensorboard, 'train/point-cloud', open3d_vis_count)
@@ -962,7 +1011,7 @@ def train() -> None:
             with torch.no_grad():
                 kf_rendered_rgbs_np, _, kf_rendered_depths_np = render_path(
                     kf_poses.to(gpu_if_available), hwf, intrinsics_matrix, args.chunk,
-                    render_kwargs_test, gt_imgs=kf_rgb_imgs)
+                    render_kwargs_test, gt_imgs=kf_rgb_imgs, render_factor=args.render_factor)
             kf_rendered_rgbds = torch.cat((torch.from_numpy(kf_rendered_rgbs_np),
                                            (torch.from_numpy(kf_rendered_depths_np)).unsqueeze(-1)), -1)
             if args.save_logs_to_file:

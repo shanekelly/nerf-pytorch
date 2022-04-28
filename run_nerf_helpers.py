@@ -695,7 +695,8 @@ def load_data(args: Namespace, gpu_if_available: torch.device, cpu
         far = hemi_R+1.
 
     elif args.dataset_type == 'bonn':
-        rgb_imgs, depth_imgs, hwf, intrinsics_matrix, poses, render_poses, train_idxs, test_idxs = load_bonn_data(
+        (rgb_imgs, depth_imgs, hwf, intrinsics_matrix, poses, render_poses, train_idxs,
+         test_idxs) = load_bonn_data(
             args.datadir, downsample_factor=args.factor)
 
         val_idxs = test_idxs
@@ -746,27 +747,23 @@ def load_data_and_create_keyframes(args, gpu_if_available, tensorboard, cpu, val
     (rgb_imgs, depth_imgs, hwf, img_height, img_width, focal, initial_intrinsics_matrix, initial_poses,
      render_poses, train_idxs, _, val_idxs, near, far) = load_data(args, gpu_if_available, cpu)
 
-    if val_idx is None:
-        val_idx = val_idxs[len(val_idxs) // 2]
-    else:
-        val_idx = val_idxs[val_idx]
-    val_rgb_img = rgb_imgs[val_idx]
-    val_depth_img = depth_imgs[val_idx]
-    val_pose = initial_poses[val_idx, :3, :4].to(gpu_if_available)
-
-    kf_rgb_imgs, kf_depth_imgs, kf_initial_poses, kf_idxs, n_kfs = \
+    kf_rgb_imgs, kf_depth_imgs, kf_initial_poses, kf_idxs, n_kfs, between_kf_idxs = \
         create_keyframes(rgb_imgs, depth_imgs, initial_poses, train_idxs, args.keyframe_creation_strategy,
                          args.every_Nth)
 
-    val_rgb_img = val_rgb_img.to(gpu_if_available)
-    val_depth_img = val_depth_img.to(gpu_if_available)
-    val_pose = val_pose.to(gpu_if_available)
+    if between_kf_idxs is not None:
+        val_idxs = between_kf_idxs
+
+    val_rgb_imgs = rgb_imgs[val_idxs].to(cpu)
+    val_depth_imgs = depth_imgs[val_idxs].to(cpu)
+    val_poses = initial_poses[val_idxs, :3, :4].to(gpu_if_available).to(cpu)
+
     kf_rgb_imgs = kf_rgb_imgs.to(gpu_if_available)
     kf_depth_imgs = kf_depth_imgs.to(gpu_if_available)
     kf_initial_poses = kf_initial_poses.to(gpu_if_available)
 
     return (hwf, img_height, img_width, focal, initial_intrinsics_matrix, initial_poses, render_poses,
-            near, far, val_rgb_img, val_depth_img, val_pose, kf_rgb_imgs, kf_depth_imgs,
+            near, far, val_rgb_imgs, val_depth_imgs, val_poses, kf_rgb_imgs, kf_depth_imgs,
             kf_initial_poses, kf_idxs, n_kfs)
 
 
@@ -788,7 +785,8 @@ def split_into_sections(mats, grid_size):
     return sw_mats
 
 
-def get_sw_rays(rgb_imgs: torch.Tensor, depth_imgs, img_height: int, img_width: int, intrinsics_matrix: torch.Tensor, poses: torch.Tensor,
+def get_sw_rays(rgb_imgs: torch.Tensor, depth_imgs, img_height: int, img_width: int,
+                intrinsics_matrix: torch.Tensor, poses: torch.Tensor,
                 n_kfs: int,  grid_size: int, section_height: int,
                 section_width: int, gpu_if_available: torch.device, verbose=False
                 ) -> Tuple[torch.Tensor, float]:
@@ -1307,12 +1305,15 @@ def minreps_from_tfmats(Rt, gpu_if_available, eps=1e-8):  # [...,3,4]
 def create_keyframes(rgb_imgs: torch.Tensor, depth_imgs, initial_poses: torch.Tensor,
                      train_idxs: List[int], keyframe_creation_strategy, every_Nth
                      ) -> Tuple[torch.Tensor, torch.Tensor, List[int], int]:
+    between_kf_idxs = None
     if keyframe_creation_strategy == 'all':
         kf_idxs = train_idxs
     elif keyframe_creation_strategy == 'every_Nth':
         assert every_Nth is not None, ('If --keyframe_creation_strategy is set to "every_Nth", '
                                        'then --every_Nth must also be defined.')
         kf_idxs = train_idxs[::every_Nth]
+        between_kf_idxs = kf_idxs[:-1] + kf_idxs.diff().div(2, rounding_mode='floor')
+
     else:
         raise RuntimeError(
             f'Unknown keyframe creation strategy "{keyframe_creation_strategy}". Exiting.')
@@ -1324,15 +1325,17 @@ def create_keyframes(rgb_imgs: torch.Tensor, depth_imgs, initial_poses: torch.Te
 
     print('Number of keyframes:', kf_idxs.shape[0])
 
-    return kf_rgb_imgs, kf_depth_imgs, kf_initial_poses, kf_idxs, n_kfs
+    return kf_rgb_imgs, kf_depth_imgs, kf_initial_poses, kf_idxs, n_kfs, between_kf_idxs
 
 
 def get_kf_poses(kf_initial_poses: torch.Tensor, kf_poses_params: torch.nn.Parameter,
-                 do_pose_optimization: bool, gpu_if_available
+                 do_pose_optimization: bool, gpu_if_available, initial_poses_lr, current_poses_lr
                  ) -> torch.Tensor:
     t_start = perf_counter()
 
     if do_pose_optimization:
+        if current_poses_lr / initial_poses_lr <= 0.01:
+            kf_poses_params = kf_poses_params.detach()
         # Unpack the minimal representations of the poses from the optimizer's parameters, then
         # convert them into 4x4 transformation matrices.
         kf_poses = tfmats_from_minreps(kf_poses_params, kf_initial_poses[0], gpu_if_available)
@@ -1423,10 +1426,17 @@ def select_keyframes(kf_rgb_imgs, kf_depth_imgs, kf_poses, kf_idxs, sw_kf_loss, 
                      n_total_rays_to_unif_sample, dims_kf_pw,
                      keyframe_selection_strategy, n_explore, n_exploit,
                      sw_unif_sampling_prob_dist, tensorboard, verbose, train_iter_idx, optimizer,
-                     chunk, render_kwargs_train, cpu, gpu_if_available):
+                     chunk, render_kwargs_train, cpu, gpu_if_available, last_selectable_kf_idx):
     t_start = perf_counter()
 
-    n_kfs, grid_size, _, section_height, section_width = dims_kf_pw
+    kf_rgb_imgs = kf_rgb_imgs[:last_selectable_kf_idx + 1]
+    kf_depth_imgs = kf_depth_imgs[:last_selectable_kf_idx + 1]
+    kf_poses = kf_poses[:last_selectable_kf_idx + 1]
+    kf_idxs = kf_idxs[:last_selectable_kf_idx + 1]
+    sw_kf_loss = sw_kf_loss[:last_selectable_kf_idx + 1]
+
+    _, grid_size, _, section_height, section_width = dims_kf_pw
+    n_kfs = last_selectable_kf_idx + 1
 
     if keyframe_selection_strategy == 'all':
         skf_rgb_imgs = kf_rgb_imgs
@@ -1612,7 +1622,14 @@ def get_sw_sampling_prob_dist_modifier(kf_rgb_imgs, grid_size,
 
 def save_point_clouds_from_rgb_imgs_and_depth_imgs(point_cloud_dpath, rgb_imgs, depth_imgs,
                                                    world_from_cameras, intrinsics_matrix,
-                                                   fruit_masks, tb_info=None):
+                                                   fruit_masks, render_factor, tb_info=None):
+    if render_factor != 0:
+        fruit_masks = torchvision.transforms.functional.resize(
+            fruit_masks,
+            (fruit_masks.shape[1] // render_factor, fruit_masks.shape[2] // render_factor)
+        )
+        intrinsics_matrix = intrinsics_matrix / render_factor
+
     if isinstance(rgb_imgs, torch.Tensor):
         rgb_imgs = rgb_imgs.detach().cpu().numpy()
     if isinstance(depth_imgs, torch.Tensor):
@@ -1722,8 +1739,10 @@ def intrinsics_matrix_from_intrinsics_params(intrinsics_params, gpu_if_available
 
 
 def get_intrinsics_matrix(initial_intrinsics_matrix, intrinsics_params, do_intrinsics_optimization,
-                          gpu_if_available):
+                          gpu_if_available, initial_intrinsics_lr, current_intrinsics_lr):
     if do_intrinsics_optimization:
+        if current_intrinsics_lr / initial_intrinsics_lr <= 0.01:
+            intrinsics_params = intrinsics_params.detach()
         intrinsics_matrix = intrinsics_matrix_from_intrinsics_params(intrinsics_params,
                                                                      gpu_if_available)
     else:
@@ -1752,7 +1771,6 @@ def extract_mesh(render_kwargs, mesh_grid_size=100, threshold=0.1):
 
         vertices, triangles = mcubes.marching_cubes(grid.detach().cpu().numpy(), threshold)
         mesh = trimesh.Trimesh(vertices, triangles)
-        set_trace()
 
     return mesh
 
@@ -1933,3 +1951,42 @@ def log_scalar_schedules(tensorboard, max_n_iters,
         tensorboard.add_scalars('scalar_schedules', {
             'depth': d, 'scene': s, 'poses': p, 'gpe-mat': g, 'intrinsics': i, 'fruit-sampling': f},
             iter_val)
+
+
+def get_last_selectable_kf_idx(
+        sw_kf_loss, incrementally_add_keyframes, prev_last_selectable_kf_idx,
+        kf_set_expanded_yet, tensorboard, train_iter_idx):
+    if not incrementally_add_keyframes:
+        return sw_kf_loss.shape[0] - 1, False
+
+    if prev_last_selectable_kf_idx is None:
+        last_selectable_kf_idx = 4
+        tensorboard.add_scalar('train/n_kfs_selectable', last_selectable_kf_idx + 1, train_iter_idx)
+        return last_selectable_kf_idx, False
+
+    if prev_last_selectable_kf_idx == sw_kf_loss.shape[0] - 1:
+        return prev_last_selectable_kf_idx, kf_set_expanded_yet
+
+    if not kf_set_expanded_yet:
+        loss_to_check = sw_kf_loss[:prev_last_selectable_kf_idx].mean()
+        if train_iter_idx % 100 == 0:
+            tensorboard.add_scalar('train/loss_most_recently_added_kf',
+                                   loss_to_check, train_iter_idx)
+        if loss_to_check < 0.02:
+            last_selectable_kf_idx = prev_last_selectable_kf_idx + 1
+            tensorboard.add_scalar('train/n_kfs_selectable',
+                                   last_selectable_kf_idx + 1, train_iter_idx)
+
+            return last_selectable_kf_idx, True
+
+        return prev_last_selectable_kf_idx, False
+
+    loss_to_check = sw_kf_loss[prev_last_selectable_kf_idx].mean()
+    if train_iter_idx % 100 == 0:
+        tensorboard.add_scalar('train/expand_kfs_loss', loss_to_check, train_iter_idx)
+    if loss_to_check < 0.02:
+        last_selectable_kf_idx = prev_last_selectable_kf_idx + 1
+        tensorboard.add_scalar('train/n_kfs_selectable', last_selectable_kf_idx + 1, train_iter_idx)
+        return last_selectable_kf_idx, True
+
+    return prev_last_selectable_kf_idx, True

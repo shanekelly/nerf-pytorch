@@ -10,12 +10,12 @@ keyframe_selection_strategy = all
 N_importance = 64
 
 n_training_iters = 50000
-s_train_scalars = 30
-s_pose_scalars = 30
-s_poses_vis = 30
-s_intrinsics_vis = 30
-s_sampling_vis = 30
-s_val = 120
+#s_train_scalars = 120
+#s_pose_scalars = 120
+#s_poses_vis = 120
+#s_intrinsics_vis = 120
+#s_sampling_vis = 120
+#s_val = 120
 i_weights = 5000
 
 pw_sampling_prob_modifier_strategy = fruit_detections
