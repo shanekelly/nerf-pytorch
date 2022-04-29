@@ -1145,7 +1145,9 @@ def get_sw_loss(rendered_rgbs: torch.Tensor, rendered_depths, gt_rgbs: torch.Ten
 
         if depth_loss_iters_multiplier > 0.0:
             depth_diffs = get_sw_coarse_or_fine_rendered_depths - gt_depths
-            depth_diffs_normalized = depth_diffs / 10
+            # TODO: determine good value for depth normalizer
+            # depth_diffs_normalized = depth_diffs / 10
+            depth_diffs_normalized = depth_diffs / 4
             depth_mean_squared_diffs = depth_diffs_normalized ** 2
             depth_mean_squared_diffs[invalid_depth_idxs_small] = 0.0
             depth_mean_squared_diffs[invalid_depth_idxs_big] = 0.0
@@ -1855,10 +1857,9 @@ def get_raw_pw_sampling_prob_modifier(kf_rgb_imgs,
     return pw_sampling_prob_modifier
 
 
-def get_pw_sampling_prob_modifier_max_min_ratio(x_center, train_iter_idx):
+def get_pw_sampling_prob_modifier_max_min_ratio(x_center, y_steepness, train_iter_idx):
     y_min = 1
     y_max = 10
-    y_steepness = -0.0005
 
     pw_sampling_prob_modifier_max_min_ratio = squiggle(x_center, y_min, y_max, y_steepness,
                                                        train_iter_idx)
@@ -1866,8 +1867,9 @@ def get_pw_sampling_prob_modifier_max_min_ratio(x_center, train_iter_idx):
     return pw_sampling_prob_modifier_max_min_ratio
 
 
-def get_pw_sampling_prob_modifier(raw_pw_sampling_prob_modifier, x_center, train_iter_idx):
-    max_min_ratio = get_pw_sampling_prob_modifier_max_min_ratio(x_center, train_iter_idx)
+def get_pw_sampling_prob_modifier(raw_pw_sampling_prob_modifier, x_center, y_steepness, train_iter_idx):
+    max_min_ratio = get_pw_sampling_prob_modifier_max_min_ratio(
+        x_center, y_steepness, train_iter_idx)
 
     min_val = 1 / max_min_ratio
     scaling = 1 - min_val
@@ -1923,11 +1925,12 @@ def exp_decay(initial_y, ten_pct_pt, x):
 
 def log_scalar_schedules(tensorboard, max_n_iters,
                          initial_scene_lr, scene_lr_10_pct_pt,
-                         initial_poses_lr, poses_lr_10_pct_pt,
+                         initial_poses_lr, poses_lr_center, poses_lr_steepness,
                          initial_gpe_mat_lr, gpe_mat_lr_10_pct_pt,
-                         initial_intrinsics_lr, intrinsics_lr_10_pct_pt,
+                         initial_intrinsics_lr, intrinsics_lr_center, intrinsics_lr_steepness,
                          depth_loss_iters_diminish_pt,
-                         pw_sampling_prob_multiplier_max_min_ratio_center
+                         pw_sampling_prob_multiplier_max_min_ratio_center,
+                         pw_sampling_prob_modifier_max_min_ratio_steepness
                          ):
     iter_vals = torch.linspace(0, max_n_iters, 101).round()
 
@@ -1936,14 +1939,17 @@ def log_scalar_schedules(tensorboard, max_n_iters,
     depth /= depth.max()
     scene = exp_decay(initial_scene_lr, scene_lr_10_pct_pt, iter_vals)
     scene /= scene.max()
-    poses = exp_decay(initial_poses_lr, poses_lr_10_pct_pt, iter_vals)
+    poses = squiggle(poses_lr_center, 0, initial_poses_lr,
+                     poses_lr_steepness, iter_vals)
     poses /= poses.max()
     gpe_mat = exp_decay(initial_gpe_mat_lr, gpe_mat_lr_10_pct_pt, iter_vals)
     gpe_mat /= gpe_mat.max()
-    intrinsics = exp_decay(initial_intrinsics_lr, intrinsics_lr_10_pct_pt, iter_vals)
+    intrinsics = squiggle(intrinsics_lr_center, 0, initial_intrinsics_lr,
+                          intrinsics_lr_steepness, iter_vals)
     intrinsics /= intrinsics.max()
     pw_max_min = get_pw_sampling_prob_modifier_max_min_ratio(
-        pw_sampling_prob_multiplier_max_min_ratio_center, iter_vals)
+        pw_sampling_prob_multiplier_max_min_ratio_center,
+        pw_sampling_prob_modifier_max_min_ratio_steepness, iter_vals)
     pw_max_min /= pw_max_min.max()
 
     for iter_val, d, s, p, g, i, f in zip(iter_vals, depth, scene, poses, gpe_mat, intrinsics,

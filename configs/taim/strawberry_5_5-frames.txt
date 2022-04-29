@@ -1,0 +1,30 @@
+datadir = ~/eth/implicit-mapping/datasets/strawberry/5/5-frames/orbslam/front-camera/right-camera
+expname = taim_strawberry_5_5-frames
+
+
+keyframe_creation_strategy = all
+keyframe_selection_strategy = all
+
+N_samples = 32
+N_importance = 32
+pw_sampling_prob_modifier_strategy = fruit_detections
+fruit_detection_model_fpath = ~/eth/implicit-mapping/fruit-detector-weights/strawberry.pth
+
+n_training_iters = 10000
+depth_loss_iters_diminish_point = 500
+scene_lr_10_pct_pt = 12000
+intrinsics_lr_center = 2000
+intrinsics_lr_steepness = 0.01
+poses_lr_center = 2000
+poses_lr_steepness = 0.01
+pw_sampling_prob_modifier_max_min_ratio_iter_center = 5000
+pw_sampling_prob_modifier_max_min_ratio_steepness = -0.007
+
+save_logs_to_file = False
+render_factor = 2
+s_train_scalars = 60
+s_pose_scalars = 60
+s_intrinsics_vis = 60
+s_sampling_vis = 60
+s_val = 300
+i_weights = 1000

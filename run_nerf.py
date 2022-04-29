@@ -39,8 +39,9 @@ from run_nerf_helpers import (add_1d_imgs_to_tensorboard, append_to_log_file, cr
                               log_scalar_schedules,
                               mse2psnr, NeRF, ndc_rays, pad_imgs, pad_sections, render,
                               render_and_compute_loss, sample_pdf, sample_skf_rays,
-                              save_imgs, save_poses, save_point_clouds_from_rgb_imgs_and_depth_imgs, select_keyframes,
-                              should_trigger, split_into_sections, to8b, tfmats_from_minreps,
+                              save_imgs, save_poses, save_point_clouds_from_rgb_imgs_and_depth_imgs,
+                              select_keyframes,
+                              should_trigger, split_into_sections, squiggle, to8b, tfmats_from_minreps,
                               minreps_from_tfmats, gray_rgb, purple_rgb, black_rgb, white_rgb, GpuMonitor)
 
 
@@ -290,11 +291,10 @@ def config_parser():
     parser.add_argument("--scene_lr_10_pct_pt", type=int, default=60000,
                         help='After this many training iterations, the learning rate will have '
                         'decayed to 10 percent of its original value.')
-    parser.add_argument("--initial_poses_lr", type=float, default=1e-3,
+    parser.add_argument("--initial_poses_lr", type=float, default=1e-4,
                         help='Initial learning rate for camera poses.')
-    parser.add_argument("--poses_lr_10_pct_pt", type=int, default=20000,
-                        help='After this many training iterations, the learning rate will have '
-                        'decayed to 10 percent of its original value.')
+    parser.add_argument("--poses_lr_center", type=int, default=20000)
+    parser.add_argument("--poses_lr_steepness", type=float, default=0.001)
     parser.add_argument("--initial_gpe_mat_lr", type=float, default=5e-3,
                         help='Initial learning rate for the Gaussian positional embedding matrix.')
     parser.add_argument("--gpe_mat_lr_10_pct_pt", type=int, default=60000,
@@ -302,13 +302,14 @@ def config_parser():
                         'decayed to 10 percent of its original value.')
     parser.add_argument("--initial_intrinsics_lr", type=float, default=5e-3,
                         help='Initial learning rate for the Gaussian positional embedding matrix.')
-    parser.add_argument("--intrinsics_lr_10_pct_pt", type=int, default=20000,
-                        help='After this many training iterations, the learning rate will have '
-                        'decayed to 10 percent of its original value.')
+    parser.add_argument("--intrinsics_lr_center", type=int, default=20000)
+    parser.add_argument("--intrinsics_lr_steepness", type=float, default=0.001)
     parser.add_argument("--pw_sampling_prob_modifier_max_min_ratio_iter_center", type=float,
                         default=20000,
                         help='The training iteration number where the pixel-wise sampling '
                         'probability modifier max-min ratio will be in the middle.')
+    parser.add_argument("--pw_sampling_prob_modifier_max_min_ratio_steepness", type=float,
+                        default=-0.0005)
     parser.add_argument("--chunk", type=int, default=8192,
                         help='number of rays processed in parallel, decrease if running out of '
                         'memory')
@@ -693,11 +694,12 @@ def train() -> None:
     log_scalar_schedules(
         tensorboard, args.n_training_iters,
         args.initial_scene_lr, args.scene_lr_10_pct_pt,
-        args.initial_poses_lr, args.poses_lr_10_pct_pt,
+        args.initial_poses_lr, args.poses_lr_center, args.poses_lr_steepness,
         args.initial_gpe_mat_lr, args.gpe_mat_lr_10_pct_pt,
-        args.initial_intrinsics_lr, args.intrinsics_lr_10_pct_pt,
+        args.initial_intrinsics_lr, args.intrinsics_lr_center, args.intrinsics_lr_steepness,
         args.depth_loss_iters_diminish_point,
-        args.pw_sampling_prob_modifier_max_min_ratio_iter_center
+        args.pw_sampling_prob_modifier_max_min_ratio_iter_center,
+        args.pw_sampling_prob_modifier_max_min_ratio_steepness
     )
 
     t_prev_train_scalars_log = 0.0
@@ -783,7 +785,9 @@ def train() -> None:
         # Sample rays to use for training.
         pw_sampling_prob_modifier = get_pw_sampling_prob_modifier(
             raw_pw_sampling_prob_modifier,
-            args.pw_sampling_prob_modifier_max_min_ratio_iter_center, train_iter_idx)
+            args.pw_sampling_prob_modifier_max_min_ratio_iter_center,
+            args.pw_sampling_prob_modifier_max_min_ratio_steepness,
+            train_iter_idx)
         (sampled_rays, sampled_skf_sw_idxs, sw_n_newly_sampled, pw_n_newly_sampled,
          t_sample_rays) = sample_skf_rays(
             sw_skf_rays, kf_rgb_imgs, intrinsics_matrix, n_total_rays_to_sample,
@@ -834,8 +838,8 @@ def train() -> None:
 
         # Update learning rate for the poses.
         if not args.no_pose_optimization:
-            new_poses_lr = exp_decay(args.initial_poses_lr,
-                                     args.poses_lr_10_pct_pt, global_step)
+            new_poses_lr = squiggle(args.poses_lr_center, 0, args.initial_poses_lr,
+                                    args.poses_lr_steepness, global_step)
             optimizer.param_groups[param_group_idx]['lr'] = new_poses_lr
             param_group_idx += 1
 
@@ -848,8 +852,8 @@ def train() -> None:
 
         # Update learning rate for the camera intrinsics.
         if not args.no_intrinsics_optimization:
-            new_intrinsics_lr = exp_decay(args.initial_intrinsics_lr,
-                                          args.intrinsics_lr_10_pct_pt, global_step)
+            new_intrinsics_lr = squiggle(args.intrinsics_lr_center, 0, args.initial_intrinsics_lr,
+                                         args.intrinsics_lr_steepness, global_step)
             optimizer.param_groups[param_group_idx]['lr'] = new_intrinsics_lr
 
         depth_train_loss = new_sw_skf_depth_loss.mean()
