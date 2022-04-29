@@ -69,11 +69,12 @@ def batchify(fn, chunk):
     return ret
 
 
-def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
+def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64, pct_progress=None):
     """Prepares inputs and applies network 'fn'.
     """
-    inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
-    embedded = embed_fn(inputs_flat)
+    # inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
+    # embedded = embed_fn(inputs_flat, L=10, pct_progress=pct_progress)
+    embedded = embed_fn(inputs, L=10, pct_progress=pct_progress)
 
     if viewdirs is not None:
         input_dirs = viewdirs[:, None].expand(inputs.shape)
@@ -88,7 +89,7 @@ def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
 
 
 def render_path(render_poses, hwf, intrinsics_matrix, chunk, render_kwargs, gt_imgs=None, savedir=None,
-                render_factor=0):
+                render_factor=0, pct_progress=None):
 
     img_height, img_width, _ = hwf
 
@@ -108,7 +109,7 @@ def render_path(render_poses, hwf, intrinsics_matrix, chunk, render_kwargs, gt_i
         # print(i, time() - t)
         t = time()
         rgb, disp, _, depth, _ = render(img_height, img_width, intrinsics_matrix, gpu_if_available, chunk=chunk,
-                                        c2w=c2w[:3, :4], **render_kwargs)
+                                        c2w=c2w[:3, :4], pct_progress=pct_progress, **render_kwargs)
         rgbs.append(rgb.cpu().numpy())
         disps.append(disp.cpu().numpy())
         depths.append(depth.cpu().numpy())
@@ -185,9 +186,9 @@ def create_nerf(args, initial_poses: torch.Tensor, initial_intrinsics_matrix: to
                           use_viewdirs=args.use_viewdirs).to(gpu_if_available)
         grad_vars += [{'params': model_fine.parameters(), 'lr': args.initial_scene_lr}]
 
-    def network_query_fn(inputs, viewdirs, network_fn):
+    def network_query_fn(inputs, viewdirs, network_fn, pct_progress):
         return run_network(inputs, viewdirs, network_fn, embed_fn=embed_fn,
-                           embeddirs_fn=embeddirs_fn, netchunk=args.netchunk)
+                           embeddirs_fn=embeddirs_fn, netchunk=args.netchunk, pct_progress=pct_progress)
 
     if args.no_pose_optimization:
         kf_poses_params = None
@@ -602,7 +603,7 @@ def train() -> None:
             rendered_rgb_imgs, _, rendered_depth_imgs = \
                 render_path(poses_to_render, hwf, intrinsics_matrix, args.chunk, render_kwargs_test,
                             gt_imgs=render_gt_rgb_imgs, savedir=log_dpath,
-                            render_factor=args.render_factor)
+                            render_factor=args.render_factor, pct_progress=1)
             fruit_masks = predict_fruit_instance_segmentation_masks(
                 Path(args.fruit_detection_model_fpath).expanduser(), render_gt_rgb_imgs,
                 dilate_masks=False, blur_masks=False)
@@ -729,6 +730,7 @@ def train() -> None:
 
         is_first_iter = train_iter_idx == 1
         is_start_iter = train_iter_idx == start_iter_idx
+        pct_progress = train_iter_idx / args.n_training_iters
 
         log_train_scalars = should_trigger(train_iter_idx, args.i_train_scalars,
                                            t_prev_train_scalars_log, args.s_train_scalars)
@@ -810,11 +812,13 @@ def train() -> None:
         sampled_skf_sw_idxs_tuple = get_idxs_tuple(sampled_skf_sw_idxs[:, :3])
         (_, _, new_sw_skf_loss, new_sw_skf_rgb_loss,
          new_sw_skf_depth_loss, train_loss, train_psnr, t_batching,
-         t_rendering, t_loss) = render_and_compute_loss(sampled_rays, intrinsics_matrix, render_kwargs_train,
-                                                        img_height, img_width, dims_skf_sw, args.chunk,
-                                                        sampled_skf_sw_idxs_tuple, sw_n_newly_sampled,
-                                                        depth_loss_iters_multiplier, optimizer,
-                                                        train_iter_idx, cpu, gpu_if_available)
+         t_rendering, t_loss) = render_and_compute_loss(
+            sampled_rays, intrinsics_matrix, render_kwargs_train,
+            img_height, img_width, dims_skf_sw, args.chunk,
+            sampled_skf_sw_idxs_tuple, sw_n_newly_sampled,
+            depth_loss_iters_multiplier, optimizer,
+            train_iter_idx, cpu, gpu_if_available,
+            pct_progress=pct_progress)
 
         # Compute gradients for parameters via backpropagation and use them to update parameter
         # values.
@@ -882,7 +886,8 @@ def train() -> None:
             with torch.no_grad():
                 rgbs, disps, _ = render_path(render_poses, hwf, intrinsics_matrix,
                                              args.chunk, render_kwargs_test,
-                                             render_factor=args.render_factor)
+                                             render_factor=args.render_factor,
+                                             pct_progress=pct_progress)
             print('Done, saving', rgbs.shape, disps.shape)
             moviebase = os.path.join(basedir, expname, '{}_spiral_{:06d}_'.format(expname,
                                                                                   train_iter_idx))
@@ -972,7 +977,8 @@ def train() -> None:
                 rendered_rgb_imgs, _, rendered_depth_imgs = \
                     render_path(val_poses_to_render, hwf, intrinsics_matrix, args.chunk,
                                 render_kwargs_test,
-                                savedir=log_dpath, render_factor=args.render_factor)
+                                savedir=log_dpath, render_factor=args.render_factor,
+                                pct_progress=pct_progress)
                 rendered_rgb_imgs = torch.from_numpy(rendered_rgb_imgs)
                 rendered_depth_imgs = torch.from_numpy(rendered_depth_imgs)
                 if args.render_factor != 0:
@@ -1015,7 +1021,8 @@ def train() -> None:
             with torch.no_grad():
                 kf_rendered_rgbs_np, _, kf_rendered_depths_np = render_path(
                     kf_poses.to(gpu_if_available), hwf, intrinsics_matrix, args.chunk,
-                    render_kwargs_test, gt_imgs=kf_rgb_imgs, render_factor=args.render_factor)
+                    render_kwargs_test, gt_imgs=kf_rgb_imgs, render_factor=args.render_factor,
+                    pct_progress=pct_progress)
             kf_rendered_rgbds = torch.cat((torch.from_numpy(kf_rendered_rgbs_np),
                                            (torch.from_numpy(kf_rendered_depths_np)).unsqueeze(-1)), -1)
             if args.save_logs_to_file:
@@ -1073,9 +1080,11 @@ def train() -> None:
 
         if log_point_cloud_vis:
             with torch.no_grad():
-                rendered_rgb_imgs, _, rendered_depth_imgs = render_path(kf_poses, hwf, intrinsics_matrix, args.chunk, render_kwargs_test,
-                                                                        gt_imgs=kf_rgb_imgs, savedir=None,
-                                                                        render_factor=args.render_factor)
+                rendered_rgb_imgs, _, rendered_depth_imgs = render_path(
+                    kf_poses, hwf, intrinsics_matrix, args.chunk, render_kwargs_test,
+                    gt_imgs=kf_rgb_imgs, savedir=None,
+                    render_factor=args.render_factor,
+                    pct_progress=pct_progress)
                 tb_info = (tensorboard, 'train/point-cloud', open3d_vis_count)
                 save_point_cloud_from_rgb_imgs_and_depth_imgs(
                     vis_dpath /

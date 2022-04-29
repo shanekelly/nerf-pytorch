@@ -58,7 +58,7 @@ class Embedder:
         out_dim = 0
 
         if self.kwargs['include_input']:
-            embed_fns.append(lambda x: x)
+            # embed_fns.append(lambda x: x)
             out_dim += d
 
         max_freq = self.kwargs['max_freq_log2']  # sk: 9 for pos, 3 for view dir
@@ -85,8 +85,28 @@ class Embedder:
         self.embed_fns = embed_fns
         self.out_dim = out_dim
 
-    def embed(self, inputs):
-        return torch.cat([fn(inputs) for fn in self.embed_fns], -1)
+    def embed(self, inputs, L=None, pct_progress=None):
+        if pct_progress is None:
+            inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
+            input_enc = torch.cat([fn(inputs_flat) for fn in self.embed_fns], -1)
+        else:
+            shape = inputs.shape
+            freq = 2**torch.arange(L, dtype=torch.float32, device=inputs.device)*np.pi  # [L]
+            spectrum = inputs[..., None]*freq  # [B,...,N,L]
+            sin, cos = spectrum.sin(), spectrum.cos()  # [B,...,N,L]
+            input_enc = torch.stack([sin, cos], dim=-2)  # [B,...,N,2,L]
+            input_enc = input_enc.view(*shape[:-1], -1)  # [B,...,2NL]
+            start, end = [0.0, 0.5]
+            # alpha = (pct_progress-start)/(end-start)*L
+            alpha = (L - 2) * (1 - torch.exp(torch.tensor(-pct_progress) * 10)) + 2
+            k = torch.arange(L, dtype=torch.float32, device=inputs.device)
+            weight = (1-(alpha-k).clamp_(min=0, max=1).mul_(np.pi).cos_())/2
+            # apply weights
+            shape = input_enc.shape
+            input_enc = (input_enc.view(-1, L)*weight).view(*shape)
+            input_enc = input_enc.reshape(-1, input_enc.shape[-1])
+            input_enc = torch.cat([inputs.reshape(-1, inputs.shape[-1]), input_enc], dim=-1)
+        return input_enc
 
 
 def get_embedder(multires, i=0, B=None):
@@ -104,7 +124,7 @@ def get_embedder(multires, i=0, B=None):
     }
 
     embedder_obj = Embedder(**embed_kwargs)
-    def embed(x, eo=embedder_obj): return eo.embed(x)
+    def embed(x, eo=embedder_obj, L=None, pct_progress=None): return eo.embed(x, L, pct_progress)
 
     return embed, embedder_obj.out_dim
 
@@ -315,11 +335,12 @@ def sample_pdf(bins, weights, N_samples, gpu_if_available: torch.device, det=Fal
     return samples
 
 
-def render(img_height: int, img_width: int, intrinsics_matrix: torch.Tensor, gpu_if_available, chunk: int = 1024*32,
+def render(img_height: int, img_width: int, intrinsics_matrix: torch.Tensor, gpu_if_available,
+           chunk: int = 1024*32,
            rays: Optional[torch.Tensor] = None, c2w: Optional[torch.Tensor] = None,
            ndc: bool = True, near: float = 0., far: float = 1.,
            use_viewdirs: bool = False, c2w_staticcam: Optional[torch.Tensor] = None,
-           **kwargs):
+           pct_progress=None, **kwargs):
     """Render rays
     Args:
       img_height: int. Height of image in pixels.
@@ -379,7 +400,7 @@ def render(img_height: int, img_width: int, intrinsics_matrix: torch.Tensor, gpu
         rays = torch.cat([rays, viewdirs], -1)
 
     # Render and reshape
-    all_ret = batchify_rays(rays, gpu_if_available, chunk, **kwargs)
+    all_ret = batchify_rays(rays, gpu_if_available, chunk, pct_progress=pct_progress, **kwargs)
 
     for k in all_ret:
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
@@ -392,7 +413,8 @@ def render(img_height: int, img_width: int, intrinsics_matrix: torch.Tensor, gpu
     return ret_list + [ret_dict]
 
 
-def batchify_rays(rays_flat: torch.Tensor, gpu_if_available, chunk: int = 1024*32, **kwargs) -> Dict:
+def batchify_rays(rays_flat: torch.Tensor, gpu_if_available, chunk: int = 1024*32,
+                  pct_progress=None, **kwargs) -> Dict:
     """
     @brief - Render rays in smaller minibatches to avoid OOM.
     @param rays_flat: Shape (N, 8). [rays_o (Nx3), rays_d (Nx3), near (Nx1), far (Nx1)]
@@ -402,7 +424,7 @@ def batchify_rays(rays_flat: torch.Tensor, gpu_if_available, chunk: int = 1024*3
 
     kwargs['gpu_if_available'] = gpu_if_available
     for i in range(0, rays_flat.shape[0], chunk):
-        ret = render_rays(rays_flat[i:i+chunk], **kwargs)
+        ret = render_rays(rays_flat[i:i+chunk], pct_progress=pct_progress, **kwargs)
 
         for k in ret:
             if k not in all_ret:
@@ -419,7 +441,7 @@ def render_rays(ray_batch: torch.Tensor, network_fn: NeRF, network_query_fn: Cal
                 N_samples: int, gpu_if_available, retraw: bool = False, lindisp: bool = False, perturb: float = 0.,
                 N_importance: int = 0, network_fine: Optional[NeRF] = None,
                 white_bkgd: bool = False, raw_noise_std: float = 0., verbose: bool = False,
-                pytest: bool = False
+                pytest: bool = False, pct_progress=None
                 ) -> Dict:
     """Volumetric rendering.
     Args:
@@ -488,7 +510,8 @@ def render_rays(ray_batch: torch.Tensor, network_fn: NeRF, network_query_fn: Cal
 
 
 #     raw = run_network(pts)
-    raw = network_query_fn(pts, viewdirs, network_fn)  # Shape: (N, N_samples ** 2, 5)
+    # Shape: (N, N_samples ** 2, 5)
+    raw = network_query_fn(pts, viewdirs, network_fn, pct_progress=pct_progress)
     rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
         raw, z_vals, rays_d, gpu_if_available, raw_noise_std, white_bkgd, pytest=pytest)
 
@@ -507,7 +530,7 @@ def render_rays(ray_batch: torch.Tensor, network_fn: NeRF, network_query_fn: Cal
 
         run_fn = network_fn if network_fine is None else network_fine
 #         raw = run_network(pts, fn=run_fn)
-        raw = network_query_fn(pts, viewdirs, run_fn)
+        raw = network_query_fn(pts, viewdirs, run_fn, pct_progress=pct_progress)
 
         rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
             raw, z_vals, rays_d, gpu_if_available, raw_noise_std, white_bkgd, pytest=pytest)
@@ -1352,7 +1375,7 @@ def get_kf_poses(kf_initial_poses: torch.Tensor, kf_poses_params: torch.nn.Param
 def render_and_compute_loss(rays, intrinsics_matrix, render_kwargs_train, img_height, img_width,
                             dims_kf_sw, chunk, sampled_sw_idxs_tuple, sw_n_newly_sampled,
                             depth_loss_iters_multiplier, optimizer,
-                            train_iter_idx, cpu, gpu_if_available
+                            train_iter_idx, cpu, gpu_if_available, pct_progress=None
                             ) -> Tuple[torch.Tensor, torch.Tensor, Dict, torch.Tensor, torch.Tensor,
                                        torch.Tensor, float, float, float]:
     t_batching_start = perf_counter()
@@ -1363,7 +1386,7 @@ def render_and_compute_loss(rays, intrinsics_matrix, render_kwargs_train, img_he
     t_rendering_start = perf_counter()
     rendered_rgbs, _, rendered_depths, _, extras = \
         render(img_height, img_width, intrinsics_matrix, gpu_if_available, chunk=chunk, rays=batch_rays,
-               verbose=train_iter_idx < 10, retraw=True, **render_kwargs_train)
+               verbose=train_iter_idx < 10, retraw=True, pct_progress=pct_progress, **render_kwargs_train)
     t_rendering = perf_counter() - t_rendering_start
 
     t_loss_start = perf_counter()
@@ -1418,7 +1441,7 @@ def initialize_sw_kf_loss(kf_rgb_imgs, kf_depth_imgs, kf_poses, sw_unif_sampling
         sampled_rays, intrinsics_matrix, render_kwargs_train,
         img_height, img_width, dims_kf_sw, chunk,
         sampled_sw_idxs_tuple, sw_n_newly_sampled, depth_loss_iters_multiplier, optimizer,
-        1, cpu, gpu_if_available)
+        1, cpu, gpu_if_available, pct_progress=0)
 
     return sw_kf_loss
 
