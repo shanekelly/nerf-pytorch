@@ -1779,6 +1779,8 @@ def extract_mesh(render_kwargs, mesh_grid_size=100, threshold=0.1):
 
 def get_depth_loss_iters_multiplier(include_depth_loss, train_iter_idx, depth_loss_iters_diminish_point):
     if not include_depth_loss:
+        if isinstance(train_iter_idx, torch.Tensor):
+            return torch.zeros_like(train_iter_idx)
         return torch.tensor(0.0)
 
     # At this value of depth loss multiplier, we consider the depth loss to be diminished.
